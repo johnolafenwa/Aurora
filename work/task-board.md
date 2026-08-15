@@ -1,6 +1,23 @@
 # Task Board
 
-Last updated: 2026-08-05
+Last updated: 2026-08-15
+
+## ADR-0045/ADR-0049 checkpoint cleanup (complete)
+
+- Ratified ADR-0045 as Aura 0.3's binding testing and assertion-introspection
+  contract after the completed local matrix and one complete green hosted CI
+  run on Ubuntu and macOS.
+- Explicitly accepted all six checkpoint choices: parameter registration,
+  `-k` selection, operand rendering bounds, lifecycle-failure precedence,
+  isolated/capture-free cases, and JSON result schema 1.
+- Formally recorded ADR-0049's class-pattern deferment. Aura 0.3 continues to
+  reject positional and named class patterns; any implementation requires a
+  future dedicated ADR covering match exposure and capability behavior.
+- Updated the ADR index, conformance ledger, generated LLM documentation, and
+  reference-integrity regression. No compiler or runtime behavior changed.
+- Protected user files remain untouched: `personal/file_ops.au` and the
+  untracked ADR-0022 draft.
+- Work note: `work/2026-08-15-adr-checkpoint-cleanup.md`.
 
 ## Compiled-language positioning sweep (complete)
 

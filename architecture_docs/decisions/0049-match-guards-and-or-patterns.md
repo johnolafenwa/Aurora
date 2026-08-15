@@ -1,8 +1,8 @@
 # ADR-0049: Match guards and or-patterns
 
-- Status: Accepted for guards and or-patterns; class-pattern disposition
-  provisional pending the Batch S1 checkpoint
+- Status: Accepted; class patterns deferred
 - Date: 2026-08-02
+- Accepted at: Batch S1 checkpoint, class-pattern deferment recorded 2026-08-15
 - Roadmap decision: Batch S1, S4.4
 - Builds on: ADR-0022 and ADR-0026
 
@@ -137,7 +137,7 @@ The implementation may use direct write-through when storage is stable, but
 its observable order must equal the reconstruction rule. It may not discard a
 mutation merely because the guarded arm body did not run.
 
-### Provisional class-pattern disposition
+### Class-pattern deferment
 
 The current implementation does not accept class patterns such as
 `case Point(x=0):`. Aura has no accepted positional-class-pattern contract,
@@ -149,9 +149,10 @@ exhaustiveness of an open class domain.
 
 Classes can be matched by explicit enum/tag representations or by a wildcard
 followed by ordinary code. A later class-pattern ADR must define the exposure
-mechanism and capability behavior before syntax is accepted. Whether Batch S1
-ratifies this deferment remains provisional until its named checkpoint, which
-must explicitly confirm deferment or authorize implementation.
+mechanism and capability behavior before syntax is accepted. Batch S1
+formally defers class patterns from Aura 0.3 and does not reserve their
+call-shaped syntax as an accepted future contract. Implementation requires a
+separate accepted ADR that resolves the design questions above.
 
 ## Diagnostics
 
@@ -200,7 +201,8 @@ an expression does not roll back its mutations.
 
 Leaving class patterns outside the current implementation keeps field
 visibility and capability design open until Aura has a deliberate
-match-exposure protocol. The checkpoint disposition remains provisional.
+match-exposure protocol. This is an accepted deferment, not an authorization
+to implement a particular class-pattern spelling or representation model.
 
 ## Completion test matrix
 
@@ -231,6 +233,6 @@ match-exposure protocol. The checkpoint disposition remains provisional.
 Guards, or-patterns, and top-level catch-all binding patterns are accepted and
 implemented as Aura 0.3's pattern-polish surface. Parser, checker, decision
 tree, both backends, diagnostics, reference, examples, and tooling land
-together. Class patterns remain unimplemented, and the implement-or-defer
-decision is provisional until the Batch S1 checkpoint records its explicit
-disposition.
+together. Class patterns remain unimplemented and are formally deferred until
+a future dedicated ADR defines and ratifies match exposure, field visibility,
+property evaluation, ownership, mutation, and exhaustiveness behavior.

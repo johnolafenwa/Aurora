@@ -1,20 +1,21 @@
 # ADR-0045: Testing framework and assertion introspection
 
-- Status: Provisional
+- Status: Accepted
 - Date: 2026-08-02
+- Accepted at: Batch S1 checkpoint, recorded 2026-08-15
 - Version target: Aura 0.3
-- Implementation: Compiler, runner, reference, LSP, and editor integration complete; checkpoint gates pending
+- Implementation: Compiler, runner, reference, LSP, and editor integration complete; full local and hosted checkpoint gates green
 - Roadmap decision: Batch S1, S3
 
 ## Decision boundary
 
 This ADR defines the complete Aura 0.3 testing surface. The compiler and runner
-implementation is complete. The ADR remains Provisional until the completion
-matrix is green, assertion diagnostics have passed the forced MIR/direct
-parity matrix, and the Batch S1 checkpoint ratifies the registration API. Skip
-markers, expected-failure markers, and property-based generation are design
-topics for a later release and are not recognized syntax or runner options in
-Aura 0.3.
+implementation is complete, the completion matrix is green, assertion
+diagnostics have passed the forced MIR/direct parity matrix, and the Batch S1
+checkpoint has ratified the registration API and external runner contract.
+Skip markers, expected-failure markers, and property-based generation are
+design topics for a later release and are not recognized syntax or runner
+options in Aura 0.3.
 
 ## Goals
 
@@ -250,19 +251,32 @@ comparison.
   independent case reporting.
 - [x] Manual, CLI reference, conformance map, examples, tutorials, LSP metadata,
   and editor packaging describe and validate the same surface.
-- [ ] Assertion diagnostic fixtures pass through the complete forced MIR/direct
+- [x] Assertion diagnostic fixtures pass through the complete forced MIR/direct
   parity matrix. The `aura test` runner suite remains on its current backend,
-  and the complete corpus passes the full local and hosted gates. Focused
-  MIR/direct runs are byte-identical; the checkpoint-wide matrix and gates
-  remain.
+  and the complete corpus passes the full local and hosted gates. The
+  checkpoint-wide matrix is byte-identical across MIR/direct execution, and
+  one complete hosted CI run passed on both supported hosted platforms.
 
-## Ratification questions
+## Ratification
 
-The Batch S1 checkpoint must explicitly confirm:
+The Batch S1 checkpoint accepts this decision as Aura 0.3's binding testing
+and assertion-diagnostic contract. It explicitly confirms:
 
-1. the `list[(str, def() -> None)]` registration shape;
-2. literal case-sensitive `-k` matching and zero-match success;
-3. 4,096-byte per-operand rendering bounds;
-4. first-failure precedence with teardown reported secondarily; and
-5. isolated lifecycle phases and capture-free registered cases; and
-6. the exact JSON schema before it becomes a stable external contract.
+1. parameter registration remains `list[(str, def() -> None)]`, expanded once
+   in registration order into independently reported cases;
+2. `aura test -k` uses literal case-sensitive substring matching after
+   parameter expansion, and selecting zero cases succeeds;
+3. each rendered assertion operand has an independent 4,096-byte UTF-8 bound
+   with explicit truncation state;
+4. the first lifecycle failure remains primary, teardown failure is reported
+   secondarily, and teardown runs after a case failure or trap;
+5. setup, case, and teardown remain isolated lifecycle phases, and registered
+   case function values must be capture-free; and
+6. JSON result schema 1 is the stable external contract described above,
+   including its ordered summary, test, discovery, output, diagnostic, and
+   runner-failure fields and completed-run exit statuses.
+
+The completed checkpoint evidence includes the full local repository gate,
+the forced-backend parity matrix, and one complete green hosted CI run on
+Ubuntu and macOS. No new testing syntax or runner behavior is introduced by
+ratification.

@@ -53,11 +53,11 @@ test locations that must prove completion.
 42. [ADR-0042: Aura product identity](0042-aura-product-identity.md) — Accepted before the first v0.2.0 preview publication
 43. [ADR-0043: Unified `int64` index domain](0043-int64-index-domain.md) — Accepted for Aura 0.3 in Batch S1
 44. [ADR-0044: Canonical collection surface](0044-canonical-collection-surface.md) — Accepted for Aura 0.3 in Batch S1
-45. [ADR-0045: Testing framework and assertion introspection](0045-testing-framework-and-assertion-introspection.md) — Provisional for Aura 0.3 checkpoint ratification
+45. [ADR-0045: Testing framework and assertion introspection](0045-testing-framework-and-assertion-introspection.md) — Accepted for Aura 0.3 at the Batch S1 checkpoint
 46. [ADR-0046: String literal forms and f-string format specifications](0046-string-literals-and-format-specifications.md) — Accepted for Aura 0.3 in Batch S1
 47. [ADR-0047: Integer literal bases, bitwise operators, and shifts](0047-integer-literals-bitwise-and-shifts.md) — Accepted for Aura 0.3 in Batch S1
 48. [ADR-0048: Power, rounding, divmod, and the math module](0048-power-round-divmod-and-math.md) — Accepted for Aura 0.3 in Batch S1
-49. [ADR-0049: Match guards and or-patterns](0049-match-guards-and-or-patterns.md) — Guards and or-patterns accepted for Aura 0.3; class-pattern disposition provisional pending the Batch S1 checkpoint
+49. [ADR-0049: Match guards and or-patterns](0049-match-guards-and-or-patterns.md) — Accepted for Aura 0.3; class patterns formally deferred to a future dedicated ADR
 50. [ADR-0050: Module-level constants and deterministic initialization](0050-module-level-constants.md) — Accepted for Aura 0.3 in Batch S1
 51. [ADR-0051: Import aliases and keyword-only parameter disposition](0051-import-aliases-and-keyword-only-parameters.md) — Accepted for Aura 0.3 in Batch S1
 52. [ADR-0052: Anonymous closed union types](0052-anonymous-closed-union-types.md) — Proposed design

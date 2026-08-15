@@ -1051,6 +1051,28 @@ if rg -n '\bSIMD\b' \
   exit 1
 fi
 
+# The Batch S1 checkpoint is closed: ADR-0045's implemented testing contract is
+# binding, and ADR-0049 formally defers class patterns to a future dedicated
+# design rather than leaving their disposition provisional.
+grep -Fq -- '- Status: Accepted' \
+  architecture_docs/decisions/0045-testing-framework-and-assertion-introspection.md
+grep -Fq 'Accepted for Aura 0.3 at the Batch S1 checkpoint' \
+  architecture_docs/decisions/README.md
+grep -Fq -- '- Status: Accepted; class patterns deferred' \
+  architecture_docs/decisions/0049-match-guards-and-or-patterns.md
+grep -Fq 'class patterns formally deferred to a future dedicated ADR' \
+  architecture_docs/decisions/README.md
+grep -Fq 'Accepted ADR-0045 assertion introspection' docs/manual/conformance.md
+grep -Fq 'Accepted ADR-0045 test runner' docs/manual/conformance.md
+grep -Fq 'class patterns are formally deferred' docs/manual/conformance.md
+
+if rg -n '[Pp]rovisional' \
+  architecture_docs/decisions/0045-testing-framework-and-assertion-introspection.md \
+  architecture_docs/decisions/0049-match-guards-and-or-patterns.md; then
+  echo "ratified ADR-0045/ADR-0049 checkpoint text still contains a provisional disposition" >&2
+  exit 1
+fi
+
 python3 scripts/test_reference_integrity.py
 python3 scripts/reference_integrity.py
 python3 -m unittest scripts/test_release_metadata.py
