@@ -329,6 +329,10 @@
           "match": "\\b(public|mut|own|indirect|copy)\\b"
         },
         {
+          "name": "keyword.declaration.view.aura",
+          "match": "\\b(view|from)\\b"
+        },
+        {
           "name": "constant.language.aura",
           "match": "\\b(None|Some|true|false|self|Self)\\b"
         }

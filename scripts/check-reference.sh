@@ -786,21 +786,22 @@ if rg -U -n 'Provisional\s+ADR-003(2|3|4|5|6)' \
   exit 1
 fi
 
-# Batch 6 opens by accepting the completed value-capture design and accepting
-# the place-loan design for Aura 0.3 without authorizing its implementation
-# in the 0.2 release family.
+# Batch 6 opens by accepting the completed value-capture design. Phase 6.5 then
+# implements the accepted place-loan design for Aura 0.3 across the maintained
+# compiler, tooling, and reference surfaces.
 grep -Fq -- '- Status: Accepted' architecture_docs/decisions/0037-expression-closures-and-value-capture.md
 grep -Fq '0037-expression-closures-and-value-capture.md) — Accepted at the Batch 6 opening checkpoint' architecture_docs/decisions/README.md
 grep -Fq 'Accepted ADR-0037 expression closures' docs/manual/conformance.md
 grep -Fq 'implemented under Accepted ADR-0037' docs/manual/closures.md
 
-grep -Fq -- '- Status: Accepted (design; implementation targets 0.3; not authorized in the 0.2 cycle)' architecture_docs/decisions/0038-place-based-loans-and-views.md
-grep -Fq -- '- Implementation: Not started; no 0.2 implementation is authorized' architecture_docs/decisions/0038-place-based-loans-and-views.md
+grep -Fq -- '- Status: Implemented' architecture_docs/decisions/0038-place-based-loans-and-views.md
+grep -Fq -- '- Implementation: Complete' architecture_docs/decisions/0038-place-based-loans-and-views.md
 grep -Fq -- '- Version target: 0.3' architecture_docs/decisions/0038-place-based-loans-and-views.md
 test "$(grep -Ec '^[0-9]+\. \*\*Answer: Yes\.\*\*' architecture_docs/decisions/0038-place-based-loans-and-views.md)" -eq 10
-grep -Fq '0038-place-based-loans-and-views.md) — Accepted design for 0.3; unimplemented and not authorized in the 0.2 cycle' architecture_docs/decisions/README.md
-rg -U -q "accepted ADR-0038 design(?:\\s|>\\s)*specifies in-loan captures for ${former_name} 0\\.3" architecture_docs/decisions/0013-callable-sequencing-and-ownership.md
-grep -Fq -- '- Future design amendment: ADR-0038 (accepted for 0.3; not implemented in 0.2)' architecture_docs/decisions/0037-expression-closures-and-value-capture.md
+grep -Fq '0038-place-based-loans-and-views.md) — Implemented for Aura 0.3' architecture_docs/decisions/README.md
+rg -U -q 'ADR-0038 implements explicit,\s*>?\s*exhaustive shared, mutable, and owned closure capture lists for Aura 0\.3\.' architecture_docs/decisions/0013-callable-sequencing-and-ownership.md
+grep -Fq -- '- Implemented design amendment: ADR-0038 (explicit loan capture lists in Aura 0.3)' architecture_docs/decisions/0037-expression-closures-and-value-capture.md
+grep -Fq 'Implemented ADR-0038 place-based loans and views' docs/manual/conformance.md
 
 if rg -U -n 'Provisional\s+ADR-0037|under Provisional\s+ADR-0037|ADR-0037[^.\n]*Provisional' \
   architecture_docs/decisions/0037-expression-closures-and-value-capture.md \
@@ -828,7 +829,7 @@ fi
 rg -U -q 'The worker may be a capture-free function value or a repeatable\s+value-capturing closure\.' docs/manual/control-plane.md
 rg -U -q 'The helper can therefore reuse one repeatable capturing closure across all\s+attempts without consuming its environment\.' docs/manual/control-plane.md
 grep -Fq 'The callback must be repeatable.' docs/manual/collections.md
-rg -U -q 'An inner lambda cannot capture a bare parameter of its enclosing lambda,\s+even\s+when the parameter type is Copy\.' docs/manual/closures.md
+rg -U -q 'An inner lambda without a list cannot capture a bare parameter of its enclosing\s+lambda\. An explicit bare entry creates a shared contained reborrow' docs/manual/closures.md
 
 # Phase 5.8: Accepted ADR-0034 is an implemented builtin call, not the
 # historical statement form. Keep the normative reference, teaching track,

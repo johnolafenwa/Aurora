@@ -14,7 +14,9 @@ The complete declaration grammar is in [Grammar](/manual/grammar#functions-metho
 
 ## Signatures And Return Types
 
-Every ordinary parameter has an explicit type. A return annotation is optional; omitting it is exactly equivalent to `-> None`.
+Every ordinary parameter has an explicit type. A return annotation is optional;
+omitting it is exactly equivalent to `-> None`. Ordinary `-> T` returns are
+owned; a returned view uses the separate `-> view [mut] T from origin` form.
 
 ```aura
 def square(value: int32) -> int32:
@@ -200,7 +202,7 @@ def parse_total(left: str, right: str) -> Result[int32, str]:
 
 ## Owned Returns
 
-Every return annotation describes an owned result:
+Every ordinary type return annotation describes an owned result:
 
 ```aura
 class User:
@@ -230,8 +232,46 @@ A bare or `mut` parameter grants access but does not give the function
 ownership of a non-copy value stored behind that access. Moving such a value
 into the result is rejected; use one of the owned-result patterns above.
 
-Every result is an owned value. See [Ownership And
+Every ordinary result is an owned value. See [Ownership And
 Borrowing](/manual/ownership-and-borrowing#owned-returns).
+
+## Returned Views
+
+A function or method can return non-owning access to one declared receiver or
+parameter origin:
+
+    class User:
+        name: str
+
+    def name(user: User) -> view str from user:
+        return view user.name
+
+    def name_mut(user: mut User) -> view mut str from user:
+        return view mut user.name
+
+The `from` origin is mandatory and belongs to the signature. It is encoded by
+receiver/parameter slot across modules and trait conformance, so an
+implementation may rename its parameter but may not select another slot. A
+shared result may use a bare or `mut` origin. A mutable result requires a
+`mut` origin. Owned and defaulted parameters cannot be origins.
+
+Every reachable `return view` must trace to the origin or one of its supported
+fixed field or tuple projections. Locals, temporaries, enum arm payloads, and
+newly allocated values cannot escape. At a call, the origin argument must be
+an addressable place and the result must initialize a matching local view:
+
+    mut user = User(name="Ada")
+    view current = name(user)
+    print(current)
+
+    view mut editable = name_mut(user)
+    editable = "Grace"
+
+Return paths may select different fixed projections of the one declared
+origin. The caller locks that origin conservatively and execution retains the
+exact selected projection; selecting a different root is `AU3010`. Structural
+`def(...) -> R` types cannot represent returned-view origin metadata and
+therefore do not accept these functions.
 
 ## Generic Functions
 
@@ -409,7 +449,8 @@ callable rejection without a narrower compile-time code.
 conflict; `AU3003` means a mutability violation; and `AU3004` means an invalid
 parameter, receiver, return, or task-capture ownership mode. `AU3007` means a
 call specialization would duplicate non-cloneable `random.Rng` state or could
-not satisfy a callable clone-safety obligation. `AU4001` means a
+not satisfy a callable clone-safety obligation. `AU3010` means a returned view
+has an invalid escape, origin, caller place, kind, or provenance path. `AU4001` means a
 call-depth or general call trap. A callee's `AU4002` means arithmetic overflow
 or underflow, `AU4003` means bounds or lookup violation, `AU4004` means zero divisor, and
 `AU4005` means a trapping resource or I/O failure; each retains the same typed
@@ -417,9 +458,9 @@ Aura call frames and task ancestry on MIR and direct-native execution.
 
 ## Backend Support
 
-Ordinary, indirect function-value, generic, imported, associated,
-trait-dispatched, and maintained task-target calls are implemented for MIR
-execution and direct native builds.
+Ordinary, returned-view, indirect function-value, generic, imported,
+associated, trait-dispatched, and maintained task-target calls are implemented
+for MIR execution and direct native builds.
 Shared semantic checking and the forced parity matrix require identical call
 results and primary failures. Compiler analysis and the LSP use the same
 resolved signature metadata, including inferred clone-safety obligations.

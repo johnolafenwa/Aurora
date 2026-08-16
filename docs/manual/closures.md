@@ -2,9 +2,9 @@
 
 Aura closures use `lambda parameters: expression`. They are small
 expression-bodied callable values. Parameter types come from context; a
-zero-parameter lambda may infer its result type from its body. Captures are
-always by value: Copy values are copied and owned non-Copy values are moved
-when the closure is created.
+zero-parameter lambda may infer its result type from its body. A lambda without
+a capture list captures by value. An explicit exhaustive capture list can
+instead request shared, mutable, or owned access to named outer locals.
 
 ```aura
 def main():
@@ -34,8 +34,16 @@ The closure productions are:
 
 ```ebnf
 lambda-expression
-    = "lambda", [ lambda-parameter,
+    = "lambda", [ lambda-capture-list ],
+      [ lambda-parameter,
       { ",", lambda-parameter } ], ":", expression ;
+
+lambda-capture-list
+    = "[", lambda-capture,
+      { ",", lambda-capture }, "]" ;
+
+lambda-capture
+    = [ "mut" | "own" ], identifier ;
 
 lambda-parameter
     = [ "mut" | "own" ], identifier ;
@@ -50,8 +58,8 @@ expression`.
 identifier token, but the spelling always begins a lambda at the start of an
 expression. Member and named-argument positions may use the same identifier
 spelling. A lambda may appear anywhere an expression is accepted, subject to
-the contextual typing rule below. There is no arrow spelling, capture list,
-statement body, `async` form, or nested `def`.
+the contextual typing rule below. There is no arrow spelling, statement body,
+`async` form, or nested `def`.
 
 ## Typing Rules
 
@@ -97,17 +105,32 @@ or return capture-free lambdas or named functions with one structural
 `def(...) -> R` type. Creating and calling a closure wholly inside a branch
 remains supported.
 
-A resolved name in the body is a capture only when it denotes an outer owned
-local or an `own` parameter. Lambda parameters, module functions, types,
-builtins, and imported items are resolved normally and are not stored in the
-environment.
+A resolved name in a lambda without a list is a capture only when it denotes
+an outer owned local or an `own` parameter. Lambda parameters, module
+functions, types, builtins, and imported items are resolved normally and are
+not stored in the environment.
+
+An explicit list is exhaustive. Every resolved outer local used by the body
+must appear exactly once, and every entry must be used. Entries are acquired
+left to right:
+
+| Entry | Contract |
+| --- | --- |
+| `value` | Shared live loan of `value`. |
+| `mut value` | Exclusive mutable live loan; `value` must be a mutable place or mutable view. |
+| `own value` | By-value Copy snapshot or move under ADR-0037. |
+
+A projected place must first be named by a `view` binding. A shared or mutable
+view can be reborrowed but cannot be captured with `own`. A bare capture of a
+Copy local is intentionally live; write `own value` for a snapshot.
 
 ## Runtime Semantics
 
-Evaluating a lambda constructs its callable value immediately. Each captured
-Copy value is snapshotted into the environment; each captured non-Copy owned
-value moves into it. Later changes to an outer mutable Copy binding do not
-retarget the snapshot.
+Evaluating a lambda constructs its callable value immediately. For an ordinary
+lambda, each captured Copy value is snapshotted and each captured non-Copy
+owned value moves. An explicit list instead acquires its declared loans or
+owned captures left to right. Loan releases belong to the closure environment
+and run exactly once when its final use or scope ends.
 
 Calling the closure evaluates arguments under its contextual structural
 function signature and then evaluates the body. A closure whose body only
@@ -124,7 +147,7 @@ copied or cloned.
 
 ## Ownership And Evaluation Order
 
-Capture is by value and happens at closure creation, not on the first call.
+Implicit capture is by value and happens at closure creation, not on the first call.
 Copy captures leave their sources usable. Non-Copy captures move, so using the
 outer source afterward reports `AU3001`. Clone before creation when both
 owners are required:
@@ -138,28 +161,30 @@ def main():
     print(length())
 ```
 
-A bare parameter of an enclosing function is shared capability, not owned
-data, and cannot be captured. Take it as `own`, or clone the data into an
-owned local before building the closure. A `mut` enclosing parameter is also
-caller-owned capability and cannot be captured.
+A bare or mutable enclosing parameter may be named in an explicit capture
+list, which creates a loan bounded by the closure's live region. Without a
+list, those capabilities are not captured; take the input as `own` or clone it
+into an owned local for by-value capture.
 
-An inner lambda cannot capture a bare parameter of its enclosing lambda, even
-when the parameter type is Copy. When the surrounding callable contract
-allows it, make that outer parameter `own`; passing a Copy argument to the
-owned position duplicates the value, and the inner lambda may capture that
-owned parameter. When the outer contract must remain bare, pass the Copy value
-to a named helper with an `own` parameter and create or invoke the inner
-closure there.
+An inner lambda without a list cannot capture a bare parameter of its enclosing
+lambda. An explicit bare entry creates a shared contained reborrow; a `mut`
+entry requires a mutable outer capability. When an independent snapshot is
+needed, make the outer parameter `own` and use an `own` capture, or pass the
+value to a named helper that creates the owned closure.
 
-Phase 6.3 closure environments are read-only. A body cannot pass a capture to
-a `mut` parameter, call a `mut self` method on a capture, or otherwise request
-mutable access to it. This does not restrict the lambda's own `mut` parameter,
-which writes through the mutable argument supplied for that call.
+An ordinary by-value closure environment is read-only. A body may mutate only
+a `mut` entry from an explicit capture list. Such a closure is
+mutable-repeatable: it must be stored in a `mut` local and called sequentially
+through that mutable place. A shared-loan closure is shared-repeatable. A body
+that consumes a non-Copy `own` capture remains a consuming, single-use closure,
+even when the environment also contains loans.
 
-A closure is Transfer exactly when all of its captures are Transfer. Moving a
+A by-value closure is Transfer exactly when all of its captures are Transfer. Moving a
 qualifying closure into `TaskGroup.start`, `start_soon`, or an explicit-stack
 variant transfers the complete environment to child-owned storage. A
-non-Transfer leaf retains the ordinary `AU3008` boundary explanation.
+non-Transfer leaf retains the ordinary `AU3008` boundary explanation. A
+closure containing any shared or mutable loan is always non-Transfer and
+cannot cross a task, Queue, supervisor, detached-work, or FFI boundary.
 
 ### Comprehension Interaction
 
@@ -171,10 +196,10 @@ and are not captures.
 A lambda expression reached inside a comprehension is created at that runtime
 position. It may snapshot a Copy target, and it may move a Queue-received owned
 target when the surrounding use permits one consuming closure. A shared
-non-Copy list/set target is a capability into the source and cannot be captured;
-pass an explicit clone to a named helper or arrange another owned value outside
-the comprehension when independent storage is required. Capture environments
-remain read-only.
+non-Copy list/set target may be captured only through an explicit loan list
+whose lifetime remains inside the synchronous containing task; otherwise pass
+an explicit clone to a named helper or arrange another owned value outside the
+comprehension.
 
 The ordinary storage boundary also remains. A capturing closure cannot itself
 be inserted as a list, set, or dictionary comprehension result because collection
@@ -191,10 +216,12 @@ missing or mismatched parameter context, parameter capability, result type,
 metadata-erasing storage boundary, or a consuming closure supplied where a
 repeatable callback is required. `AU3001` reports use after a non-Copy value
 moved into a closure and use after a consuming closure call. `AU3002` rejects
-capture of shared or mutable caller capability. `AU3003` rejects mutable
-access through a captured environment. `AU3008` reports a closure whose
+overlapping capture loans and source accesses. `AU3003` rejects capability
+escalation or a mutable-repeatable call through an immutable closure place.
+`AU3008` reports a closure whose
 captured environment cannot cross a task boundary because some captured value
-is not Transfer.
+is not Transfer. `AU3010` reports a loan closure escaping into storage or a
+metadata-erasing callable boundary.
 
 The shared-capability diagnostic recommends cloning to an owned local or
 taking owned input. Move diagnostics identify closure creation or the
@@ -202,21 +229,23 @@ consuming call as the ownership origin.
 
 ## Backend Support
 
-Contextual checking, capture analysis, move checking, MIR lowering, and direct
-native lowering implement the same closure contract. Both maintained backends
-copy or move captures at creation, preserve repeated read-only calls, enforce
-single-use consumption statically, and clean up an owned environment exactly
-once. Compiler analysis and the language server expose lambda parameter scope,
+Contextual checking, capture and loan analysis, move checking, MIR lowering,
+and direct native lowering implement the same closure contract. Both maintained
+backends copy, move, or loan captures at creation; preserve shared- and
+mutable-repeatable calls; enforce single-use consumption; write mutable loans
+through immediately; and clean up an environment exactly once. Compiler
+analysis and the language server expose lambda parameter scope,
 captured-name definitions, callable hover, completions, and the compiler-owned
 diagnostics.
 
 ## Limits And Implementation-Defined Behavior
 
 Closures are expression-only and contextually typed. They do not support
-statement bodies, inline parameter types, defaults, generics, capture lists,
-implicit reference capture, mutable captured state, method values, trait
-objects, FFI callbacks, asynchronous syntax, shared-capability capture, or
-mutable captured state.
+statement bodies, inline parameter types, defaults, generics, implicit
+reference capture, method values, trait objects, FFI callbacks, asynchronous
+syntax, returned loan closures, or lifetime-bearing structural callable types.
+Explicit lists accept local identifiers; project a field into a named view
+before capturing it.
 
 Arbitrary structural `def` parameters and stored `def` fields, collection
 elements, and annotated returns currently carry only capture-free code
@@ -238,4 +267,6 @@ Expression closures and by-value capture are implemented under Accepted ADR-0037
 after ratification at the Batch 6 opening checkpoint. Capture-free function
 values remain governed by [Functions](/manual/functions), and task-boundary
 Transfer remains governed by Accepted ADR-0033. Comprehensions preserve this
-contract under Accepted ADR-0039 rather than adding a capture exception.
+contract under Accepted ADR-0039. Explicit shared/mutable/owned capture lists,
+mutable-repeatable closure calls, and loan cleanup are implemented under
+ADR-0038.

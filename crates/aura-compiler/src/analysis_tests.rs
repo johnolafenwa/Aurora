@@ -11,12 +11,13 @@ use super::{
     placeholder_stmt_for_return_type, range_from_span, range_from_span_with_path,
     recover_checked_program_after_member_errors, recover_checked_program_after_member_errors_with,
     recover_checked_program_after_parse_error_with, recover_checked_program_after_position,
-    replace_dangling_member_stmt_with_recovery_stmt, sanitize_member_completion_source,
-    stmt_end_line, stmt_start_line, symbols_from_module, AnalysisBuilder, TypeExt,
+    render_view_source, replace_dangling_member_stmt_with_recovery_stmt,
+    sanitize_member_completion_source, stmt_end_line, stmt_start_line, symbols_from_module,
+    view_source_root, AnalysisBuilder, TypeExt,
 };
 use crate::ast::{
     Argument, AssignStmt, AssignTarget, BinaryOp, ClassDecl, Expr, ExprKind, FunctionDecl, Item,
-    ParamMode, PassStmt, ReceiverKind, ReturnStmt, TypeRef, VariantPattern,
+    ParamMode, PassStmt, ReceiverKind, ReturnStmt, TypeRef, VariantPattern, ViewStmt,
 };
 use crate::diag::{Diagnostic, RuntimeCallFrame, RuntimeSourceSpan, RuntimeTaskFrame, Span};
 use crate::sema::{
@@ -342,6 +343,7 @@ fn function_decl(name: &str, return_type: &str) -> FunctionDecl {
             span: Span::new(1, 1),
         }],
         return_type: type_ref(return_type),
+        view_return: None,
         body: Vec::new(),
         span: Span::new(1, 1),
     }
@@ -6093,6 +6095,7 @@ fn analysis_recovery_helpers_cover_placeholders_and_receiver_extraction() {
                 kind: ExprKind::Int(1),
                 span: Span::new(4, 5),
             }),
+            view: None,
             span: Span::new(4, 5),
         }),
     ];
@@ -6254,6 +6257,7 @@ fn analysis_builtin_completion_and_statement_helpers_cover_remaining_branches() 
         }],
         else_body: Some(vec![crate::ast::Stmt::Return(ReturnStmt {
             value: None,
+            view: None,
             span: Span::new(5, 5),
         })]),
         span: Span::new(2, 5),
@@ -6415,6 +6419,23 @@ fn analysis_builtin_completion_and_statement_helpers_cover_remaining_branches() 
             .definition,
         range_from_span(Span::new(30, 1), "fresh".len())
     );
+    let fallback_view = ViewStmt {
+        name: "alias".to_string(),
+        mutable: false,
+        source: expr(ExprKind::Name("fresh".to_string())),
+        span: Span::new(32, 1),
+    };
+    fallback_builder.bind_view_value(&fallback_view, Type::named("int32"), &mut fallback_scope);
+    assert_eq!(
+        fallback_scope
+            .get("alias")
+            .expect("fallback view binding should be inserted")
+            .definition,
+        fallback_scope
+            .get("fresh")
+            .expect("view source should remain in scope")
+            .definition
+    );
     let reassignment = AssignStmt {
         mutable: false,
         target: AssignTarget::Name("fresh".to_string()),
@@ -6516,6 +6537,107 @@ fn analysis_builtin_completion_and_statement_helpers_cover_remaining_branches() 
         None
     );
     assert_eq!(placeholder_stmt_for_return_type("Custom"), None);
+}
+
+#[test]
+fn adr0038_analysis_exposes_view_provenance_and_return_contracts() {
+    let source = r#"
+class User:
+    name: str
+
+def name(user: User) -> view str from user:
+    return view user.name
+
+def main():
+    user = User(name="Ada")
+    view direct = (user.name)
+    print(direct)
+    view display = name(user)
+    print(display)
+"#;
+    let analysis = analyze_source(source);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
+    assert!(analysis.occurrences.iter().any(|occurrence| {
+        occurrence
+            .hover
+            .contains("function name(user: User) -> view str from user")
+    }));
+    let display = analysis
+        .occurrences
+        .iter()
+        .find(|occurrence| occurrence.hover.contains("view display: str from <place>"))
+        .expect("view hover should expose its kind, pointee type, and returned source");
+    assert!(display.definition.is_some());
+    assert!(analysis
+        .symbols
+        .iter()
+        .any(|symbol| { symbol.name == "name" && symbol.detail == "view str from user" }));
+}
+
+#[test]
+fn adr0038_analysis_view_source_helpers_cover_place_shapes_and_recovery() {
+    let name = expr(ExprKind::Name("pair".to_string()));
+    let member = expr(ExprKind::Member {
+        object: Box::new(name.clone()),
+        field: "right".to_string(),
+    });
+    let grouped = expr(ExprKind::Group(Box::new(member.clone())));
+    let indexed = expr(ExprKind::Index {
+        object: Box::new(grouped.clone()),
+        index: Box::new(expr(ExprKind::Int(1))),
+    });
+    assert_eq!(view_source_root(&indexed), Some("pair"));
+    assert_eq!(
+        render_view_source(&indexed).as_deref(),
+        Some("pair.right[1]")
+    );
+
+    let dynamic_index = expr(ExprKind::Index {
+        object: Box::new(name),
+        index: Box::new(expr(ExprKind::Name("position".to_string()))),
+    });
+    assert_eq!(render_view_source(&dynamic_index), None);
+    let literal = expr(ExprKind::Int(7));
+    assert_eq!(view_source_root(&literal), None);
+    assert_eq!(render_view_source(&literal), None);
+}
+
+#[test]
+fn adr0038_completion_scope_retains_view_bindings_and_sources() {
+    let source = [
+        "def main():",
+        "    mut pair = (1, 2)",
+        "    view mut selected = pair[0]",
+        "    selected",
+    ]
+    .join("\n");
+    let completions = complete_source(&source, 3, 12, None)
+        .expect("completion after a view declaration should recover the function scope");
+    for name in ["pair", "selected"] {
+        assert!(
+            completions.iter().any(|completion| completion.name == name),
+            "view-aware completion should retain `{name}`: {completions:?}"
+        );
+    }
+
+    let lambda_source = [
+        "def main():",
+        "    pair = (1, 2)",
+        "    view selected = pair[0]",
+        "    callback: def(int64) -> int64 = lambda [selected] value: selected + value",
+    ]
+    .join("\n");
+    let _ = complete_source(
+        &lambda_source,
+        3,
+        lambda_source.lines().nth(3).unwrap().len(),
+        None,
+    )
+    .expect("lambda scope traversal should accept view statements during recovery");
 }
 
 #[test]

@@ -14,7 +14,7 @@ const COMPILER_REQUEST_TIMEOUT_MS = 15_000;
 const COMPILER_RESPONSE_LIMIT_BYTES = 16 * 1024 * 1024;
 // The compiler owns the canonical identity; this transport declares the one
 // compiler interface it can safely decode.
-const SUPPORTED_SEMANTIC_INTERFACE_SCHEMA_VERSION = 5;
+const SUPPORTED_SEMANTIC_INTERFACE_SCHEMA_VERSION = 6;
 
 function setCompilerSchemaMismatchHandler(handler) {
   compilerSchemaMismatchHandler = typeof handler === "function" ? handler : null;

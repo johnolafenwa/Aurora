@@ -5,7 +5,7 @@
 - Accepted at: Batch 6 opening checkpoint
 - Roadmap decision: Batch 5, Phase 6.3
 - Amends: ADR-0013
-- Future design amendment: ADR-0038 (accepted for 0.3; not implemented in 0.2)
+- Implemented design amendment: ADR-0038 (explicit loan capture lists in Aura 0.3)
 
 ## Context
 
@@ -71,7 +71,7 @@ A bare shared parameter is a capability, not an owned value, so capturing it
 is rejected. The diagnostic recommends taking owned input or cloning to an
 owned local before closure creation. A `mut` parameter is likewise a
 caller-owned capability and cannot be captured. In-loan capture remains
-deferred to implementation of accepted ADR-0038 in Aurora 0.3.
+implemented by ADR-0038's explicit exhaustive capture lists in Aura 0.3.
 
 ### Callability
 

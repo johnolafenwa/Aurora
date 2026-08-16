@@ -126,7 +126,15 @@ pub struct FunctionDecl {
     pub receiver: Option<ReceiverKind>,
     pub params: Vec<Param>,
     pub return_type: TypeRef,
+    pub view_return: Option<ViewReturn>,
     pub body: Vec<Stmt>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ViewReturn {
+    pub mutable: bool,
+    pub origin: String,
     pub span: Span,
 }
 
@@ -212,6 +220,7 @@ pub struct Param {
 #[derive(Clone, Debug, Serialize)]
 pub enum Stmt {
     Assign(AssignStmt),
+    View(ViewStmt),
     Destructure(DestructureStmt),
     Pass(PassStmt),
     Assert(AssertStmt),
@@ -224,6 +233,14 @@ pub enum Stmt {
     Break(BreakStmt),
     Continue(ContinueStmt),
     Expr(ExprStmt),
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ViewStmt {
+    pub name: String,
+    pub mutable: bool,
+    pub source: Expr,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -292,7 +309,14 @@ impl BindingTarget {
 #[derive(Clone, Debug, Serialize)]
 pub struct ReturnStmt {
     pub value: Option<Expr>,
+    pub view: Option<ViewKind>,
     pub span: Span,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ViewKind {
+    Shared,
+    Mutable,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -462,6 +486,13 @@ pub struct LambdaParam {
     pub span: Span,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct LambdaCapture {
+    pub name: String,
+    pub mode: ParamMode,
+    pub span: Span,
+}
+
 /// The value produced for each successful pass through a comprehension.
 ///
 /// Keeping the collection shape on the output makes list, set, and map
@@ -524,6 +555,7 @@ pub enum ExprKind {
         else_expr: Box<Expr>,
     },
     Lambda {
+        captures: Option<Vec<LambdaCapture>>,
         params: Vec<LambdaParam>,
         body: Box<Expr>,
     },

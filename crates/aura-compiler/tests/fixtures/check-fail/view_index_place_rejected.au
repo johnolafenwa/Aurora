@@ -1,0 +1,4 @@
+def main():
+    mut values = [1, 2]
+    view item = values[0]
+    print(item)

@@ -364,12 +364,15 @@ pub struct ClosureCaptureValue {
     pub name: String,
     pub ty: Type,
     pub value: Value,
+    pub source_place: Option<String>,
+    pub mutable: bool,
 }
 
 #[derive(Debug)]
 pub struct ClosureEnvironment {
     captures: Mutex<Option<Vec<ClosureCaptureValue>>>,
     consuming: bool,
+    consumed: Mutex<bool>,
 }
 
 impl ClosureEnvironment {
@@ -377,6 +380,7 @@ impl ClosureEnvironment {
         Self {
             captures: Mutex::new(Some(captures)),
             consuming,
+            consumed: Mutex::new(false),
         }
     }
 
@@ -386,11 +390,31 @@ impl ClosureEnvironment {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.consuming {
-            return captures.take().ok_or_else(|| {
+            let mut consumed = self
+                .consumed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *consumed {
+                return Err(Diagnostic::new(format!(
+                    "closure `{function_name}` has already consumed its captured environment"
+                )));
+            }
+            *consumed = true;
+            let captures = captures.as_mut().ok_or_else(|| {
                 Diagnostic::new(format!(
                     "closure `{function_name}` has already consumed its captured environment"
                 ))
-            });
+            })?;
+            return Ok(captures
+                .iter_mut()
+                .map(|capture| ClosureCaptureValue {
+                    name: capture.name.clone(),
+                    ty: capture.ty.clone(),
+                    value: std::mem::replace(&mut capture.value, Value::Unit),
+                    source_place: capture.source_place.clone(),
+                    mutable: capture.mutable,
+                })
+                .collect());
         }
         let captures = captures
             .as_ref()
@@ -402,9 +426,46 @@ impl ClosureEnvironment {
                 name: capture.name.clone(),
                 ty: capture.ty.clone(),
                 value: try_clone_array_containing_value(&capture.value)?,
+                source_place: capture.source_place.clone(),
+                mutable: capture.mutable,
             });
         }
         Ok(copied)
+    }
+
+    pub(crate) fn write_back_mutable(&self, index: usize, value: Value) -> Result<()> {
+        let mut captures = self
+            .captures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let captures = captures.as_mut().ok_or_else(|| {
+            Diagnostic::new("cannot write back into a consumed closure environment")
+        })?;
+        let capture = captures
+            .get_mut(index)
+            .ok_or_else(|| Diagnostic::new(format!("closure has no capture at index {index}")))?;
+        if !capture.mutable {
+            return Err(Diagnostic::new(format!(
+                "closure capture `{}` is not mutable",
+                capture.name
+            )));
+        }
+        capture.value = value;
+        Ok(())
+    }
+
+    pub(crate) fn capture_value(&self, index: usize) -> Result<Value> {
+        let captures = self
+            .captures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let capture = captures
+            .as_ref()
+            .and_then(|captures| captures.get(index))
+            .ok_or_else(|| {
+                Diagnostic::new(format!("closure has no live capture at index {index}"))
+            })?;
+        try_clone_array_containing_value(&capture.value)
     }
 }
 

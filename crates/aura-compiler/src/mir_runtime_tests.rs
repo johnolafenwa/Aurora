@@ -51,6 +51,407 @@ fn test_function_operand(name: &str, params: Vec<Type>, return_type: Type) -> Op
     }
 }
 
+#[test]
+fn adr0038_mutable_views_write_through_and_reborrows_share_one_place() {
+    let output = crate::run_source(
+        r#"
+class Counter:
+    value: int64
+
+def main():
+    mut counter = Counter(value=1)
+    view mut value = counter.value
+    view mut nested = value
+    nested = nested + 4
+    print(counter.value)
+"#,
+    )
+    .expect("mutable views must execute through the MIR loan representation");
+    assert_eq!(output.stdout, "5\n");
+
+    let tuple_output = crate::run_source(
+        r#"
+def main():
+    mut pair = (1, 2)
+    view mut second = pair[1]
+    second = 7
+    print(pair)
+"#,
+    )
+    .expect("fixed tuple-position views must write through their stable place");
+    assert_eq!(tuple_output.stdout, "(1, 7)\n");
+}
+
+#[test]
+fn adr0038_returned_views_keep_the_callers_origin() {
+    let output = crate::run_source(
+        r#"
+class Counter:
+    value: int64
+
+def value(counter: Counter) -> view int64 from counter:
+    return view counter.value
+
+def value_mut(counter: mut Counter) -> view mut int64 from counter:
+    return view mut counter.value
+
+def bump(value: mut int64):
+    value += 1
+
+def main():
+    mut counter = Counter(value=2)
+    view initial = value(counter)
+    print(initial)
+    view mut editable = value_mut(counter)
+    editable = 9
+    print(counter.value)
+    bump(value_mut(counter))
+    print(counter.value)
+"#,
+    )
+    .expect("returned views must alias the declared caller origin");
+    assert_eq!(output.stdout, "2\n9\n10\n");
+
+    let selected = crate::run_source(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def choose(pair: mut Pair, left: bool) -> view mut int64 from pair:
+    if left:
+        return view mut pair.left
+    return view mut pair.right
+
+def bump(value: mut int64):
+    value += 1
+
+def main():
+    mut pair = Pair(left=1, right=10)
+    view mut left = choose(pair, true)
+    left = 2
+    view mut right = choose(pair, false)
+    right = 20
+    bump(choose(pair, false))
+    print(pair.left)
+    print(pair.right)
+"#,
+    )
+    .expect("returned views must retain the exact control-flow-selected projection");
+    assert_eq!(selected.stdout, "2\n21\n");
+}
+
+#[test]
+fn adr0038_mutable_closure_capture_writes_back_to_its_live_source() {
+    let output = crate::run_source(
+        r#"
+def main():
+    mut values = [1]
+    mut update: def(int64) -> None = lambda [mut values] item: values.append(item)
+    update(2)
+    update(3)
+    print(values)
+"#,
+    )
+    .expect("a mutable-repeatable closure must reborrow and write through on every call");
+    assert_eq!(output.stdout, "[1, 2, 3]\n");
+
+    let mixed = crate::run_source(
+        r#"
+def consume(value: own str):
+    pass
+
+def main():
+    mut values = [1]
+    text = "owned"
+    callback: def(int64) -> (None, None) = lambda [mut values, own text] item: (values.append(item), consume(text))
+    callback(2)
+    print(values)
+"#,
+    )
+    .expect("a consuming closure may still write through its live mutable capture before teardown");
+    assert_eq!(mixed.stdout, "[1, 2]\n");
+}
+
+#[test]
+fn adr0038_mir_loan_environment_covers_alias_resolution_and_nested_place_errors() {
+    let pair_value = || {
+        Value::Instance(InstanceValue {
+            class_name: "Pair".to_string(),
+            fields: BTreeMap::from([(
+                "nested".to_string(),
+                Value::Tuple(TupleValue {
+                    element_types: vec![Type::named("int64")],
+                    elements: vec![Value::Int(IntegerValue::from_signed(1))],
+                }),
+            )]),
+        })
+    };
+    let mut env = Env::default();
+    env.define_typed("pair", Type::named("Pair"), pair_value());
+    env.begin_loan("root", "pair", true)
+        .expect("root loan should begin");
+    env.begin_loan("nested", "root.nested", true)
+        .expect("reborrowed loan should resolve through its parent");
+    assert_eq!(
+        env.resolve_loan_place("nested.0")
+            .expect("loan suffix should compose"),
+        "pair.nested.0"
+    );
+    assert!(env.loans.get("root").expect("loan should exist").mutable);
+    env.begin_loan("shared", "pair", false)
+        .expect("shared loan should begin");
+    assert!(env
+        .write_place("shared", pair_value())
+        .expect_err("writes through shared loans must fail")
+        .message
+        .contains("cannot write through shared MIR loan"));
+    assert_eq!(
+        env.returned_view_projection("root", "pair")
+            .expect("root projection should be empty"),
+        ""
+    );
+    assert_eq!(
+        env.returned_view_projection("nested", "pair")
+            .expect("nested projection should be relative to the origin"),
+        "nested"
+    );
+    assert!(env
+        .returned_view_projection("pair", "nested")
+        .expect_err("a returned view may not escape its origin")
+        .message
+        .contains("outside declared origin"));
+    assert_eq!(
+        env.begin_loan("missing", "unknown", false)
+            .expect_err("loans require a live root")
+            .message,
+        "cannot begin MIR loan `missing` from unknown place `unknown`"
+    );
+    assert_eq!(
+        env.end_loan("missing")
+            .expect_err("unknown loans cannot end")
+            .message,
+        "cannot end unknown MIR loan `missing`"
+    );
+    env.loans.insert(
+        "cycle_a".to_string(),
+        super::RuntimeLoan {
+            source: "cycle_b".to_string(),
+            mutable: false,
+        },
+    );
+    env.loans.insert(
+        "cycle_b".to_string(),
+        super::RuntimeLoan {
+            source: "cycle_a".to_string(),
+            mutable: false,
+        },
+    );
+    assert!(env
+        .resolve_loan_place("cycle_a")
+        .expect_err("loan cycles must be diagnosed")
+        .message
+        .contains("cyclic MIR loan descriptor"));
+
+    assert!(env
+        .place_ref("pair.nested.bad")
+        .expect_err("tuple projections must be numeric")
+        .message
+        .contains("is not a fixed position"));
+    assert!(env
+        .place_ref("pair.nested.4")
+        .expect_err("tuple projections must be in bounds")
+        .message
+        .contains("has no element at index 4"));
+
+    let mut nested = pair_value();
+    super::write_nested_place(
+        &mut nested,
+        &["nested", "0"],
+        Value::Int(IntegerValue::from_signed(8)),
+        "pair.nested.0",
+    )
+    .expect("nested tuple writes should succeed");
+    let mut tuple_then_instance = Value::Tuple(TupleValue {
+        element_types: vec![Type::named("Pair")],
+        elements: vec![Value::Instance(InstanceValue {
+            class_name: "Pair".to_string(),
+            fields: BTreeMap::from([(
+                "value".to_string(),
+                Value::Int(IntegerValue::from_signed(1)),
+            )]),
+        })],
+    });
+    super::write_nested_place(
+        &mut tuple_then_instance,
+        &["0", "value"],
+        Value::Int(IntegerValue::from_signed(5)),
+        "pair.0.value",
+    )
+    .expect("tuple-to-instance nested writes should recurse");
+    assert!(
+        super::write_nested_place(&mut nested, &[], Value::Unit, "pair")
+            .expect_err("empty nested write paths must fail")
+            .message
+            .contains("cannot assign empty nested MIR place")
+    );
+    assert!(super::write_nested_place(
+        &mut nested,
+        &["nested", "bad"],
+        Value::Unit,
+        "pair.nested.bad",
+    )
+    .expect_err("tuple write projections must be numeric")
+    .message
+    .contains("is not a fixed position"));
+    assert!(
+        super::write_nested_place(&mut nested, &["nested", "3"], Value::Unit, "pair.nested.3",)
+            .expect_err("tuple write projections must be in bounds")
+            .message
+            .contains("has no element at index 3")
+    );
+
+    let mut taken = pair_value();
+    assert_eq!(
+        super::take_nested_place(
+            &mut taken,
+            &["nested".to_string(), "0".to_string()],
+            "pair.nested.0",
+        )
+        .expect("nested tuple moves should succeed"),
+        Value::Int(IntegerValue::from_signed(1))
+    );
+    let mut tuple_then_instance = Value::Tuple(TupleValue {
+        element_types: vec![Type::named("Pair")],
+        elements: vec![Value::Instance(InstanceValue {
+            class_name: "Pair".to_string(),
+            fields: BTreeMap::from([(
+                "value".to_string(),
+                Value::Int(IntegerValue::from_signed(6)),
+            )]),
+        })],
+    });
+    assert_eq!(
+        super::take_nested_place(
+            &mut tuple_then_instance,
+            &["0".to_string(), "value".to_string()],
+            "pair.0.value",
+        )
+        .expect("tuple-to-instance nested moves should recurse"),
+        Value::Int(IntegerValue::from_signed(6))
+    );
+    assert!(super::take_nested_place(&mut taken, &[], "pair")
+        .expect_err("empty nested move paths must fail")
+        .message
+        .contains("cannot move empty nested MIR place"));
+    for (segment, expected) in [("bad", "not a fixed position"), ("3", "has no element")] {
+        let mut tuple = Value::Tuple(TupleValue {
+            element_types: vec![Type::named("int64")],
+            elements: vec![Value::Int(IntegerValue::from_signed(1))],
+        });
+        assert!(
+            super::take_nested_place(&mut tuple, &[segment.to_string()], "pair")
+                .expect_err("invalid tuple move projection must fail")
+                .message
+                .contains(expected)
+        );
+    }
+
+    let mut mutable = pair_value();
+    *super::nested_place_mut(
+        &mut mutable,
+        &["nested".to_string(), "0".to_string()],
+        "pair.nested.0",
+    )
+    .expect("nested mutable lookup should succeed") = Value::Int(IntegerValue::from_signed(9));
+    for (segment, expected) in [("bad", "not a fixed position"), ("3", "has no element")] {
+        let mut tuple = Value::Tuple(TupleValue {
+            element_types: vec![Type::named("int64")],
+            elements: vec![Value::Int(IntegerValue::from_signed(1))],
+        });
+        assert!(
+            super::nested_place_mut(&mut tuple, &[segment.to_string()], "pair")
+                .expect_err("invalid mutable tuple projection must fail")
+                .message
+                .contains(expected)
+        );
+    }
+    let mut scalar = Value::Int(IntegerValue::from_signed(1));
+    assert!(
+        super::nested_place_mut(&mut scalar, &["field".to_string()], "value.field")
+            .expect_err("scalars have no nested mutable place")
+            .message
+            .contains("on a non-instance value")
+    );
+}
+
+#[test]
+fn adr0038_mir_returned_loan_instruction_reports_handoff_errors_and_root_projection() {
+    let mut runtime = test_runtime();
+    let mut env = Env::default();
+    env.define_typed(
+        "pair",
+        Type::Tuple(vec![Type::named("int64")]),
+        Value::Tuple(TupleValue {
+            element_types: vec![Type::named("int64")],
+            elements: vec![Value::Int(IntegerValue::from_signed(1))],
+        }),
+    );
+    let mut cleanup = Vec::new();
+    let mut fuel = crate::mir::MIR_LOOP_SAFEPOINT_INTERVAL;
+    let instruction = Instruction::BeginReturnedLoan {
+        loan: "selected".to_string(),
+        origin: "pair".to_string(),
+        projections: vec![String::new(), "0".to_string()],
+        mutable: true,
+    };
+    assert!(runtime
+        .execute_instruction(&instruction, &mut env, &mut cleanup, &mut fuel)
+        .expect_err("a returned loan requires a projection handoff")
+        .message
+        .contains("has no transferred projection"));
+    runtime.pending_returned_view_projection = Some("missing".to_string());
+    assert!(runtime
+        .execute_instruction(&instruction, &mut env, &mut cleanup, &mut fuel)
+        .expect_err("the selected projection must be declared")
+        .message
+        .contains("selected undeclared projection"));
+    runtime.pending_returned_view_projection = Some(String::new());
+    runtime
+        .execute_instruction(&instruction, &mut env, &mut cleanup, &mut fuel)
+        .expect("an empty projection aliases the origin itself");
+    assert_eq!(env.resolve_loan_place("selected").unwrap(), "pair");
+
+    runtime
+        .execute_instruction(
+            &Instruction::Reborrow {
+                loan: "same".to_string(),
+                parent: "selected".to_string(),
+                projection: String::new(),
+                mutable: true,
+            },
+            &mut env,
+            &mut cleanup,
+            &mut fuel,
+        )
+        .expect("an empty reborrow projection aliases its parent");
+    assert_eq!(env.resolve_loan_place("same").unwrap(), "pair");
+    runtime
+        .execute_instruction(
+            &Instruction::Reborrow {
+                loan: "element".to_string(),
+                parent: "selected".to_string(),
+                projection: "0".to_string(),
+                mutable: true,
+            },
+            &mut env,
+            &mut cleanup,
+            &mut fuel,
+        )
+        .expect("a projected reborrow should compose with its parent");
+    assert_eq!(env.resolve_loan_place("element").unwrap(), "pair.0");
+}
+
 fn test_runtime() -> MirRuntime {
     MirRuntime::new(
         MirModule {
@@ -18145,6 +18546,8 @@ fn mir_runtime_closure_environment_is_by_value_repeatable_and_one_shot_when_cons
                     name: "__capture_offset".to_string(),
                     value: Operand::Place("offset".to_string()),
                     ty: int_type.clone(),
+                    passing: MirReceiverKind::Value,
+                    source_place: None,
                 }],
                 consuming: false,
             },
@@ -18196,6 +18599,8 @@ fn mir_runtime_closure_environment_is_by_value_repeatable_and_one_shot_when_cons
                     name: "__capture_text".to_string(),
                     value: Operand::MovePlace("text".to_string()),
                     ty: Type::named("str"),
+                    passing: MirReceiverKind::Value,
+                    source_place: None,
                 }],
                 consuming: true,
             },

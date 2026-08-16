@@ -1,0 +1,28 @@
+class Profile:
+    name: str
+    visits: int64
+
+    def rename(mut self, value: str):
+        self.name = value
+
+
+def profile_name(profile: Profile) -> view str from profile:
+    return view profile.name
+
+
+def profile_visits(profile: mut Profile) -> view mut int64 from profile:
+    return view mut profile.visits
+
+
+def inspect(profile: mut Profile):
+    view name = profile.name
+    view another_name = name
+    print(another_name)
+
+    view mut visits = profile.visits
+    view mut nested_visits = visits
+    nested_visits = nested_visits + 1
+
+    formatter = lambda [name] prefix: prefix + name
+    mut rename = lambda [mut profile] value: profile.rename(value)
+    snapshot = lambda [own profile] _: profile.name

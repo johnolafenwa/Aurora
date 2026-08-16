@@ -46,7 +46,7 @@ test locations that must prove completion.
 35. [ADR-0035: Configurable blocking-I/O pool](0035-configurable-blocking-io-pool.md) — Accepted after the Batch 5 default-parallel watchdog closure
 36. [ADR-0036: Native structured runtime frames](0036-native-structured-runtime-frames.md) — Accepted at the Batch 4 checkpoint
 37. [ADR-0037: Expression closures and value capture](0037-expression-closures-and-value-capture.md) — Accepted at the Batch 6 opening checkpoint
-38. [ADR-0038: Place-based loans and views](0038-place-based-loans-and-views.md) — Accepted design for 0.3; unimplemented and not authorized in the 0.2 cycle
+38. [ADR-0038: Place-based loans and views](0038-place-based-loans-and-views.md) — Implemented for Aura 0.3
 39. [ADR-0039: Comprehensions](0039-comprehensions.md) — Accepted for Aura 0.2 in Batch 6, Phase 7.1
 40. [ADR-0040: Owned Vec and String slices](0040-owned-vec-and-string-slices.md) — Accepted for Aura 0.2 in Batch 6, Phase 7.2
 41. [ADR-0041: Contiguous numeric arrays and explicit integer arithmetic modes](0041-contiguous-numeric-arrays.md) — Accepted for Aura 0.2 in Batch 6, Phase 7.3

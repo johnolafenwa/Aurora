@@ -14,6 +14,297 @@ fn checked_program(source: &str) -> Program {
     crate::check_source(source).expect("source should type check")
 }
 
+#[test]
+fn adr0038_view_lowering_uses_explicit_loan_operations() {
+    let module = crate::lower_source_to_mir(
+        r#"
+class Counter:
+    value: int64
+
+def main():
+    mut counter = Counter(value=1)
+    view mut value = counter.value
+    value = 2
+"#,
+    )
+    .expect("view source should lower");
+    let main = module
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+        .expect("main MIR should exist");
+    assert!(main
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .any(|instruction| matches!(
+            instruction,
+            Instruction::BeginLoan { loan, source, mutable: true }
+                if loan == "value" && source == "counter.value"
+        )));
+}
+
+#[test]
+fn adr0038_cleanup_ends_local_loans_before_early_exit() {
+    let module = crate::lower_source_to_mir(
+        r#"
+class Counter:
+    value: int64
+
+def read(counter: Counter) -> int64:
+    view value = counter.value
+    return value
+
+def loop_once(counter: Counter):
+    while true:
+        view value = counter.value
+        print(value)
+        break
+"#,
+    )
+    .expect("early-exit loan source should lower");
+
+    for function_name in ["read", "loop_once"] {
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name == function_name)
+            .expect("lowered function should exist");
+        assert!(
+            function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .any(|instruction| matches!(instruction, Instruction::EndLoan { loan } if loan == "value")),
+            "{function_name} must release its local view on the exited path"
+        );
+    }
+}
+
+#[test]
+fn adr0038_returned_view_projection_helpers_cover_every_place_and_control_shape() {
+    assert!(place_paths_overlap("pair", "pair.left"));
+    assert!(place_paths_overlap("pair.left", "pair"));
+    assert!(!place_paths_overlap("pair.left", "pair.right"));
+    assert!(!place_paths_overlap("left.value", "right.value"));
+
+    let name = |value: &str| Expr {
+        kind: ExprKind::Name(value.to_string()),
+        span: Span::new(1, 1),
+    };
+    let aliases = BTreeMap::from([("alias".to_string(), "left".to_string())]);
+    assert_eq!(
+        return_view_projection_expr(&name("origin"), "origin", &aliases).as_deref(),
+        Some("")
+    );
+    assert_eq!(
+        return_view_projection_expr(&name("alias"), "origin", &aliases).as_deref(),
+        Some("left")
+    );
+    assert_eq!(
+        return_view_projection_expr(&name("other"), "origin", &aliases),
+        None
+    );
+    let member = Expr {
+        kind: ExprKind::Member {
+            object: Box::new(name("origin")),
+            field: "right".to_string(),
+        },
+        span: Span::new(1, 1),
+    };
+    let grouped = Expr {
+        kind: ExprKind::Group(Box::new(member)),
+        span: Span::new(1, 1),
+    };
+    let indexed = Expr {
+        kind: ExprKind::Index {
+            object: Box::new(grouped),
+            index: Box::new(Expr {
+                kind: ExprKind::Int(2),
+                span: Span::new(1, 1),
+            }),
+        },
+        span: Span::new(1, 1),
+    };
+    assert_eq!(
+        return_view_projection_expr(&indexed, "origin", &aliases).as_deref(),
+        Some("right.2")
+    );
+    for index in [
+        ExprKind::Int(u128::MAX),
+        ExprKind::Name("index".to_string()),
+    ] {
+        let invalid = Expr {
+            kind: ExprKind::Index {
+                object: Box::new(name("origin")),
+                index: Box::new(Expr {
+                    kind: index,
+                    span: Span::new(1, 1),
+                }),
+            },
+            span: Span::new(1, 1),
+        };
+        assert_eq!(
+            return_view_projection_expr(&invalid, "origin", &aliases),
+            None
+        );
+    }
+    assert_eq!(
+        return_view_projection_expr(
+            &Expr {
+                kind: ExprKind::Int(1),
+                span: Span::new(1, 1),
+            },
+            "origin",
+            &aliases,
+        ),
+        None
+    );
+
+    let module = crate::parse_source(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def explore(origin: Pair, condition: bool) -> view int64 from origin:
+    view alias = origin.left
+    if condition:
+        return view alias
+    else:
+        return view origin.right
+    match condition:
+        case true:
+            return view origin.left
+        case _:
+            pass
+    for ignored in [1]:
+        return view origin.right
+    with TaskGroup() as group:
+        return view origin.left
+    while condition:
+        return view origin.right
+    return view origin
+
+def plain():
+    pass
+"#,
+    )
+    .expect("projection collector input should parse");
+    let explore = module
+        .items
+        .iter()
+        .find_map(|item| match item {
+            crate::ast::Item::Function(function) if function.name == "explore" => Some(function),
+            _ => None,
+        })
+        .expect("explore function should be present");
+    assert_eq!(
+        return_view_projections(explore),
+        vec!["".to_string(), "left".to_string(), "right".to_string()]
+    );
+    let plain = module
+        .items
+        .iter()
+        .find_map(|item| match item {
+            crate::ast::Item::Function(function) if function.name == "plain" => Some(function),
+            _ => None,
+        })
+        .expect("plain function should be present");
+    assert!(return_view_projections(plain).is_empty());
+}
+
+#[test]
+fn adr0038_closure_capture_lowering_preserves_each_loan_mode() {
+    let module = crate::lower_source_to_mir(
+        r#"
+def main():
+    shared = 1
+    mut values = [2]
+    text = "owned"
+    callback: def(int64) -> (int64, None, str) = lambda [shared, mut values, own text] item: (shared + item, values.append(item), text)
+    print(callback(3))
+"#,
+    )
+    .expect("all closure capture capabilities should lower");
+    let main = module
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+        .expect("main should lower");
+    let captures = main
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .find_map(|instruction| match instruction {
+            Instruction::Assign {
+                value: Rvalue::Closure { captures, .. },
+                ..
+            } => Some(captures),
+            _ => None,
+        })
+        .expect("capturing lambda should emit a closure environment");
+    assert!(captures.iter().any(|capture| {
+        capture.name == "shared"
+            && capture.passing == MirReceiverKind::Borrow
+            && capture.source_place.as_deref() == Some("shared")
+    }));
+    assert!(captures.iter().any(|capture| {
+        capture.name == "values"
+            && capture.passing == MirReceiverKind::BorrowMut
+            && capture.source_place.as_deref() == Some("values")
+    }));
+    assert!(captures.iter().any(|capture| {
+        capture.name == "text"
+            && capture.passing == MirReceiverKind::Value
+            && capture.source_place.is_none()
+            && matches!(capture.value, Operand::MovePlace(_))
+    }));
+}
+
+#[test]
+fn adr0038_returned_method_views_and_immediate_call_reborrows_lower_explicitly() {
+    let module = crate::lower_source_to_mir(
+        r#"
+class Box:
+    value: int64
+
+    def identity(mut self) -> view mut Box from self:
+        return view mut self
+
+def value(box: mut Box) -> view mut int64 from box:
+    return view mut box.value
+
+def bump(value: mut int64):
+    value += 1
+
+def main():
+    mut box = Box(value=1)
+    view mut root = box.identity()
+    bump(value(root))
+    print(root.value)
+"#,
+    )
+    .expect("self-returned and immediately passed views should lower");
+    let instructions = module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .collect::<Vec<_>>();
+    assert!(instructions.iter().any(|instruction| matches!(
+        instruction,
+        Instruction::ReturnLoan { loan, origin } if loan == "self" && origin == "self"
+    )));
+    assert!(
+        instructions
+            .iter()
+            .filter(|instruction| matches!(instruction, Instruction::BeginReturnedLoan { .. }))
+            .count()
+            >= 2
+    );
+}
+
 fn lower_ffi_source(source: &str) -> MirModule {
     let module = crate::parse_source(source).expect("FFI source should parse");
     let program =
@@ -5713,6 +6004,7 @@ def main() -> int32:
         borrow_mode: Some(ReceiverKind::BorrowMut),
         body: vec![Stmt::Return(crate::ast::ReturnStmt {
             value: Some(name_expr("item")),
+            view: None,
             span: Span::new(1, 1),
         })],
         span: Span::new(1, 1),
@@ -7836,6 +8128,7 @@ def main() -> int32:
             name,
             value: Operand::Place(place),
             ty,
+            ..
         }] if name == "factor" && place == "factor" && *ty == Type::named("int64")
     ));
     assert!(matches!(
@@ -8011,6 +8304,7 @@ fn imported_lambdas_resolve_owner_qualified_metadata_and_lifted_function_ids() {
                 name,
                 value: Operand::Place(place),
                 ty,
+                ..
             }] if name == "offset" && place == "offset" && *ty == Type::named("int64")
         ));
 

@@ -4,10 +4,10 @@ use crate::ast::{
     ConstantDecl, ContinueStmt, DestructureStmt, EnumDecl, EnumPayloadFieldDecl, EnumVariantDecl,
     Expr, ExprKind, ExprStmt, ExternFunctionDecl, ExternOpaqueClassDecl, FieldDecl, ForStmt,
     FormatPart, FunctionDecl, FunctionTypeParam, IfBranch, IfStmt, ImplDecl, ImportDecl,
-    ImportKind, ImportName, Item, LambdaParam, LiteralPattern, LiteralPatternKind, MapEntryExpr,
-    MatchArm, MatchExprArm, MatchStmt, Module, Param, ParamMode, Pattern, ReceiverKind, ReturnStmt,
-    Stmt, TraitDecl, TuplePattern, TypeRef, TypeRefKind, UnaryOp, VariantPattern, WhileStmt,
-    WithStmt,
+    ImportKind, ImportName, Item, LambdaCapture, LambdaParam, LiteralPattern, LiteralPatternKind,
+    MapEntryExpr, MatchArm, MatchExprArm, MatchStmt, Module, Param, ParamMode, Pattern,
+    ReceiverKind, ReturnStmt, Stmt, TraitDecl, TuplePattern, TypeRef, TypeRefKind, UnaryOp,
+    VariantPattern, ViewKind, ViewReturn, ViewStmt, WhileStmt, WithStmt,
 };
 use crate::diag::{Diagnostic, Result, Span};
 use crate::integer::IntegerValue;
@@ -57,6 +57,7 @@ struct Parser {
     tokens: Vec<Token>,
     index: usize,
     recursion_depth: usize,
+    current_function_returns_view: bool,
 }
 
 impl Parser {
@@ -69,6 +70,7 @@ impl Parser {
             tokens,
             index: 0,
             recursion_depth,
+            current_function_returns_view: false,
         }
     }
 
@@ -267,7 +269,13 @@ impl Parser {
                 "`extern` function declarations require an explicit return type; write `-> None` when the function returns no value",
             ));
         }
-        let return_type = self.parse_return_annotation(span)?;
+        let (return_type, view_return) = self.parse_return_annotation(span)?;
+        if view_return.is_some() {
+            return Err(parse_error(
+                span,
+                "`extern` functions cannot return Aura views",
+            ));
+        }
         if self.at_simple(&TokenKind::Colon) {
             return Err(self.error_here(
                 "`extern` function declarations have no Aura body; remove `:` and the indented block",
@@ -567,10 +575,14 @@ impl Parser {
         self.expect_simple(TokenKind::LParen)?;
         let (receiver, params) = self.parse_params(allow_receiver)?;
         self.expect_simple(TokenKind::RParen)?;
-        let return_type = self.parse_return_annotation(span)?;
+        let (return_type, view_return) = self.parse_return_annotation(span)?;
         self.expect_simple(TokenKind::Colon)?;
         self.expect_newline()?;
-        let body = self.parse_block()?;
+        let previous_view_return = self.current_function_returns_view;
+        self.current_function_returns_view = view_return.is_some();
+        let body = self.parse_block();
+        self.current_function_returns_view = previous_view_return;
+        let body = body?;
 
         Ok(FunctionDecl {
             public,
@@ -580,6 +592,7 @@ impl Parser {
             receiver,
             params,
             return_type,
+            view_return,
             body,
             span,
         })
@@ -679,10 +692,14 @@ impl Parser {
         self.expect_simple(TokenKind::LParen)?;
         let (receiver, params) = self.parse_params(true)?;
         self.expect_simple(TokenKind::RParen)?;
-        let return_type = self.parse_return_annotation(span)?;
+        let (return_type, view_return) = self.parse_return_annotation(span)?;
         let body = if self.eat_simple(&TokenKind::Colon).is_some() {
             self.expect_newline()?;
-            self.parse_block()?
+            let previous_view_return = self.current_function_returns_view;
+            self.current_function_returns_view = view_return.is_some();
+            let body = self.parse_block();
+            self.current_function_returns_view = previous_view_return;
+            body?
         } else {
             self.expect_newline()?;
             Vec::new()
@@ -695,17 +712,50 @@ impl Parser {
             receiver,
             params,
             return_type,
+            view_return,
             body,
             span,
         })
     }
 
-    fn parse_return_annotation(&mut self, span: Span) -> Result<TypeRef> {
+    fn parse_return_annotation(&mut self, span: Span) -> Result<(TypeRef, Option<ViewReturn>)> {
         if self.eat_simple(&TokenKind::Arrow).is_none() {
-            return Ok(TypeRef::named("None", Vec::new(), false, span));
+            return Ok((TypeRef::named("None", Vec::new(), false, span), None));
         }
 
-        self.parse_type()
+        if matches!(self.current_kind(), TokenKind::Identifier(name) if name == "view")
+            && matches!(
+                self.peek_kind(1),
+                Some(
+                    TokenKind::KwMut
+                        | TokenKind::KwIndirect
+                        | TokenKind::KwDef
+                        | TokenKind::Identifier(_)
+                        | TokenKind::LParen
+                )
+            )
+        {
+            let view_span = self.bump().span;
+            let mutable = self.eat_simple(&TokenKind::KwMut).is_some();
+            let return_type = self.parse_type()?;
+            if self.eat_simple(&TokenKind::KwFrom).is_none() {
+                return Err(parse_error(
+                    self.current_span(),
+                    "a view return type requires `from` and one receiver or parameter origin",
+                ));
+            }
+            let origin = self.expect_identifier()?;
+            return Ok((
+                return_type,
+                Some(ViewReturn {
+                    mutable,
+                    origin,
+                    span: view_span,
+                }),
+            ));
+        }
+
+        Ok((self.parse_type()?, None))
     }
 
     fn parse_optional_type_params(&mut self, allow_bounds: bool) -> Result<ParsedTypeParams> {
@@ -922,6 +972,8 @@ impl Parser {
             self.parse_break_stmt()
         } else if self.at_simple(&TokenKind::KwContinue) {
             self.parse_continue_stmt()
+        } else if self.is_view_binding_stmt() {
+            self.parse_view_stmt()
         } else if self.is_destructure_assignment_stmt() {
             self.parse_destructure_stmt()
         } else if self.is_assignment_stmt() {
@@ -933,13 +985,56 @@ impl Parser {
 
     fn parse_return_stmt(&mut self) -> Result<Stmt> {
         let span = self.expect_keyword(TokenKind::KwReturn)?.span;
+        let view = if self.current_function_returns_view
+            && matches!(self.current_kind(), TokenKind::Identifier(name) if name == "view")
+            && !matches!(self.peek_kind(1), Some(TokenKind::Newline | TokenKind::Eof))
+        {
+            self.bump();
+            Some(if self.eat_simple(&TokenKind::KwMut).is_some() {
+                ViewKind::Mutable
+            } else {
+                ViewKind::Shared
+            })
+        } else {
+            None
+        };
         let value = if self.at_simple(&TokenKind::Newline) {
             None
         } else {
             Some(self.parse_expr()?)
         };
         self.expect_statement_terminator()?;
-        Ok(Stmt::Return(ReturnStmt { value, span }))
+        Ok(Stmt::Return(ReturnStmt { value, view, span }))
+    }
+
+    fn is_view_binding_stmt(&self) -> bool {
+        if !matches!(self.current_kind(), TokenKind::Identifier(name) if name == "view") {
+            return false;
+        }
+        matches!(
+            (self.peek_kind(1), self.peek_kind(2), self.peek_kind(3)),
+            (Some(TokenKind::Identifier(_)), Some(TokenKind::Equal), _)
+                | (
+                    Some(TokenKind::KwMut),
+                    Some(TokenKind::Identifier(_)),
+                    Some(TokenKind::Equal)
+                )
+        )
+    }
+
+    fn parse_view_stmt(&mut self) -> Result<Stmt> {
+        let span = self.bump().span;
+        let mutable = self.eat_simple(&TokenKind::KwMut).is_some();
+        let name = self.expect_identifier()?;
+        self.expect_simple(TokenKind::Equal)?;
+        let source = self.parse_expr()?;
+        self.expect_statement_terminator()?;
+        Ok(Stmt::View(ViewStmt {
+            name,
+            mutable,
+            source,
+            span,
+        }))
     }
 
     fn parse_assert_stmt(&mut self) -> Result<Stmt> {
@@ -1616,6 +1711,50 @@ impl Parser {
             TokenKind::Identifier(ref name) if name == "lambda"
         ));
 
+        let captures = if self.eat_simple(&TokenKind::LBracket).is_some() {
+            let mut captures = Vec::new();
+            if self.eat_simple(&TokenKind::RBracket).is_none() {
+                loop {
+                    let mode = if self.eat_simple(&TokenKind::KwOwn).is_some() {
+                        ParamMode::Own
+                    } else if self.eat_simple(&TokenKind::KwMut).is_some() {
+                        ParamMode::BorrowMut
+                    } else {
+                        ParamMode::Default
+                    };
+                    let capture_span = self.current_span();
+                    let name = self.expect_identifier()?;
+                    if captures
+                        .iter()
+                        .any(|capture: &LambdaCapture| capture.name == name)
+                    {
+                        return Err(parse_error(
+                            capture_span,
+                            format!("duplicate lambda capture `{name}`"),
+                        ));
+                    }
+                    captures.push(LambdaCapture {
+                        name,
+                        mode,
+                        span: capture_span,
+                    });
+                    if self.eat_simple(&TokenKind::Comma).is_none() {
+                        break;
+                    }
+                    if self.at_simple(&TokenKind::RBracket) {
+                        return Err(parse_error(
+                            self.current_span(),
+                            "expected a capture name after `,` in lambda capture list",
+                        ));
+                    }
+                }
+                self.expect_simple(TokenKind::RBracket)?;
+            }
+            Some(captures)
+        } else {
+            None
+        };
+
         let mut params: Vec<LambdaParam> = Vec::new();
         if !self.at_simple(&TokenKind::Colon) {
             loop {
@@ -1691,6 +1830,7 @@ impl Parser {
         }
         Ok(Expr {
             kind: ExprKind::Lambda {
+                captures,
                 params,
                 body: Box::new(body),
             },
@@ -3518,7 +3658,7 @@ fn offset_expr_span(expr: &mut Expr, line: usize, column_offset: usize) {
             offset_expr_span(condition, line, column_offset);
             offset_expr_span(else_expr, line, column_offset);
         }
-        ExprKind::Lambda { params, body } => {
+        ExprKind::Lambda { params, body, .. } => {
             for param in params {
                 param.span.line = line;
                 param.span.column += column_offset;

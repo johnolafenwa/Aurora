@@ -91,11 +91,13 @@ once under those parameter bindings. Aura does not infer parameter types
 from body operations. A zero-parameter lambda may infer `def() -> R` from its
 body when no expected callable type is present.
 
-Outer owned locals and `own` parameters referenced by the body are captured by
-value. Copy values are snapshotted and non-Copy values move when the lambda
-expression is evaluated. Bare and `mut` enclosing parameters are capabilities
-and cannot be captured. Captured values permit shared reads or consumption,
-but not mutation in Phase 6.3. See [Closures](/manual/closures).
+Without a capture list, outer owned locals and `own` parameters referenced by
+the body are captured by value. Copy values snapshot and non-Copy values move
+when the lambda expression is evaluated. An explicit exhaustive list may
+instead request a shared loan, mutable loan, or owned capture for each used
+outer local. Mutable-loan closures require a mutable closure place for calls;
+loan closures are non-Transfer and remain inside synchronous local use. See
+[Closures](/manual/closures).
 
 Capture-free lambdas may cross every ordinary structural function-value
 boundary. Capturing closures retain environment and call-kind metadata, so
@@ -120,6 +122,8 @@ A declaration is valid only when:
 - all referenced types exist with the correct arity
 - default expressions have exactly the declared parameter or field type
 - a non-`None` function or method returns on every statically reachable fallthrough path
+- every view-returning declaration names one bare or mutable receiver/parameter
+  origin, and every `return view` derives from that origin with matching kind
 - copy classes contain only copy-compatible fields
 - trait implementations satisfy the trait's type arguments, supertraits, method set, and method signatures
 
@@ -433,7 +437,10 @@ is safe.
 
 ## Control Flow
 
-`return` is valid only in a function or method. Its value must equal the declared return type; an omitted value has type `None`.
+`return` is valid only in a function or method. Its ordinary value must equal
+the declared return type; an omitted value has type `None`. `return view` is
+valid only under a matching declared view return and must preserve the exact
+receiver/parameter provenance root.
 
 `break` and `continue` are valid only inside `for` or `while`. A loop-local binding does not escape. Moving a non-copy outer value for the first time inside a repeatable loop is rejected unless the checker can prove the path does not create an invalid next iteration.
 
@@ -494,11 +501,10 @@ rejection uses `AU3008`, identifies the task or Queue boundary, and gives the
 nested component path that caused it, such as a field that contains `fs.File`;
 it does not suggest implementing a `Transfer` trait.
 
-A closure target is Transfer exactly when every stored capture is Transfer.
+A by-value closure target is Transfer exactly when every stored capture is Transfer.
 The complete closure value is moved or copied into task-owned storage before
-the child calls it. Capture-free lambdas are Copy and Transfer. By-value
-closure capture cannot launder shared or mutable capabilities because those
-captures are rejected when the closure is created.
+the child calls it. Capture-free lambdas are Copy and Transfer. A closure with
+any shared or mutable loan capture is non-Transfer and rejected with `AU3008`.
 
 Task-target resolution accepts a concrete function value. Explicit
 `function[Types]` specialization may produce such a value before the call;

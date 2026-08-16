@@ -7506,6 +7506,7 @@ fn function_decl(name: &str) -> FunctionDecl {
         receiver: None,
         params: Vec::new(),
         return_type: type_ref("None"),
+        view_return: None,
         body: Vec::new(),
         span: Span::new(1, 1),
     }
@@ -7733,6 +7734,8 @@ fn local_binding(
         frozen_places: BTreeMap::new(),
         shared_match_places: BTreeMap::new(),
         captured: false,
+        view: None,
+        closure_loans: Vec::new(),
     }
 }
 
@@ -13982,6 +13985,8 @@ fn checker_helper_paths_cover_imported_modules_type_args_and_binding_consumption
             frozen_places: BTreeMap::new(),
             shared_match_places: BTreeMap::new(),
             captured: false,
+            view: None,
+            closure_loans: Vec::new(),
         },
     )]);
     checker
@@ -14013,6 +14018,8 @@ fn checker_helper_paths_cover_imported_modules_type_args_and_binding_consumption
             frozen_places: BTreeMap::new(),
             shared_match_places: BTreeMap::new(),
             captured: false,
+            view: None,
+            closure_loans: Vec::new(),
         },
     )]);
     let borrowed_error = checker
@@ -14041,6 +14048,8 @@ fn checker_helper_paths_cover_imported_modules_type_args_and_binding_consumption
             frozen_places: BTreeMap::new(),
             shared_match_places: BTreeMap::new(),
             captured: false,
+            view: None,
+            closure_loans: Vec::new(),
         },
     )]);
     let moved_error = checker
@@ -15819,6 +15828,7 @@ fn checker_direct_entrypoints_cover_top_level_function_method_and_impl_paths() {
     let top_level_return = checker
         .check_top_level(&[Stmt::Return(ReturnStmt {
             value: Some(expr(ExprKind::Int(1))),
+            view: None,
             span,
         })])
         .expect_err("top-level return should be rejected");
@@ -15858,6 +15868,7 @@ fn checker_direct_entrypoints_cover_top_level_function_method_and_impl_paths() {
         .check_block(
             &[Stmt::Return(ReturnStmt {
                 value: Some(expr(ExprKind::Name("owned".to_string()))),
+                view: None,
                 span,
             })],
             &mut owned_return_locals,
@@ -15871,6 +15882,7 @@ fn checker_direct_entrypoints_cover_top_level_function_method_and_impl_paths() {
     function_ok.return_type = type_ref("int32");
     function_ok.body = vec![Stmt::Return(ReturnStmt {
         value: Some(expr(ExprKind::Int(7))),
+        view: None,
         span,
     })];
     let function_ok = FunctionInfo {
@@ -15912,6 +15924,7 @@ fn checker_direct_entrypoints_cover_top_level_function_method_and_impl_paths() {
             object: Box::new(expr(ExprKind::Name("self".to_string()))),
             field: "value".to_string(),
         })),
+        view: None,
         span,
     })];
     let method_ok = MethodInfo {
@@ -15944,6 +15957,7 @@ fn checker_direct_entrypoints_cover_top_level_function_method_and_impl_paths() {
     impl_method_ok.return_type = type_ref("int32");
     impl_method_ok.body = vec![Stmt::Return(ReturnStmt {
         value: Some(expr(ExprKind::Int(1))),
+        view: None,
         span,
     })];
     let impl_method_ok = TraitImplMethodInfo {
@@ -15973,6 +15987,7 @@ fn checker_direct_entrypoints_cover_top_level_function_method_and_impl_paths() {
     }];
     impl_method_with_default.body = vec![Stmt::Return(ReturnStmt {
         value: Some(expr(ExprKind::Int(1))),
+        view: None,
         span,
     })];
     let impl_method_with_default = TraitImplMethodInfo {
@@ -19179,6 +19194,8 @@ fn place_path_and_resource_helpers_cover_remaining_checker_paths() {
                 frozen_places: BTreeMap::new(),
                 shared_match_places: BTreeMap::new(),
                 captured: false,
+                view: None,
+                closure_loans: Vec::new(),
             },
         ),
         (
@@ -19222,6 +19239,8 @@ fn place_path_and_resource_helpers_cover_remaining_checker_paths() {
                 frozen_places: BTreeMap::new(),
                 shared_match_places: BTreeMap::new(),
                 captured: false,
+                view: None,
+                closure_loans: Vec::new(),
             },
         ),
         (
@@ -19243,6 +19262,8 @@ fn place_path_and_resource_helpers_cover_remaining_checker_paths() {
                 frozen_places: BTreeMap::new(),
                 shared_match_places: BTreeMap::new(),
                 captured: false,
+                view: None,
+                closure_loans: Vec::new(),
             },
         ),
     ]);
@@ -19391,6 +19412,8 @@ fn place_path_and_resource_helpers_cover_remaining_checker_paths() {
             frozen_places: BTreeMap::new(),
             shared_match_places: BTreeMap::new(),
             captured: false,
+            view: None,
+            closure_loans: Vec::new(),
         },
     )]);
     let receiver_error = match checker.prepare_method_receiver_borrows(
@@ -20394,6 +20417,7 @@ fn lower_type_and_imported_context_helpers_cover_builtin_and_context_paths() {
     remote_function.decl.return_type = type_ref("int32");
     remote_function.decl.body = vec![Stmt::Return(crate::ast::ReturnStmt {
         value: Some(expr(ExprKind::Int(7))),
+        view: None,
         span: Span::new(1, 1),
     })];
     let mut remote_class = class_info("Widget", false, Vec::new());
@@ -24984,6 +25008,26 @@ fn closure_type_keeps_compact_runtime_layout_and_stable_serialization() {
         call_kind: ClosureCallKind::Repeatable,
     };
 
+    assert!(type_contains_named(&closure, "str"));
+    assert!(type_reaches_class_through_non_indirect_fields(
+        &closure,
+        "str",
+        &BTreeMap::new(),
+        &mut BTreeSet::new(),
+    ));
+    assert!(type_pattern_specificity(&closure) >= 3);
+    assert!(type_pattern_matches(
+        &closure,
+        &closure,
+        &BTreeSet::new(),
+        &mut HashMap::new(),
+    ));
+    assert!(!has_unresolved_type_params(&closure));
+    assert!(matches!(
+        erase_type_callable_contracts(&closure),
+        Type::Closure { .. }
+    ));
+
     assert!(
         std::mem::size_of::<Type>() <= 48,
         "closure metadata must stay indirectly stored so Type does not inflate every runtime collection; actual Type size is {} bytes",
@@ -26959,5 +27003,967 @@ def main():
     )
     .expect(
         "tuple comprehension targets are local bindings, so they shadow same-named parameters in the output",
+    );
+}
+
+#[test]
+fn adr0038_views_enforce_overlap_and_shorten_at_last_use() {
+    crate::check_source(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def main():
+    mut pair = Pair(left=1, right=2)
+    view left = pair.left
+    print(left)
+    pair.left = 3
+    view mut right = pair.right
+    right = right + 4
+    print(pair.left)
+    print(pair.right)
+"#,
+    )
+    .expect(
+        "a last-used shared view must release before later mutation and sibling loans are disjoint",
+    );
+
+    let error = crate::check_source(
+        r#"
+class Box:
+    value: int64
+
+def main():
+    mut box = Box(value=1)
+    view value = box.value
+    box.value = 2
+    print(value)
+"#,
+    )
+    .expect_err("a later view use must keep the overlapping source shared-loaned");
+    assert_eq!(error.code, "AU3002");
+    assert!(error.message.contains("shared view `value`"));
+
+    crate::check_source(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def main():
+    mut pair = Pair(left=1, right=2)
+    view mut right = pair.right
+    right = right + 1
+    print(pair.left)
+    print(right)
+"#,
+    )
+    .expect("a mutable view permits access through itself and to a proven-disjoint sibling field");
+
+    let blocked_read = crate::check_source(
+        r#"
+class Box:
+    value: int64
+
+def main():
+    mut box = Box(value=1)
+    view mut value = box.value
+    print(box.value)
+    value = 2
+"#,
+    )
+    .expect_err("a live mutable view must block overlapping source reads");
+    assert_eq!(blocked_read.code, "AU3002");
+    assert!(blocked_read.message.contains("cannot read"));
+}
+
+#[test]
+fn adr0038_returned_views_require_declared_origin_provenance() {
+    crate::check_source(
+        r#"
+class User:
+    name: str
+
+def name(user: User) -> view str from user:
+    return view user.name
+
+def main():
+    user = User(name="Ada")
+    view name = name(user)
+    print(name)
+"#,
+    )
+    .expect("a returned shared view may derive from its declared addressable origin");
+
+    crate::check_source(
+        r#"
+class Account:
+    name: str
+
+    def name_view(self) -> view str from self:
+        return view self.name
+
+    def name_view_mut(mut self) -> view mut str from self:
+        return view mut self.name
+
+def main():
+    mut account = Account(name="Ada")
+    view name = account.name_view()
+    print(name)
+    view mut editable = account.name_view_mut()
+    editable = "Grace"
+    print(editable)
+"#,
+    )
+    .expect("receiver methods may return shared and mutable views tied to self");
+
+    crate::check_source(
+        r#"
+class Counter:
+    value: int64
+
+def value_mut(counter: mut Counter) -> view mut int64 from counter:
+    return view mut counter.value
+
+def bump(value: mut int64):
+    value += 1
+
+def main():
+    mut counter = Counter(value=1)
+    bump(value_mut(counter))
+    print(counter.value)
+"#,
+    )
+    .expect("a mutable returned view may be immediately reborrowed into a mutable call");
+
+    let error = crate::check_source(
+        r#"
+class User:
+    name: str
+
+def invalid(user: User) -> view str from user:
+    local = User(name="local")
+    return view local.name
+"#,
+    )
+    .expect_err("a returned view must not escape callee-local storage");
+    assert_eq!(error.code, "AU3010");
+
+    crate::check_source(
+        r#"
+class User:
+    name: str
+
+class Picker:
+    marker: int64
+
+trait Select:
+    def select(self, left: User, right: User) -> view str from left
+
+impl Select for Picker:
+    def select(self, first: User, second: User) -> view str from first:
+        return view first.name
+"#,
+    )
+    .expect("trait implementations may rename a returned-view origin while preserving its parameter slot");
+
+    let origin_mismatch = crate::check_source(
+        r#"
+class User:
+    name: str
+
+class Picker:
+    marker: int64
+
+trait Select:
+    def select(self, left: User, right: User) -> view str from left
+
+impl Select for Picker:
+    def select(self, first: User, second: User) -> view str from second:
+        return view second.name
+"#,
+    )
+    .expect_err("trait implementations must preserve the returned-view origin slot");
+    assert!(origin_mismatch
+        .message
+        .contains("does not match the trait signature"));
+
+    crate::check_source(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def choose_field(pair: Pair, choose_left: bool) -> view int64 from pair:
+    if choose_left:
+        return view pair.left
+    return view pair.right
+"#,
+    )
+    .expect("control flow may select different projections of one declared returned-view origin");
+}
+
+#[test]
+fn adr0038_explicit_capture_lists_are_exhaustive_and_capability_checked() {
+    crate::check_source(
+        r#"
+def main():
+    value = 3
+    callback: def(int64) -> int64 = lambda [value] item: value + item
+    print(callback(4))
+"#,
+    )
+    .expect("an exhaustive shared-loan capture list must type-check");
+
+    let error = crate::check_source(
+        r#"
+def main():
+    left = 1
+    right = 2
+    callback: def(int64) -> int64 = lambda [left] item: left + right + item
+    print(callback(3))
+"#,
+    )
+    .expect_err("every used outer local must appear in an explicit capture list");
+    assert_eq!(error.code, "AU3004");
+
+    let overlap = crate::check_source(
+        r#"
+def main():
+    mut value = 1
+    callback: def() -> int64 = lambda [value]: value
+    value = 2
+    print(callback())
+"#,
+    )
+    .expect_err("a live shared closure capture must keep its source loaned until final use");
+    assert_eq!(overlap.code, "AU3002");
+
+    let immutable_call = crate::check_source(
+        r#"
+def main():
+    mut values = [1]
+    update: def(int64) -> None = lambda [mut values] item: values.append(item)
+    update(2)
+"#,
+    )
+    .expect_err("mutable-repeatable closures require a mutable closure place");
+    assert_eq!(immutable_call.code, "AU3003");
+
+    let task_escape = crate::check_source(
+        r#"
+def main():
+    value = 1
+    worker: def() -> int64 = lambda [value]: value
+    with TaskGroup() as group:
+        task = group.start(worker)
+        print(task.result_or(-1, timeout=1s))
+"#,
+    )
+    .expect_err("loan closures must not cross a task boundary");
+    assert_eq!(task_escape.code, "AU3008");
+}
+
+#[test]
+fn adr0038_view_return_contract_validation_covers_every_invalid_origin() {
+    let cases = [
+        (
+            "def invalid() -> view int64 from self:\n    return view 1\n",
+            "`from self` is valid only on a method with a receiver",
+        ),
+        (
+            "class Box:\n    value: int64\n\n    def invalid(own self) -> view int64 from self:\n        return view self.value\n",
+            "an owned `self` receiver cannot be the origin of a returned view",
+        ),
+        (
+            "class Box:\n    value: int64\n\n    def invalid(self) -> view mut int64 from self:\n        return view mut self.value\n",
+            "a mutable returned view requires a `mut self` origin",
+        ),
+        (
+            "def invalid(value: int64) -> view int64 from missing:\n    return view value\n",
+            "returned-view origin `missing` is not a receiver or parameter",
+        ),
+        (
+            "def invalid(value: own str) -> view str from value:\n    return view value\n",
+            "owned parameter `value` cannot be the origin of a returned view",
+        ),
+        (
+            "def invalid(value: int64 = 1) -> view int64 from value:\n    return view value\n",
+            "defaulted parameter `value` cannot be the origin of a returned view",
+        ),
+        (
+            "def invalid(value: int64) -> view mut int64 from value:\n    return view mut value\n",
+            "a mutable returned view requires mutable origin parameter `value`",
+        ),
+    ];
+    for (source, expected) in cases {
+        let error = crate::check_source(source).expect_err(expected);
+        assert_eq!(
+            error.code, "AU3010",
+            "expected `{expected}`, found `{}`",
+            error.message
+        );
+        assert_eq!(error.message, expected);
+    }
+}
+
+#[test]
+fn adr0038_view_binding_diagnostics_cover_kind_place_and_shadowing_errors() {
+    let cases = [
+        (
+            "def main():\n    value = 1\n    view value = value\n",
+            "view binding `value` would shadow an existing name",
+        ),
+        (
+            "def main():\n    view value = 1\n",
+            "a view source must be an addressable local, parameter, receiver, fixed field, tuple position, or existing view",
+        ),
+        (
+            "def main():\n    value = 1\n    view mut editable = value\n",
+            "mutable view source `value` is not mutable",
+        ),
+        (
+            "def main():\n    mut value = 1\n    view shared = value\n    view mut editable = shared\n",
+            "a shared view cannot be escalated to a mutable view",
+        ),
+        (
+            "def borrowed(value: int64) -> view int64 from value:\n    return view value\n\ndef main():\n    value = 1\n    view mut mismatch = borrowed(value)\n",
+            "a returned view must initialize a view binding with the same shared or mutable kind",
+        ),
+        (
+            "def borrowed(value: mut int64) -> view mut int64 from value:\n    return view mut value\n\ndef main():\n    mut value = 1\n    view mismatch = borrowed(value)\n",
+            "a returned view must initialize a view binding with the same shared or mutable kind",
+        ),
+    ];
+    for (source, expected) in cases {
+        let error = crate::check_source(source).expect_err(expected);
+        assert_eq!(error.message, expected);
+    }
+}
+
+#[test]
+fn adr0038_return_statement_diagnostics_cover_contract_and_place_mismatches() {
+    let cases = [
+        (
+            "def invalid(value: int64) -> view int64 from value:\n    return value\n",
+            "this function must return a shared view from `value`",
+        ),
+        (
+            "def invalid(value: mut int64) -> view mut int64 from value:\n    return view value\n",
+            "this function must return a mutable view from `value`",
+        ),
+    ];
+    for (source, expected) in cases {
+        let error = crate::check_source(source).expect_err(expected);
+        assert_eq!(
+            error.code, "AU3010",
+            "expected `{expected}`, found `{}`",
+            error.message
+        );
+        assert_eq!(error.message, expected);
+    }
+}
+
+#[test]
+fn adr0038_tuple_view_places_reject_dynamic_negative_and_out_of_range_positions() {
+    let cases = [
+        (
+            "def main():\n    pair = (1, 2)\n    index = 0\n    view value = pair[index]\n",
+            "a tuple view requires a fixed integer position",
+        ),
+        (
+            "def main():\n    pair = (1, 2)\n    view value = pair[-1]\n",
+            "a tuple view requires a fixed integer position",
+        ),
+        (
+            "def main():\n    pair = (1, 2)\n    view value = pair[2]\n",
+            "tuple has no position 2",
+        ),
+    ];
+    for (source, expected) in cases {
+        let error = crate::check_source(source).expect_err(expected);
+        assert_eq!(error.code, "AU3004");
+        assert_eq!(error.message, expected);
+    }
+}
+
+#[test]
+fn adr0038_statement_reference_walker_covers_every_statement_shape() {
+    let module = crate::parse_source(
+        r#"
+def probe(needle: bool):
+    needle = false
+    view alias = needle
+    left, right = (needle, true)
+    assert needle, str(needle)
+    if needle:
+        print(needle)
+    else:
+        print(needle)
+    match needle:
+        case true if needle:
+            print(needle)
+        case _:
+            pass
+    for item in [needle]:
+        print(needle)
+    with TaskGroup() as group:
+        print(needle)
+    while needle:
+        break
+    print(needle)
+    return needle
+"#,
+    )
+    .expect("reference walker input should parse");
+    let body = module
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Function(function) if function.name == "probe" => Some(&function.body),
+            _ => None,
+        })
+        .expect("probe function should exist");
+    assert!(block_references_name(body, "needle"));
+    for stmt in body {
+        assert!(
+            stmt_references_name(stmt, "needle"),
+            "statement should retain its needle reference: {stmt:?}"
+        );
+    }
+    let pass = Stmt::Pass(crate::ast::PassStmt {
+        span: Span::new(1, 1),
+    });
+    let break_stmt = Stmt::Break(crate::ast::BreakStmt {
+        span: Span::new(1, 1),
+    });
+    let continue_stmt = Stmt::Continue(crate::ast::ContinueStmt {
+        span: Span::new(1, 1),
+    });
+    for stmt in [&pass, &break_stmt, &continue_stmt] {
+        assert!(!stmt_references_name(stmt, "needle"));
+    }
+    assert!(!block_references_name(&[], "needle"));
+}
+
+#[test]
+fn adr0038_closure_capture_loans_support_reborrowing_and_reject_overlap() {
+    crate::check_source(
+        r#"
+def main():
+    mut values = [1]
+    view mut editable = values
+    mut update: def(int64) -> None = lambda [mut editable] next: editable.append(next)
+    update(3)
+    print(editable)
+"#,
+    )
+    .expect("a mutable closure capture may reborrow an existing mutable view");
+
+    let error = crate::check_source(
+        r#"
+def main():
+    mut values = [1]
+    mut update: def(int64) -> None = lambda [mut values] next: values.append(next)
+    inspect: def() -> int64 = lambda [values]: values.len()
+    update(2)
+    print(inspect())
+"#,
+    )
+    .expect_err("overlapping closure loans must conflict while both closures remain live");
+    assert_eq!(error.code, "AU3002");
+}
+
+#[test]
+fn adr0038_reference_walker_exercises_nonmatching_nested_paths() {
+    let module = crate::parse_source(
+        r#"
+def probe(value: bool):
+    pair[0] = value
+    assert value, str(value)
+    if value:
+        print(value)
+    else:
+        print(value)
+    match value:
+        case true if value:
+            print(value)
+    for item in [value]:
+        print(value)
+    with TaskGroup() as group:
+        print(value)
+    while value:
+        print(value)
+    return value
+"#,
+    )
+    .expect("reference walker branch input should parse");
+    let body = module
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Function(function) if function.name == "probe" => Some(&function.body),
+            _ => None,
+        })
+        .expect("probe function should exist");
+    for stmt in body {
+        assert!(!stmt_references_name(stmt, "absent"));
+    }
+}
+
+#[test]
+fn adr0038_additional_view_diagnostics_cover_call_and_tuple_place_edges() {
+    let cases = [
+        (
+            "def main():\n    mut values = [1]\n    view mut item = values[0]\n",
+            "indexed collection elements do not have stable view identity",
+        ),
+        (
+            "def bump(value: mut int64):\n    value += 1\n\ndef main():\n    mut values = [1, 2]\n    bump(values[0])\n",
+            "must be a mutable place",
+        ),
+        (
+            "def plain() -> int64:\n    return 1\n\ndef main():\n    view invalid = plain()\n",
+            "a view source must be an addressable",
+        ),
+        (
+            "class Box:\n    value: int64\n\n    def value_view(self) -> view int64 from self:\n        return view self.value\n\ndef main():\n    view invalid = Box(value=1).value_view()\n",
+            "requires an addressable receiver place",
+        ),
+        (
+            "def identity(value: int64) -> view int64 from value:\n    return view value\n\ndef main():\n    view invalid = identity(1 + 2)\n",
+            "requires an addressable caller place",
+        ),
+    ];
+    for (source, expected) in cases {
+        let error = crate::check_source(source).expect_err(expected);
+        assert!(
+            error.message.contains(expected),
+            "expected `{expected}`, found `{}`",
+            error.message
+        );
+    }
+
+    let tuple_overlap = crate::check_source(
+        r#"
+def main():
+    mut pair = (1, 2)
+    view first = pair[0]
+    view mut conflicting = pair[0]
+    print(first)
+    print(conflicting)
+"#,
+    )
+    .expect_err("tuple projection overlap should be diagnosed using the exact place");
+    assert!(tuple_overlap.message.contains("pair[0]"));
+
+    let mut missing_value = crate::parse_source(
+        "def invalid(value: int64) -> view int64 from value:\n    return view value\n",
+    )
+    .expect("valid view return should parse before AST corruption");
+    let function = missing_value
+        .items
+        .iter_mut()
+        .find_map(|item| match item {
+            Item::Function(function) => Some(function),
+            _ => None,
+        })
+        .expect("test function should exist");
+    let Stmt::Return(return_stmt) = &mut function.body[0] else {
+        panic!("test function should contain a return")
+    };
+    return_stmt.value = None;
+    let error =
+        super::check(missing_value).expect_err("view-return ASTs must retain an addressable value");
+    assert!(error
+        .message
+        .contains("a view return requires an addressable source place"));
+
+    let mut missing_contract = crate::parse_source(
+        "def invalid(value: int64) -> view int64 from value:\n    return view value\n",
+    )
+    .expect("valid view return should parse before contract removal");
+    let function = missing_contract
+        .items
+        .iter_mut()
+        .find_map(|item| match item {
+            Item::Function(function) => Some(function),
+            _ => None,
+        })
+        .expect("test function should exist");
+    function.view_return = None;
+    let error = super::check(missing_contract)
+        .expect_err("return-view ASTs require matching function contracts");
+    assert!(error
+        .message
+        .contains("requires a matching `-> view ... from source` declaration"));
+
+    let mut literal_return = crate::parse_source(
+        "def invalid(value: int64) -> view int64 from value:\n    return view value\n",
+    )
+    .expect("valid view return should parse before replacing its source");
+    let function = literal_return
+        .items
+        .iter_mut()
+        .find_map(|item| match item {
+            Item::Function(function) => Some(function),
+            _ => None,
+        })
+        .expect("test function should exist");
+    let Stmt::Return(return_stmt) = &mut function.body[0] else {
+        panic!("test function should contain a return")
+    };
+    return_stmt.value = Some(expr(ExprKind::Int(1)));
+    let error =
+        super::check(literal_return).expect_err("view-return ASTs must retain a place expression");
+    assert!(error.message.contains("must derive from its declared"));
+}
+
+#[test]
+fn adr0038_shared_repeats_self_reborrows_and_mutable_capture_transfer_are_checked() {
+    crate::check_source(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+    def identity(mut self) -> view mut Pair from self:
+        return view mut self
+
+def main():
+    mut pair = Pair(left=1, right=2)
+    view first = pair.left
+    view second = pair.left
+    print(first)
+    print(second)
+    view mut root = pair
+    view mut nested = root.identity()
+    nested.right = 3
+    print(nested.right)
+"#,
+    )
+    .expect("shared loans may coexist and self-returned views may reborrow an existing view");
+
+    let mutable_lock = crate::check_source(
+        r#"
+def main():
+    mut pair = (1, 2)
+    view mut first = pair[0]
+    pair[0] = 3
+    print(first)
+"#,
+    )
+    .expect_err("a live mutable tuple view must block source mutation");
+    assert!(mutable_lock.message.contains("mutable view `first`"));
+
+    let transfer = crate::check_source(
+        r#"
+def main():
+    mut values = [1]
+    mut worker: def() -> None = lambda [mut values]: values.append(2)
+    with TaskGroup() as group:
+        task = group.start(worker)
+        task.result_or(None, timeout=1s)
+"#,
+    )
+    .expect_err("a mutable closure loan cannot cross a task boundary");
+    assert_eq!(transfer.code, "AU3008");
+    assert!(transfer.message.contains("mutable"));
+}
+
+#[test]
+fn adr0038_self_origin_trait_contracts_compare_by_receiver_slot() {
+    crate::check_source(
+        r#"
+class Box:
+    value: int64
+
+trait Inspect:
+    def inspect(self) -> view int64 from self
+
+impl Inspect for Box:
+    def inspect(self) -> view int64 from self:
+        return view self.value
+"#,
+    )
+    .expect("trait and implementation self-origin contracts should compare structurally");
+}
+
+#[test]
+fn adr0038_view_place_helpers_cover_defensive_call_and_projection_edges() {
+    let mut program = crate::check_source(
+        r#"
+class Box:
+    value: int64
+
+    def borrow(self) -> view int64 from self:
+        return view self.value
+
+def shared(value: int64) -> view int64 from value:
+    return view value
+
+def second(first: int64, second: int64) -> view int64 from second:
+    return view second
+
+def main():
+    pass
+"#,
+    )
+    .expect("view helper program should type check");
+
+    let mut named_self = program.classes["Box"].methods["borrow"].clone();
+    named_self.decl.name = "named_self".to_string();
+    program.functions.insert(
+        "named_self".to_string(),
+        FunctionInfo {
+            module_name: program.module_name.clone(),
+            decl: named_self.decl,
+            signature: named_self.signature,
+            type_param_bounds: named_self.type_param_bounds,
+        },
+    );
+
+    let mut missing_origin = program.functions["shared"].clone();
+    missing_origin.decl.name = "missing_origin".to_string();
+    missing_origin
+        .decl
+        .view_return
+        .as_mut()
+        .expect("shared has a returned-view contract")
+        .origin = "missing".to_string();
+    program
+        .functions
+        .insert("missing_origin".to_string(), missing_origin);
+
+    let mut default_origin = program.functions["second"].clone();
+    default_origin.decl.name = "default_origin".to_string();
+    default_origin.decl.params[1].default = Some(expr(ExprKind::Int(0)));
+    program
+        .functions
+        .insert("default_origin".to_string(), default_origin);
+
+    let (type_names, type_arities) = type_maps_from_program(&program);
+    let checker = FunctionChecker::new(
+        &program.module_name,
+        &type_names,
+        &type_arities,
+        empty_canonical_type_names(),
+        &program.classes,
+        &program.enums,
+        &program.functions,
+        &program.constants,
+        &program.traits,
+        &program.trait_impls,
+        &program.imported_modules,
+        &program.module_registry,
+    );
+    let mut locals = HashMap::from([
+        (
+            "tuple".to_string(),
+            local_binding(
+                Type::Tuple(vec![Type::named("int64"), Type::named("int64")]),
+                true,
+                true,
+                ReceiverKind::Value,
+                false,
+                &[],
+            ),
+        ),
+        (
+            "items".to_string(),
+            local_binding(
+                Type::Named("list".to_string(), vec![Type::named("int64")]),
+                true,
+                true,
+                ReceiverKind::Value,
+                false,
+                &[],
+            ),
+        ),
+        (
+            "box".to_string(),
+            local_binding(
+                Type::named("Box"),
+                true,
+                true,
+                ReceiverKind::Value,
+                false,
+                &[],
+            ),
+        ),
+        (
+            "value".to_string(),
+            local_binding(
+                Type::named("int64"),
+                true,
+                true,
+                ReceiverKind::Value,
+                false,
+                &[],
+            ),
+        ),
+    ]);
+    let name = |name: &str| expr(ExprKind::Name(name.to_string()));
+    let index = |object: &str, position: Expr| {
+        expr(ExprKind::Index {
+            object: Box::new(name(object)),
+            index: Box::new(position),
+        })
+    };
+    let call = |callee: Expr, args: Vec<Argument>| {
+        expr(ExprKind::Call {
+            callee: Box::new(callee),
+            args,
+        })
+    };
+
+    assert!(!checker
+        .is_mutable_place(&index("items", expr(ExprKind::Int(0))), &mut locals)
+        .expect("list indexing is not a stable mutable place"));
+    assert!(!checker
+        .is_mutable_place(&index("tuple", name("value")), &mut locals,)
+        .expect("dynamic tuple indexing is not a mutable place"));
+    let enormous = expr(ExprKind::Int(u128::MAX));
+    assert!(!checker
+        .is_mutable_place(&index("tuple", enormous.clone()), &mut locals)
+        .expect("unrepresentable tuple positions are not mutable places"));
+    assert!(!checker
+        .is_mutable_place(&index("tuple", expr(ExprKind::Int(4))), &mut locals)
+        .expect("out-of-bounds tuple positions are not mutable places"));
+    assert!(!checker
+        .is_mutable_place(&call(name("shared"), vec![arg(name("value"))]), &mut locals,)
+        .expect("shared returned views are not mutable places"));
+    let invalid_position = checker
+        .view_place(&index("tuple", enormous), &mut locals)
+        .expect_err("tuple view positions must fit usize");
+    assert!(invalid_position
+        .message
+        .contains("invalid tuple view position"));
+
+    assert!(checker
+        .returned_view_call_place(&expr(ExprKind::Int(1)), &[], &mut locals)
+        .expect("a literal is not a returned-view call")
+        .is_none());
+    let tuple_member = expr(ExprKind::Member {
+        object: Box::new(name("tuple")),
+        field: "missing".to_string(),
+    });
+    assert!(checker
+        .returned_view_call_place(&tuple_member, &[], &mut locals)
+        .expect("non-class member calls have no returned-view origin")
+        .is_none());
+    let box_member = expr(ExprKind::Member {
+        object: Box::new(name("box")),
+        field: "missing".to_string(),
+    });
+    assert!(checker
+        .returned_view_call_place(&box_member, &[], &mut locals)
+        .expect("unknown methods have no returned-view origin")
+        .is_none());
+    let self_error = checker
+        .returned_view_call_place(&name("named_self"), &[], &mut locals)
+        .expect_err("self-origin functions require a receiver");
+    assert!(self_error.message.contains("requires an instance receiver"));
+    assert!(checker
+        .returned_view_call_place(&name("missing_origin"), &[arg(name("value"))], &mut locals,)
+        .expect("an inconsistent origin name cannot resolve")
+        .is_none());
+    let default_error = checker
+        .returned_view_call_place(&name("default_origin"), &[arg(name("value"))], &mut locals)
+        .expect_err("a returned-view origin cannot be satisfied by a default");
+    assert!(default_error.message.contains("must be supplied"));
+
+    let grouped_origin = call(
+        name("shared"),
+        vec![arg(expr(ExprKind::Group(Box::new(name("value")))))],
+    );
+    assert!(checker
+        .returned_view_call_parent(&grouped_origin, &mut locals)
+        .is_none());
+    assert!(checker
+        .returned_view_call_parent(&call(tuple_member.clone(), Vec::new()), &mut locals)
+        .is_none());
+    assert!(checker
+        .returned_view_call_parent(&call(expr(ExprKind::Int(1)), Vec::new()), &mut locals)
+        .is_none());
+    assert!(checker
+        .returned_view_call_kind(&call(tuple_member, Vec::new()), &mut locals)
+        .expect("non-class member calls have no returned-view kind")
+        .is_none());
+    assert!(checker
+        .returned_view_call_kind(&call(expr(ExprKind::Int(1)), Vec::new()), &mut locals)
+        .expect("literal callees have no returned-view kind")
+        .is_none());
+
+    let mut disjoint_loan = local_binding(
+        Type::named("Box"),
+        true,
+        true,
+        ReceiverKind::Value,
+        false,
+        &[],
+    );
+    disjoint_loan.view = Some(ViewBinding {
+        kind: crate::ast::ViewKind::Mutable,
+        source: PlacePath::root("box".to_string()),
+        created_at: Span::new(1, 1),
+        last_use: Span::new(2, 1),
+    });
+    locals.insert("disjoint".to_string(), disjoint_loan);
+    checker
+        .ensure_view_loan_available(
+            &PlacePath::root("tuple".to_string()),
+            crate::ast::ViewKind::Mutable,
+            None,
+            Span::new(3, 1),
+            &locals,
+        )
+        .expect("disjoint active loans do not conflict");
+
+    let not_a_tuple = checker
+        .place_path_type(
+            &PlacePath::root("items".to_string()).with_tuple(0),
+            &locals,
+            Span::new(4, 1),
+        )
+        .expect_err("tuple projection on a list must fail");
+    assert!(not_a_tuple
+        .message
+        .contains("cannot project tuple position"));
+    let out_of_bounds = checker
+        .place_path_type(
+            &PlacePath::root("tuple".to_string()).with_tuple(9),
+            &locals,
+            Span::new(5, 1),
+        )
+        .expect_err("out-of-bounds tuple paths must fail");
+    assert!(out_of_bounds.message.contains("tuple has no position 9"));
+}
+
+#[test]
+fn adr0038_lambda_capture_lists_reject_unused_and_immutable_mut_entries() {
+    let unused = crate::check_source(
+        "def main():\n    value = 1\n    callback: def(int64) -> int64 = lambda [value] item: item\n",
+    )
+    .expect_err("listed captures must be used by the lambda body");
+    assert!(
+        unused
+            .message
+            .contains("capture-list entry `value` is not used"),
+        "unexpected diagnostic: {}",
+        unused.message
+    );
+
+    let immutable = crate::check_source(
+        "def main():\n    value = 1\n    callback: def() -> int64 = lambda [mut value]: value\n",
+    )
+    .expect_err("mutable capture entries require a mutable source place");
+    assert!(
+        immutable
+            .message
+            .contains("capture `mut value` requires a mutable place"),
+        "unexpected diagnostic: {}",
+        immutable.message
     );
 }

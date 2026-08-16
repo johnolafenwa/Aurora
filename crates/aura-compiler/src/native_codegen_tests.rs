@@ -19,8 +19,8 @@ use super::{
     ordered_optional_named_args, release_direct_call_results, release_direct_values,
     render_direct_type, runtime_type_is_wildcard, signature_for, thunk_signature,
     thunk_string_constant, unbox_thunk_value, validate_function, validate_operand, validate_rvalue,
-    validate_tuple_projection_operand, validate_tuple_take_place, DirectType, NativeCodegen,
-    PlainClassField, PlainClassType, ScalarKind,
+    validate_tuple_projection_operand, validate_tuple_take_place, DirectType, DirectViewPlace,
+    NativeCodegen, PlainClassField, PlainClassType, ScalarKind,
 };
 use crate::ast::{BinaryOp, UnaryOp};
 use crate::diag::Span;
@@ -32,6 +32,171 @@ use crate::mir::{
 };
 use crate::sema::Type;
 use crate::{lower_path_to_mir, lower_source_to_mir};
+
+#[test]
+fn adr0038_local_and_returned_views_compile_through_direct_backend() {
+    let module = lower_source_to_mir(
+        r#"
+class Counter:
+    value: int64
+
+def value_mut(counter: mut Counter) -> view mut int64 from counter:
+    return view mut counter.value
+
+class Pair:
+    left: int64
+    right: int64
+
+class Matrix:
+    left: Pair
+    right: Pair
+
+class Labels:
+    left: str
+    right: str
+
+def choose(pair: mut Pair, left: bool) -> view mut int64 from pair:
+    if left:
+        return view mut pair.left
+    return view mut pair.right
+
+def identity(pair: mut Pair) -> view mut Pair from pair:
+    return view mut pair
+
+def choose_pair(matrix: mut Matrix, left: bool) -> view mut Pair from matrix:
+    if left:
+        return view mut matrix.left
+    return view mut matrix.right
+
+def choose_label(labels: mut Labels, left: bool) -> view mut str from labels:
+    if left:
+        return view mut labels.left
+    return view mut labels.right
+
+def main():
+    mut counter = Counter(value=1)
+    view mut local = counter.value
+    local = 2
+    view mut returned = value_mut(counter)
+    returned = 3
+    print(counter.value)
+    mut pair = (4, 5)
+    view mut tuple_item = pair[1]
+    tuple_item = 6
+    print(pair)
+    mut selected = Pair(left=7, right=8)
+    view mut selected_right = choose(selected, false)
+    selected_right = 9
+    print(selected.right)
+    view mut whole = identity(selected)
+    whole.left = 10
+    mut matrix = Matrix(left=Pair(left=11, right=12), right=Pair(left=13, right=14))
+    view mut selected_pair = choose_pair(matrix, false)
+    view mut nested_selection = choose(selected_pair, true)
+    nested_selection = 15
+    print(matrix.right.left)
+    mut labels = Labels(left="Ada", right="Grace")
+    view mut selected_label = choose_label(labels, false)
+    print(selected_label)
+    selected_label = "Lin"
+    print(labels.right)
+"#,
+    )
+    .expect("view source should lower for direct codegen");
+    emit_host_object(&module).expect("direct codegen should preserve view place identity");
+}
+
+#[test]
+fn adr0038_direct_codegen_rejects_malformed_loan_and_capture_metadata() {
+    let closure_source = r#"
+def main():
+    mut values = [1]
+    mut update: def(int64) -> None = lambda [mut values] item: values.append(item)
+    update(2)
+"#;
+    let closure_module = lower_source_to_mir(closure_source)
+        .expect("mutable closure capture source should lower for direct validation");
+    emit_host_object(&closure_module)
+        .expect("valid mutable capture metadata should compile through direct codegen");
+
+    let mutate_capture =
+        |module: &mut crate::mir::MirModule,
+         update: &mut dyn FnMut(&mut crate::mir::MirClosureCapture)| {
+            let capture = module
+                .functions
+                .iter_mut()
+                .flat_map(|function| &mut function.blocks)
+                .flat_map(|block| &mut block.instructions)
+                .find_map(|instruction| match instruction {
+                    Instruction::Assign {
+                        value: Rvalue::Closure { captures, .. },
+                        ..
+                    } => captures
+                        .iter_mut()
+                        .find(|capture| capture.passing == MirReceiverKind::BorrowMut),
+                    _ => None,
+                })
+                .expect("lowered mutable closure should retain its capture metadata");
+            update(capture);
+        };
+
+    let mut missing_source = closure_module.clone();
+    mutate_capture(&mut missing_source, &mut |capture| {
+        capture.source_place = None
+    });
+    let error = emit_host_object(&missing_source)
+        .expect_err("mutable direct captures require an exact source place");
+    assert!(
+        error.contains("has no source place"),
+        "unexpected error: {error}"
+    );
+
+    let mut generic_type = closure_module;
+    mutate_capture(&mut generic_type, &mut |capture| {
+        capture.ty = Type::TypeParam("Unresolved".to_string())
+    });
+    emit_host_object(&generic_type)
+        .expect("direct closure metadata retains unresolved generic captures as opaque values");
+
+    let mut escaped = lower_source_to_mir(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def invalid(pair: mut Pair, other: mut Pair) -> view mut int64 from pair:
+    return view mut pair.left
+"#,
+    )
+    .expect("valid returned-view source should lower before metadata corruption");
+    let return_loan = escaped
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match instruction {
+            Instruction::ReturnLoan { origin, .. } => Some(origin),
+            _ => None,
+        })
+        .expect("returned view should emit ReturnLoan metadata");
+    *return_loan = "other".to_string();
+    let error = emit_host_object(&escaped)
+        .expect_err("direct returned loans must remain within their declared origin");
+    assert!(
+        error.contains("has no projection within origin `other`"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn adr0038_direct_view_place_projection_handles_root_and_nested_paths() {
+    let root = DirectViewPlace::static_place("origin".to_string());
+    assert_eq!(root.clone().project("").alternatives[0].place, "origin");
+    assert_eq!(
+        root.project("left.value").alternatives[0].place,
+        "origin.left.value"
+    );
+}
 
 fn test_function_operand(name: &str, params: Vec<Type>, return_type: Type) -> Operand {
     Operand::Function {
@@ -13411,5 +13576,135 @@ fn direct_validation_accepts_assert_fail_operands_and_rejects_unknown_places() {
     assert!(
         error.contains("rendered assertion capture to be `str`, found `int64`"),
         "unexpected capture type error: {error}"
+    );
+}
+
+#[test]
+fn adr0038_direct_return_projection_selection_and_tuple_errors_are_codegen_checked() {
+    let pair_type = Type::named("Pair");
+    let returned_module = crate::mir::MirModule {
+        constants: Vec::new(),
+        functions: vec![
+            MirFunction {
+                name: "dynamic_return".to_string(),
+                module_name: "<test>".to_string(),
+                source_path: None,
+                span: Span::new(1, 1),
+                receiver: None,
+                params: vec![MirParam {
+                    name: "origin".to_string(),
+                    passing: MirReceiverKind::BorrowMut,
+                    ty: pair_type.clone(),
+                    default_function: None,
+                }],
+                local_types: vec![MirLocalType {
+                    name: "selected".to_string(),
+                    ty: Type::named("int64"),
+                }],
+                return_type: Type::named("int32"),
+                entry: "entry".to_string(),
+                blocks: vec![BasicBlock {
+                    label: "entry".to_string(),
+                    instructions: vec![
+                        Instruction::BeginReturnedLoan {
+                            loan: "selected".to_string(),
+                            origin: "origin".to_string(),
+                            projections: vec!["left".to_string(), "left".to_string()],
+                            mutable: true,
+                        },
+                        Instruction::ReturnLoan {
+                            loan: "selected".to_string(),
+                            origin: "selected".to_string(),
+                        },
+                    ],
+                    terminator: Terminator::Return(Operand::Int(0)),
+                }],
+            },
+            MirFunction {
+                name: "main".to_string(),
+                module_name: "<test>".to_string(),
+                source_path: None,
+                span: Span::new(1, 1),
+                receiver: None,
+                params: Vec::new(),
+                local_types: Vec::new(),
+                return_type: Type::named("int32"),
+                entry: "entry".to_string(),
+                blocks: vec![BasicBlock {
+                    label: "entry".to_string(),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Return(Operand::Int(0)),
+                }],
+            },
+        ],
+        classes: vec![crate::mir::MirClass {
+            name: "Pair".to_string(),
+            type_params: Vec::new(),
+            fields: vec![
+                crate::mir::MirClassField {
+                    name: "left".to_string(),
+                    ty: Type::named("int64"),
+                },
+                crate::mir::MirClassField {
+                    name: "right".to_string(),
+                    ty: Type::named("int64"),
+                },
+            ],
+            methods: Vec::new(),
+        }],
+        trait_impls: Vec::new(),
+        top_level: None,
+    };
+    emit_host_object(&returned_module)
+        .expect("dynamic returned-view projection selection should compile");
+
+    let malformed_tuple_module = |projection: &str| crate::mir::MirModule {
+        constants: Vec::new(),
+        functions: vec![MirFunction {
+            name: format!("tuple_projection_{projection}"),
+            module_name: "<test>".to_string(),
+            source_path: None,
+            span: Span::new(1, 1),
+            receiver: None,
+            params: vec![MirParam {
+                name: "origin".to_string(),
+                passing: MirReceiverKind::Borrow,
+                ty: Type::Tuple(vec![Type::named("int64"), Type::named("int64")]),
+                default_function: None,
+            }],
+            local_types: vec![MirLocalType {
+                name: "target".to_string(),
+                ty: Type::named("int64"),
+            }],
+            return_type: Type::named("int32"),
+            entry: "entry".to_string(),
+            blocks: vec![BasicBlock {
+                label: "entry".to_string(),
+                instructions: vec![
+                    Instruction::BeginLoan {
+                        loan: "selected".to_string(),
+                        source: format!("origin.{projection}"),
+                        mutable: false,
+                    },
+                    Instruction::ReadLoan {
+                        target: "target".to_string(),
+                        loan: "selected".to_string(),
+                    },
+                ],
+                terminator: Terminator::Return(Operand::Int(0)),
+            }],
+        }],
+        classes: Vec::new(),
+        trait_impls: Vec::new(),
+        top_level: None,
+    };
+    let invalid = emit_host_object(&malformed_tuple_module("invalid"))
+        .expect_err("tuple view projections must be fixed positions");
+    assert!(invalid.contains("is not a fixed position"), "{invalid}");
+    let out_of_bounds = emit_host_object(&malformed_tuple_module("4"))
+        .expect_err("tuple view projections must remain in bounds");
+    assert!(
+        out_of_bounds.contains("has no element at index 4"),
+        "{out_of_bounds}"
     );
 }

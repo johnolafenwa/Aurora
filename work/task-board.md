@@ -1,6 +1,40 @@
 # Task Board
 
-Last updated: 2026-08-15
+Last updated: 2026-08-16
+
+## ADR-0038 loans and views (complete)
+
+- Implemented place identity for local/parameter/receiver roots, fixed class
+  fields, fixed tuple positions, and contained reborrows, with conservative
+  inferred last-use regions and disjoint-projection analysis.
+- Implemented shared and mutable local views, returned receiver/parameter views,
+  immediate write-through, trait origin-slot checking, early-exit/scope loan
+  cleanup, and the `AU3010` view escape/provenance diagnostic family.
+- Returned-view declarations permit control flow to select different fixed
+  projections of one origin. MIR and direct execution hand off the exact
+  selected projection while the checker conservatively locks the origin.
+- Implemented exhaustive shared/mutable/owned lambda capture lists, shared- and
+  mutable-repeatable call kinds, consuming mixed environments, task/Transfer
+  rejection, and exact-once closure-loan teardown.
+- MIR execution and direct native builds share explicit loan lowering and pass
+  local, returned, method, tuple, reborrow, and closure write-through probes.
+  Analysis/LSP, TextMate syntax, snippets, and semantic-interface schema 6 are
+  updated.
+- The ADR is ratified. The Manual, tutorials, maintained example, generated
+  agent documentation, language server, and editor tooling are updated in the
+  same change family.
+- Verification is green: 365 CLI tests, 1,707 compiler library tests, all
+  integration and fixture suites, the forced MIR/direct fixture matrix (1
+  aggregate, 0 mismatches), 110 LSP tests, 25 extension tests, and 100% LSP
+  coverage. Compiler coverage is 94.78% regions, 97.23% functions, and 96.37%
+  lines. Reference integrity, 339 tutorial fences, the production docs build,
+  formatting, Clippy, npm/Cargo audit, and hygiene pass.
+- The live npm audit disclosed a transitive `nanoid <3.3.18` advisory during
+  final verification. The lockfile now resolves the compatible patched 3.3.18
+  release and npm reports zero vulnerabilities.
+- Protected user files remain untouched: `personal/file_ops.au` and the
+  untracked ADR-0022 draft.
+- Work note: `work/2026-08-16-adr0038-loans-and-views.md`.
 
 ## ADR-0045/ADR-0049 checkpoint cleanup (complete)
 

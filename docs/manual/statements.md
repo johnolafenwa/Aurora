@@ -7,6 +7,7 @@ Statements introduce and update bindings, control execution, or evaluate an expr
 Aura 0.3 statements are:
 
 - binding and assignment
+- local `view` bindings
 - expression statements
 - `return`
 - `assert`
@@ -150,6 +151,24 @@ language-level partial assignment contract.
 
 See [Ownership And Borrowing](/manual/ownership-and-borrowing) for moves, partial field moves, and mutable-place rules.
 
+## View Bindings
+
+`view name = place` creates an immutable shared alias, and `view mut name =
+place` creates a non-rebindable mutable write-through alias. The initializer
+must resolve to a supported addressable root, field path, fixed tuple position,
+or existing view; collection indexes and computed temporaries are rejected.
+
+    mut pair = (1, 2)
+    view mut second = pair[1]
+    second = 7
+    print(pair)
+
+The binding's pointee type is inferred. Assigning through a mutable view
+changes the source; it does not retarget the view. Static final-use analysis
+ends its loan as early as control flow safely permits. Overlapping mutation,
+move, rebind, cleanup, or another mutable loan is rejected while it remains
+live. Scope and control-flow exits release active loans before outer cleanup.
+
 ## Expression Statements
 
 Any expression may be used as a statement when its produced value is not needed:
@@ -171,7 +190,11 @@ def answer() -> int32:
     return 42
 ```
 
-The expression is evaluated before control returns. Its type must equal the declared return type. Bare `return` produces `None` and is valid only where `None` is a valid return.
+The expression is evaluated before control returns. Its type must equal the
+declared return type. Bare `return` produces `None` and is valid only where
+`None` is a valid return. Inside a declared view-returning function, `return
+view [mut] place` hands a matching loan derived from the named `from` origin to
+the caller.
 
 ```aura
 def maybe_log(enabled: bool):

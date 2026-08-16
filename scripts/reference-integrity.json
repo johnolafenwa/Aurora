@@ -272,7 +272,7 @@
       "stderr": ""
     },
     "docs/manual/closures.md#ebnf-1": {
-      "sha256": "82f928fdaab5e9899e07335b68a7580cec908caceee4f16ec4a7ecb2c4ace246",
+      "sha256": "2dd72c165951648c2c104222636dbcf9fff1278bd1f520c96cf93bb8a84f5d92",
       "mode": "illustrative",
       "reason": "Normative expression-lambda EBNF interpreted by the grammar prose, not Aura source."
     },
@@ -340,7 +340,7 @@
       "reason": "Long-running documentation development server command."
     },
     "docs/manual/cli-and-tooling.md#json-1": {
-      "sha256": "2aab4e79268630f40c20f1ce37f7c51d75f5a26b029d011a829d32ffdde7b0cc",
+      "sha256": "40e1e2746a98715043ae7483f4df7fe8e4559f4e77f3b3611b5bb2aba192a856",
       "mode": "illustrative",
       "reason": "Two-line analysis-service request transcript, not a single executable JSON document."
     },
@@ -988,7 +988,7 @@
       "reason": "Normative match-statement-and-pattern EBNF fragment interpreted by the grammar prose, not Aura source."
     },
     "docs/manual/grammar.md#ebnf-13": {
-      "sha256": "9a2436e7ee7c641abd08af478f3085689b5529feda1ef96c93bca39cd215a2b2",
+      "sha256": "e389beba9a40dae74e463c8beef5210c752fc82b9807361943ae25c6dfaade7f",
       "mode": "illustrative",
       "reason": "Normative EBNF expression grammar, not an executable Aura program."
     },
@@ -1033,7 +1033,7 @@
       "reason": "Normative enum-declaration EBNF fragment interpreted by the grammar prose, not Aura source."
     },
     "docs/manual/grammar.md#ebnf-7": {
-      "sha256": "49e5b06392856bbc85054b6bb408462a43b37ee69bbc22847addaffdaa48f282",
+      "sha256": "3e8540c47d94d43a06a4ac15bb41f19a2295d376a6e2e617f190ad0082d68fff",
       "mode": "illustrative",
       "reason": "Normative callable-and-parameter EBNF fragment interpreted by the grammar prose, not Aura source."
     },
@@ -1043,7 +1043,7 @@
       "reason": "Normative trait-and-implementation EBNF fragment interpreted by the grammar prose, not Aura source."
     },
     "docs/manual/grammar.md#ebnf-9": {
-      "sha256": "44bdd30487d5be8a6ce10962f0db8541737c51a608e3f6b6705edc1b61bc7421",
+      "sha256": "4ef85b428a6200a6a2bd1fa736b7276df44020fc72c20c0fcbac364817a69dc3",
       "mode": "illustrative",
       "reason": "Normative statement-and-assignment EBNF fragment interpreted by the grammar prose, not Aura source."
     },

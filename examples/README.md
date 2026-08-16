@@ -86,6 +86,15 @@ printed-output order unless they explicitly coordinate that order.
     - `6`
     - `6`
     - `owned`
+- `views.au`
+  - shared and mutable local views, returned view provenance, mutable
+    reborrowing, inferred final-use release, fixed tuple-place identity, and a
+    mutable-repeatable loan closure
+  - prints:
+    - `Ada`
+    - `2`
+    - `9`
+    - `(10, 21)`
 - `borrow_parameters.au`
   - free-function bare shared and `mut` parameters with caller-visible mutation
   - prints:

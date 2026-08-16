@@ -20,6 +20,7 @@ fn dummy_function(name: &str) -> FunctionDecl {
         receiver: Some(ReceiverKind::Borrow),
         params: vec![],
         return_type: dummy_type("None"),
+        view_return: None,
         body: vec![],
         span: Span::new(1, 1),
     }

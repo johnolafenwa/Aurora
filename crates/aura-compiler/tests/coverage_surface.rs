@@ -1347,3 +1347,74 @@ def main() -> int32:
         .expect("nested non-copy JSON source should emit a native object")
         .is_empty());
 }
+
+#[test]
+fn adr0038_public_entrypoints_preserve_views_closure_loans_and_backend_lowering() {
+    let source = r#"
+class Pair:
+    left: int64
+    right: int64
+
+def choose(pair: mut Pair, choose_left: bool) -> view mut int64 from pair:
+    if choose_left:
+        return view mut pair.left
+    return view mut pair.right
+
+def main() -> int32:
+    mut pair = Pair(left=1, right=2)
+    view mut selected = choose(pair, false)
+    selected = 9
+    print(selected)
+
+    mut values = [1]
+    mut update: def(int64) -> None = lambda [mut values] item: values.append(item)
+    update(2)
+    print(values[1])
+    return 0
+"#;
+
+    let analysis = analyze_source(source);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:#?}",
+        analysis.diagnostics
+    );
+    assert!(analysis
+        .occurrences
+        .iter()
+        .any(|occurrence| occurrence.hover.contains("view mut selected: int64")));
+
+    check_source(source).expect("ADR-0038 public source should type-check");
+    let output = run_source(source).expect("ADR-0038 public source should execute through MIR");
+    assert_eq!(output.stdout, "9\n2\n");
+
+    let mir = lower_source_to_mir(source).expect("ADR-0038 public source should lower to MIR");
+    let instructions = mir
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .collect::<Vec<_>>();
+    assert!(instructions
+        .iter()
+        .any(|instruction| matches!(instruction, Instruction::BeginReturnedLoan { .. })));
+    assert!(instructions
+        .iter()
+        .any(|instruction| matches!(instruction, Instruction::WriteLoan { .. })));
+    assert!(instructions
+        .iter()
+        .any(|instruction| matches!(instruction, Instruction::ReturnLoan { .. })));
+    assert!(!emit_host_native_object(&mir)
+        .expect("ADR-0038 MIR should emit a direct-backend object")
+        .is_empty());
+
+    let unstable = check_source("def main():\n    view item = 1\n")
+        .expect_err("view bindings require addressable places");
+    assert_eq!(unstable.code, "AU3004");
+
+    let immutable_closure = check_source(
+        "def main():\n    mut values = [1]\n    update: def(int64) -> None = lambda [mut values] item: values.append(item)\n    update(2)\n",
+    )
+    .expect_err("mutable-repeatable closures require mutable closure places");
+    assert_eq!(immutable_closure.code, "AU3003");
+}

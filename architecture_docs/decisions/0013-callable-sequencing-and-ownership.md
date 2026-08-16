@@ -7,9 +7,8 @@
 > **Amended by ADR-0022, ADR-0037, and ADR-0038.** Amended, not superseded.
 > ADR-0037 implements value-capturing expression closures: Copy values copy,
 > non-Copy owned values move at creation, read-only closures are repeatable,
-> and consuming closures are single-use. The accepted ADR-0038 design
-> specifies in-loan captures for Aurora 0.3; no implementation is authorized
-> in the 0.2 cycle.
+> and consuming closures are single-use. ADR-0038 implements explicit,
+> exhaustive shared, mutable, and owned closure capture lists for Aura 0.3.
 
 ## Decision
 

@@ -1,0 +1,6 @@
+error[AU3004]: indexed collection elements do not have stable view identity; only fixed tuple positions are supported
+ --> crates/aura-compiler/tests/fixtures/check-fail/view_index_place_rejected.au:3:17
+  |
+3 |     view item = values[0]
+  |                 ^
+  = help: return or store an index, handle, or owned clone instead

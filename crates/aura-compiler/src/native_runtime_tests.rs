@@ -55,6 +55,202 @@ fn bool_value(value: bool) -> *mut OpaqueValue {
     super::aura_direct_box_bool(i64::from(value))
 }
 
+#[test]
+fn adr0038_direct_returned_view_projection_handoff_is_exact_and_consuming() {
+    let selected = b"right";
+    super::aura_direct_set_returned_view_projection(selected.as_ptr(), selected.len());
+    let projections = b"left\0right";
+    assert_eq!(
+        super::aura_direct_take_returned_view_projection(projections.as_ptr(), projections.len()),
+        1
+    );
+    assert!(super::with_direct_task_runtime_state(|state| state
+        .returned_view_projection
+        .is_none()));
+}
+
+#[test]
+fn adr0038_direct_returned_view_projection_handoff_reports_invalid_state() {
+    assert_eq!(
+        capture_direct_boundary_error_message(|| {
+            let projections = b"left\0right";
+            super::aura_direct_take_returned_view_projection(
+                projections.as_ptr(),
+                projections.len(),
+            );
+        }),
+        "direct returned view has no transferred projection"
+    );
+    assert_eq!(
+        capture_direct_boundary_error_message(|| {
+            let selected = b"middle";
+            super::aura_direct_set_returned_view_projection(selected.as_ptr(), selected.len());
+            let projections = b"left\0right";
+            super::aura_direct_take_returned_view_projection(
+                projections.as_ptr(),
+                projections.len(),
+            );
+        }),
+        "direct returned view selected an undeclared projection"
+    );
+}
+
+#[test]
+fn adr0038_direct_nested_place_assignment_helper_covers_tuple_and_class_paths() {
+    let mut nested = Value::Instance(InstanceValue {
+        class_name: "Outer".to_string(),
+        fields: BTreeMap::from([(
+            "inner".to_string(),
+            Value::Tuple(TupleValue {
+                element_types: vec![Type::named("int64")],
+                elements: vec![Value::Int(IntegerValue::from_signed(1))],
+            }),
+        )]),
+    });
+    super::set_direct_instance_field_owned(
+        &mut nested,
+        &["inner", "0"],
+        "inner.0",
+        Value::Int(IntegerValue::from_signed(7)),
+    )
+    .expect("nested instance and tuple assignment should succeed");
+    assert!(nested.render().contains("(7,)"));
+    let mut tuple_then_instance = Value::Tuple(TupleValue {
+        element_types: vec![Type::named("Inner")],
+        elements: vec![Value::Instance(InstanceValue {
+            class_name: "Inner".to_string(),
+            fields: BTreeMap::from([(
+                "value".to_string(),
+                Value::Int(IntegerValue::from_signed(1)),
+            )]),
+        })],
+    });
+    super::set_direct_instance_field_owned(
+        &mut tuple_then_instance,
+        &["0", "value"],
+        "0.value",
+        Value::Int(IntegerValue::from_signed(8)),
+    )
+    .expect("tuple-to-instance assignment should recurse through both aggregate kinds");
+    assert!(tuple_then_instance.render().contains("value=8"));
+
+    assert_eq!(
+        super::set_direct_instance_field_owned(&mut nested, &[], "", Value::Unit)
+            .expect_err("empty paths must be rejected"),
+        "direct runtime received an empty instance assignment path"
+    );
+    assert!(super::set_direct_instance_field_owned(
+        &mut nested,
+        &["missing", "field"],
+        "missing.field",
+        Value::Unit,
+    )
+    .expect_err("unknown nested fields must be diagnosed")
+    .contains("has no field `missing`"));
+
+    let mut tuple = Value::Tuple(TupleValue {
+        element_types: vec![Type::named("int64")],
+        elements: vec![Value::Int(IntegerValue::from_signed(1))],
+    });
+    assert!(
+        super::set_direct_instance_field_owned(&mut tuple, &["field"], "field", Value::Unit,)
+            .expect_err("tuple projections must be fixed positions")
+            .contains("is not a fixed position")
+    );
+    assert!(
+        super::set_direct_instance_field_owned(&mut tuple, &["4"], "4", Value::Unit,)
+            .expect_err("tuple projections must be in bounds")
+            .contains("has no element at index 4")
+    );
+    let mut scalar = Value::Int(IntegerValue::from_signed(1));
+    assert!(
+        super::set_direct_instance_field_owned(&mut scalar, &["value"], "value", Value::Unit,)
+            .expect_err("scalar values cannot receive projected assignment")
+            .contains("cannot assign field `value` on non-instance")
+    );
+}
+
+#[test]
+fn adr0038_direct_closure_capture_abi_covers_mutability_and_errors() {
+    let result = run_lightweight_root_task(|| {
+        super::with_direct_task_runtime_scope(|| {
+            let base = boxed_value(Value::Function(Box::new(FunctionValue {
+                name: "main::__lambda_capture".to_string(),
+                signature: Type::Closure {
+                    params: Box::new(Vec::new()),
+                    return_type: Box::new(Type::named("int64")),
+                    captures: Box::new(Vec::new()),
+                    call_kind: crate::sema::ClosureCallKind::Repeatable,
+                },
+                source_path: None,
+                entry_span: Span::new(1, 1),
+                direct_thunk: Some(direct_zero_capture_closure as *const () as usize as i64),
+                direct_default_binder: Some(1),
+                closure_environment: None,
+            })));
+            let captures = super::aura_direct_arg_buffer_new(1);
+            super::aura_direct_arg_buffer_store_owned(captures, 0, int_value(17) as i64);
+            let capture_modes = [1_i64];
+            let closure =
+                super::aura_direct_closure_value(base, captures, 1, capture_modes.as_ptr(), 0);
+            let captured = super::aura_direct_closure_capture(closure, 0);
+            assert_eq!(expect_int(captured), 17);
+            let Value::Function(function) = (unsafe { value_ref(closure) }) else {
+                panic!("closure construction must preserve its function value");
+            };
+            assert!(
+                function
+                    .closure_environment
+                    .as_ref()
+                    .expect("closure environment must exist")
+                    .arguments("main::__lambda_capture")
+                    .expect("capture arguments should remain repeatable")[0]
+                    .mutable
+            );
+            unsafe {
+                release_value(captured);
+                release_value(closure);
+            }
+            Ok(Value::Unit)
+        })
+    });
+    assert_eq!(
+        result.expect("capture ABI probe should complete"),
+        Value::Unit
+    );
+
+    assert_eq!(
+        capture_direct_boundary_error_message(|| {
+            super::aura_direct_closure_capture(int_value(1), 0);
+        }),
+        "closure capture access expected a function value"
+    );
+    assert_eq!(
+        capture_direct_boundary_error_message(|| {
+            let plain = boxed_value(Value::Function(Box::new(FunctionValue {
+                name: "plain".to_string(),
+                signature: Type::Function {
+                    params: Vec::new(),
+                    return_type: Box::new(Type::Unit),
+                },
+                source_path: None,
+                entry_span: Span::new(1, 1),
+                direct_thunk: None,
+                direct_default_binder: None,
+                closure_environment: None,
+            })));
+            super::aura_direct_closure_capture(plain, 0);
+        }),
+        "function has no closure environment"
+    );
+    assert_eq!(
+        capture_direct_boundary_error_message(|| {
+            super::aura_direct_closure_capture(int_value(1), -1);
+        }),
+        "invalid closure capture index"
+    );
+}
+
 fn integer_vector(kind: IntegerKind, values: &[i64]) -> *mut OpaqueValue {
     boxed_value(Value::Vec(VecValue {
         element_type: Type::named(kind.runtime_type_name()),
@@ -15566,6 +15762,8 @@ fn native_runtime_closure_task_handoff_transfers_capture_ownership_to_child() {
                         name: "captured".to_string(),
                         ty: capture_type,
                         value: Value::Int(crate::integer::IntegerValue::from_signed(9)),
+                        source_place: None,
+                        mutable: false,
                     }],
                     false,
                 ))),
@@ -15656,6 +15854,8 @@ fn native_runtime_closure_task_handoff_preserves_repeatable_and_one_shot_semanti
                     name: "captured".to_string(),
                     ty: Type::named("int64"),
                     value: Value::Int(IntegerValue::from_signed(i128::from(captured))),
+                    source_place: None,
+                    mutable: false,
                 }],
                 consuming,
             ))),
@@ -15811,6 +16011,8 @@ fn native_runtime_closure_task_rejects_negative_public_arity_then_allows_valid_r
                         name: "captured".to_string(),
                         ty: Type::named("int64"),
                         value: Value::Int(IntegerValue::from_signed(29)),
+                        source_place: None,
+                        mutable: false,
                     }],
                     false,
                 ))),
@@ -15925,6 +16127,8 @@ fn native_runtime_detached_closure_task_surfaces_unobserved_trap_and_cleans_capt
                                 name: "payload".to_string(),
                                 ty: Type::named("str"),
                                 value: Value::String("owned by detached task".to_string()),
+                                source_place: None,
+                                mutable: false,
                             }],
                             true,
                         ))),
@@ -16341,6 +16545,8 @@ fn native_runtime_closure_calls_preserve_results_writebacks_and_call_kind() {
                         name: "offset".to_string(),
                         ty: Type::named("int64"),
                         value: Value::Int(IntegerValue::from_signed(7)),
+                        source_place: None,
+                        mutable: false,
                     }],
                     false,
                 ))),
@@ -16415,6 +16621,8 @@ fn native_runtime_closure_calls_preserve_results_writebacks_and_call_kind() {
                         name: "payload".to_string(),
                         ty: Type::named("int64"),
                         value: Value::Int(IntegerValue::from_signed(19)),
+                        source_place: None,
+                        mutable: false,
                     }],
                     true,
                 ))),
@@ -16473,6 +16681,8 @@ fn native_runtime_closure_call_moves_owned_args_and_copies_only_mutable_writebac
                         name: "offset".to_string(),
                         ty: Type::named("int64"),
                         value: Value::Int(IntegerValue::from_signed(2)),
+                        source_place: None,
+                        mutable: false,
                     }],
                     false,
                 ))),
@@ -16529,8 +16739,13 @@ fn native_runtime_closure_construction_handles_zero_captures_and_reports_invalid
                 direct_default_binder: Some(1),
                 closure_environment: None,
             })));
-            let zero_capture =
-                super::aura_direct_closure_value(zero_capture_base, std::ptr::null_mut(), 0, 0);
+            let zero_capture = super::aura_direct_closure_value(
+                zero_capture_base,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+                0,
+            );
             let called = super::aura_direct_function_call(zero_capture, std::ptr::null_mut(), 0);
             assert_eq!(expect_int(called), 42);
             unsafe {
@@ -16568,13 +16783,25 @@ fn native_runtime_closure_construction_handles_zero_captures_and_reports_invalid
                 direct_default_binder: Some(1),
                 closure_environment: None,
             })));
-            super::aura_direct_closure_value(invalid_count_base, std::ptr::null_mut(), -1, 0);
+            super::aura_direct_closure_value(
+                invalid_count_base,
+                std::ptr::null_mut(),
+                -1,
+                std::ptr::null(),
+                0,
+            );
         }),
         "invalid closure capture count"
     );
     assert_eq!(
         capture_direct_boundary_error_message(|| {
-            super::aura_direct_closure_value(int_value(7), std::ptr::null_mut(), 0, 0);
+            super::aura_direct_closure_value(
+                int_value(7),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+                0,
+            );
         }),
         "direct closure construction expected a function value"
     );
@@ -16786,6 +17013,8 @@ fn native_runtime_trapping_closure_call_releases_combined_buffer_without_mut_wri
                 name: "captured".to_string(),
                 ty: Type::named("str"),
                 value: Value::String("owned capture".to_string()),
+                source_place: None,
+                mutable: false,
             }],
             false,
         ))),
@@ -16857,7 +17086,7 @@ fn native_runtime_uncalled_closure_releases_owned_capture_environment() {
             let capture = string_value("never called");
             let captures = super::aura_direct_arg_buffer_new(1);
             super::aura_direct_arg_buffer_store_owned(captures, 0, capture as i64);
-            let closure = super::aura_direct_closure_value(base, captures, 1, 1);
+            let closure = super::aura_direct_closure_value(base, captures, 1, std::ptr::null(), 1);
             unsafe {
                 release_value(closure);
             }

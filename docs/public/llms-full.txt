@@ -2916,17 +2916,17 @@ The JSON result is an array of `{ "name": str, "kind": str, "detail": str }` obj
 `ast-json`, `analyze`, `complete`, and `lsp` emit JSON. The `analyze` and `complete` shapes described here are maintained tooling contracts for Aura 0.3. `ast`, `ast-json`, and `mir` expose compiler inspection data for people and tests; their exact formatting and internal node/block shape are not a stable cross-version serialization API.
 
 `aura lsp` is a persistent JSON-lines compiler service. Every request requires
-`semantic_interface_version: 5` plus string fields `method`, `path`, and
+`semantic_interface_version: 6` plus string fields `method`, `path`, and
 `source`; `id` is optional and is echoed in the response. Supported requests
 are:
 
 ```json
-{"id":1,"semantic_interface_version":5,"method":"analyze","path":"/absolute/app.au","source":"print(1)\n"}
-{"id":2,"semantic_interface_version":5,"method":"complete","path":"/absolute/app.au","source":"value.\n","line":0,"character":6,"trigger":"."}
+{"id":1,"semantic_interface_version":6,"method":"analyze","path":"/absolute/app.au","source":"print(1)\n"}
+{"id":2,"semantic_interface_version":6,"method":"complete","path":"/absolute/app.au","source":"value.\n","line":0,"character":6,"trigger":"."}
 ```
 
 Each response is one line containing the same `id`,
-`semantic_interface_version: 5`, and either `result` or an `error` string.
+`semantic_interface_version: 6`, and either `result` or an `error` string.
 Paths give the virtual source a package/import context; ranges and completion
 positions are zero-based. A missing or different semantic interface version is
 an incompatible request and returns a schema-mismatch error.
@@ -3114,7 +3114,7 @@ Tool-side mutations are explicit: `fmt` without `--check`, `deps update`, and su
 
 ## Diagnostics
 
-Compiler-backed commands can surface the complete append-only registry. `AU1001` means invalid lexical input; `AU1002` means an invalid f-string delimiter; and `AU1101` means invalid syntax. `AU2001` means name-resolution failure; `AU2002` means type mismatch; `AU2003` means unsupported operator; `AU2004` means argument-binding failure; `AU2005` means unsupported syntax or feature; `AU2006` means a builtin method collision; `AU2007` means builtin function redefinition; `AU2008` means equality unavailable; and `AU2999` means a general compile-time rejection without a narrower code. `AU3001` means use of a moved value; `AU3002` means a borrow violation; `AU3003` means a mutability violation; `AU3004` means an invalid ownership mode; `AU3005` means a non-copy indexed read; `AU3006` means a non-copy indexed compound assignment; `AU3007` means non-cloneable state duplication; `AU3008` means a non-transferable task or Queue boundary; and `AU3009` means single-consumer task-result duplication. `AU4001` means a general runtime trap; `AU4002` means arithmetic overflow or underflow; `AU4003` means a bounds or lookup violation; `AU4004` means a zero divisor; `AU4005` means a resource, allocation, or I/O failure; `AU4006` means invalid runtime configuration; and `AU4007` means a numeric Array shape or reduction violation. The structured schema is defined in [Diagnostics](/manual/diagnostics).
+Compiler-backed commands can surface the complete append-only registry. `AU1001` means invalid lexical input; `AU1002` means an invalid f-string delimiter; and `AU1101` means invalid syntax. `AU2001` means name-resolution failure; `AU2002` means type mismatch; `AU2003` means unsupported operator; `AU2004` means argument-binding failure; `AU2005` means unsupported syntax or feature; `AU2006` means a builtin method collision; `AU2007` means builtin function redefinition; `AU2008` means equality unavailable; and `AU2999` means a general compile-time rejection without a narrower code. `AU3001` means use of a moved value; `AU3002` means a borrow violation; `AU3003` means a mutability violation; `AU3004` means an invalid ownership mode; `AU3005` means a non-copy indexed read; `AU3006` means a non-copy indexed compound assignment; `AU3007` means non-cloneable state duplication; `AU3008` means a non-transferable task or Queue boundary; `AU3009` means single-consumer task-result duplication; and `AU3010` means a view escape or returned-view provenance failure. `AU4001` means a general runtime trap; `AU4002` means arithmetic overflow or underflow; `AU4003` means a bounds or lookup violation; `AU4004` means a zero divisor; `AU4005` means a resource, allocation, or I/O failure; `AU4006` means invalid runtime configuration; and `AU4007` means a numeric Array shape or reduction violation. The structured schema is defined in [Diagnostics](/manual/diagnostics).
 
 Human diagnostics render as `error[AU####]` with source context when a span is
 available. Ordinary notes are followed by readable call-chain and task-entry
@@ -3184,9 +3184,9 @@ backend.
 
 Aura closures use `lambda parameters: expression`. They are small
 expression-bodied callable values. Parameter types come from context; a
-zero-parameter lambda may infer its result type from its body. Captures are
-always by value: Copy values are copied and owned non-Copy values are moved
-when the closure is created.
+zero-parameter lambda may infer its result type from its body. A lambda without
+a capture list captures by value. An explicit exhaustive capture list can
+instead request shared, mutable, or owned access to named outer locals.
 
 ```aura
 def main():
@@ -3216,8 +3216,16 @@ The closure productions are:
 
 ```ebnf
 lambda-expression
-    = "lambda", [ lambda-parameter,
+    = "lambda", [ lambda-capture-list ],
+      [ lambda-parameter,
       { ",", lambda-parameter } ], ":", expression ;
+
+lambda-capture-list
+    = "[", lambda-capture,
+      { ",", lambda-capture }, "]" ;
+
+lambda-capture
+    = [ "mut" | "own" ], identifier ;
 
 lambda-parameter
     = [ "mut" | "own" ], identifier ;
@@ -3232,8 +3240,8 @@ expression`.
 identifier token, but the spelling always begins a lambda at the start of an
 expression. Member and named-argument positions may use the same identifier
 spelling. A lambda may appear anywhere an expression is accepted, subject to
-the contextual typing rule below. There is no arrow spelling, capture list,
-statement body, `async` form, or nested `def`.
+the contextual typing rule below. There is no arrow spelling, statement body,
+`async` form, or nested `def`.
 
 ## Typing Rules
 
@@ -3279,17 +3287,32 @@ or return capture-free lambdas or named functions with one structural
 `def(...) -> R` type. Creating and calling a closure wholly inside a branch
 remains supported.
 
-A resolved name in the body is a capture only when it denotes an outer owned
-local or an `own` parameter. Lambda parameters, module functions, types,
-builtins, and imported items are resolved normally and are not stored in the
-environment.
+A resolved name in a lambda without a list is a capture only when it denotes
+an outer owned local or an `own` parameter. Lambda parameters, module
+functions, types, builtins, and imported items are resolved normally and are
+not stored in the environment.
+
+An explicit list is exhaustive. Every resolved outer local used by the body
+must appear exactly once, and every entry must be used. Entries are acquired
+left to right:
+
+| Entry | Contract |
+| --- | --- |
+| `value` | Shared live loan of `value`. |
+| `mut value` | Exclusive mutable live loan; `value` must be a mutable place or mutable view. |
+| `own value` | By-value Copy snapshot or move under ADR-0037. |
+
+A projected place must first be named by a `view` binding. A shared or mutable
+view can be reborrowed but cannot be captured with `own`. A bare capture of a
+Copy local is intentionally live; write `own value` for a snapshot.
 
 ## Runtime Semantics
 
-Evaluating a lambda constructs its callable value immediately. Each captured
-Copy value is snapshotted into the environment; each captured non-Copy owned
-value moves into it. Later changes to an outer mutable Copy binding do not
-retarget the snapshot.
+Evaluating a lambda constructs its callable value immediately. For an ordinary
+lambda, each captured Copy value is snapshotted and each captured non-Copy
+owned value moves. An explicit list instead acquires its declared loans or
+owned captures left to right. Loan releases belong to the closure environment
+and run exactly once when its final use or scope ends.
 
 Calling the closure evaluates arguments under its contextual structural
 function signature and then evaluates the body. A closure whose body only
@@ -3306,7 +3329,7 @@ copied or cloned.
 
 ## Ownership And Evaluation Order
 
-Capture is by value and happens at closure creation, not on the first call.
+Implicit capture is by value and happens at closure creation, not on the first call.
 Copy captures leave their sources usable. Non-Copy captures move, so using the
 outer source afterward reports `AU3001`. Clone before creation when both
 owners are required:
@@ -3320,28 +3343,30 @@ def main():
     print(length())
 ```
 
-A bare parameter of an enclosing function is shared capability, not owned
-data, and cannot be captured. Take it as `own`, or clone the data into an
-owned local before building the closure. A `mut` enclosing parameter is also
-caller-owned capability and cannot be captured.
+A bare or mutable enclosing parameter may be named in an explicit capture
+list, which creates a loan bounded by the closure's live region. Without a
+list, those capabilities are not captured; take the input as `own` or clone it
+into an owned local for by-value capture.
 
-An inner lambda cannot capture a bare parameter of its enclosing lambda, even
-when the parameter type is Copy. When the surrounding callable contract
-allows it, make that outer parameter `own`; passing a Copy argument to the
-owned position duplicates the value, and the inner lambda may capture that
-owned parameter. When the outer contract must remain bare, pass the Copy value
-to a named helper with an `own` parameter and create or invoke the inner
-closure there.
+An inner lambda without a list cannot capture a bare parameter of its enclosing
+lambda. An explicit bare entry creates a shared contained reborrow; a `mut`
+entry requires a mutable outer capability. When an independent snapshot is
+needed, make the outer parameter `own` and use an `own` capture, or pass the
+value to a named helper that creates the owned closure.
 
-Phase 6.3 closure environments are read-only. A body cannot pass a capture to
-a `mut` parameter, call a `mut self` method on a capture, or otherwise request
-mutable access to it. This does not restrict the lambda's own `mut` parameter,
-which writes through the mutable argument supplied for that call.
+An ordinary by-value closure environment is read-only. A body may mutate only
+a `mut` entry from an explicit capture list. Such a closure is
+mutable-repeatable: it must be stored in a `mut` local and called sequentially
+through that mutable place. A shared-loan closure is shared-repeatable. A body
+that consumes a non-Copy `own` capture remains a consuming, single-use closure,
+even when the environment also contains loans.
 
-A closure is Transfer exactly when all of its captures are Transfer. Moving a
+A by-value closure is Transfer exactly when all of its captures are Transfer. Moving a
 qualifying closure into `TaskGroup.start`, `start_soon`, or an explicit-stack
 variant transfers the complete environment to child-owned storage. A
-non-Transfer leaf retains the ordinary `AU3008` boundary explanation.
+non-Transfer leaf retains the ordinary `AU3008` boundary explanation. A
+closure containing any shared or mutable loan is always non-Transfer and
+cannot cross a task, Queue, supervisor, detached-work, or FFI boundary.
 
 ### Comprehension Interaction
 
@@ -3353,10 +3378,10 @@ and are not captures.
 A lambda expression reached inside a comprehension is created at that runtime
 position. It may snapshot a Copy target, and it may move a Queue-received owned
 target when the surrounding use permits one consuming closure. A shared
-non-Copy list/set target is a capability into the source and cannot be captured;
-pass an explicit clone to a named helper or arrange another owned value outside
-the comprehension when independent storage is required. Capture environments
-remain read-only.
+non-Copy list/set target may be captured only through an explicit loan list
+whose lifetime remains inside the synchronous containing task; otherwise pass
+an explicit clone to a named helper or arrange another owned value outside the
+comprehension.
 
 The ordinary storage boundary also remains. A capturing closure cannot itself
 be inserted as a list, set, or dictionary comprehension result because collection
@@ -3373,10 +3398,12 @@ missing or mismatched parameter context, parameter capability, result type,
 metadata-erasing storage boundary, or a consuming closure supplied where a
 repeatable callback is required. `AU3001` reports use after a non-Copy value
 moved into a closure and use after a consuming closure call. `AU3002` rejects
-capture of shared or mutable caller capability. `AU3003` rejects mutable
-access through a captured environment. `AU3008` reports a closure whose
+overlapping capture loans and source accesses. `AU3003` rejects capability
+escalation or a mutable-repeatable call through an immutable closure place.
+`AU3008` reports a closure whose
 captured environment cannot cross a task boundary because some captured value
-is not Transfer.
+is not Transfer. `AU3010` reports a loan closure escaping into storage or a
+metadata-erasing callable boundary.
 
 The shared-capability diagnostic recommends cloning to an owned local or
 taking owned input. Move diagnostics identify closure creation or the
@@ -3384,21 +3411,23 @@ consuming call as the ownership origin.
 
 ## Backend Support
 
-Contextual checking, capture analysis, move checking, MIR lowering, and direct
-native lowering implement the same closure contract. Both maintained backends
-copy or move captures at creation, preserve repeated read-only calls, enforce
-single-use consumption statically, and clean up an owned environment exactly
-once. Compiler analysis and the language server expose lambda parameter scope,
+Contextual checking, capture and loan analysis, move checking, MIR lowering,
+and direct native lowering implement the same closure contract. Both maintained
+backends copy, move, or loan captures at creation; preserve shared- and
+mutable-repeatable calls; enforce single-use consumption; write mutable loans
+through immediately; and clean up an environment exactly once. Compiler
+analysis and the language server expose lambda parameter scope,
 captured-name definitions, callable hover, completions, and the compiler-owned
 diagnostics.
 
 ## Limits And Implementation-Defined Behavior
 
 Closures are expression-only and contextually typed. They do not support
-statement bodies, inline parameter types, defaults, generics, capture lists,
-implicit reference capture, mutable captured state, method values, trait
-objects, FFI callbacks, asynchronous syntax, shared-capability capture, or
-mutable captured state.
+statement bodies, inline parameter types, defaults, generics, implicit
+reference capture, method values, trait objects, FFI callbacks, asynchronous
+syntax, returned loan closures, or lifetime-bearing structural callable types.
+Explicit lists accept local identifiers; project a field into a named view
+before capturing it.
 
 Arbitrary structural `def` parameters and stored `def` fields, collection
 elements, and annotated returns currently carry only capture-free code
@@ -3420,7 +3449,9 @@ Expression closures and by-value capture are implemented under Accepted ADR-0037
 after ratification at the Batch 6 opening checkpoint. Capture-free function
 values remain governed by [Functions](/manual/functions), and task-boundary
 Transfer remains governed by Accepted ADR-0033. Comprehensions preserve this
-contract under Accepted ADR-0039 rather than adding a capture exception.
+contract under Accepted ADR-0039. Explicit shared/mutable/owned capture lists,
+mutable-repeatable closure calls, and loan cleanup are implemented under
+ADR-0038.
 
 ## Source: docs/manual/collections.md
 
@@ -4556,7 +4587,8 @@ Exact diagnostic prose is normative only where a fixture or this Manual explicit
 | Application-level HTTP retry composition: retry only `503`, deterministic seed-42 jitter, exponential `Duration` backoff, final-attempt no-RNG/no-sleep behavior, explicit deadlines, and scoped resource cleanup | `examples/agents/retrying_network_worker.au` and `retrying_network_worker_runs_with_computed_backoff_on_both_backends` in `crates/aura/tests/cli.rs`, which pin the exact seven-request loopback trace on the MIR and forced-direct backends |
 | Callable-powered list algorithms: stable mutable natural/key sorting, once-only left-to-right key evaluation before mutation, trap-before-mutation, eager shared map/filter traversal, owned results, source retention, exact shared callback capabilities, and filter clone safety | `list_algorithm_callbacks`, `list_sort_requires_mut_receiver`, `list_sort_rejects_non_orderable`, `list_map_callback_requires_shared`, `list_filter_rng_clone_safety`, and builtin-collision fixtures; focused semantic, MIR, runtime, native, analysis, and LSP tests; `examples/collections/list_algorithms.au`; the executable Collections Manual block; and the MIR/direct parity matrix |
 | `control.retry`: immediate first attempt, every-Err retry policy, exact attempt budget, doubling Duration backoff, zero-delay sleep elision, no post-final sleep/multiply, exact last-error return, worker-trap/overflow/cancellation propagation, and both-backend behavior | `control_retry_surface` parse/check fixtures; `control_retry_basics` run fixture; focused compiler/runtime tests; `crates/aura/tests/control_retry.rs`; `examples/agents/retry_with_backoff.au`; the executable Control-Plane Manual block; and the MIR/direct parity matrix |
-| Accepted ADR-0037 expression closures: contextual bare/`mut`/`own` parameters, expression-only bodies, Copy snapshots, non-Copy move-at-creation, repeatable reads, consuming single-use calls, read-only environments, shared-capability rejection, structural Transfer, cleanup, and MIR/direct parity | lambda parser/check/run/failure fixture families; focused semantic, MIR, runtime, native-codegen, analysis, completion, language-server, and extension tests; `examples/basics/closures.au`; the executable Closures Manual block; and the forced MIR/direct parity matrix |
+| Accepted ADR-0037 expression closures: contextual bare/`mut`/`own` parameters, expression-only bodies, implicit Copy snapshots, non-Copy move-at-creation, repeatable reads, consuming single-use calls, structural Transfer, cleanup, and MIR/direct parity | lambda parser/check/run/failure fixture families; focused semantic, MIR, runtime, native-codegen, analysis, completion, language-server, and extension tests; `examples/basics/closures.au`; the executable Closures Manual block; and the forced MIR/direct parity matrix |
+| Implemented ADR-0038 place-based loans and views: root/field/fixed-tuple identity, shared/mutable local views, inferred final-use regions, returned receiver/parameter views, reborrowing, exhaustive loan capture lists, mutable-repeatable closures, non-Transfer escape rejection, exit cleanup, `AU3010`, analysis/editor schema 6, and MIR/direct write-through parity | focused ADR-0038 parser, semantic, analysis, MIR, MIR-runtime, native-codegen, and native-runtime tests; `place_views.au`; `examples/basics/views.au`; executable Ownership, Functions, and Closures Manual blocks; language-server/compiler-bridge and extension protocol tests; and the forced MIR/direct parity matrix |
 | Accepted ADR-0039 eager owned comprehensions: list/set/dictionary forms, exact-Boolean filters, progressive non-leaking target scope, nested outer-major order, left-to-right filters, dictionary key-before-value replacement, every bare iterable including Queue receive ownership, explicit clone/move behavior, ADR-0037 capture interaction, generator/modifier teaching diagnostics, cleanup, and MIR/direct parity | comprehension parser/check/run/failure fixture families; focused semantic, MIR, runtime, analysis, completion, language-server, and extension tests; `examples/collections/comprehensions.au`; the executable Collections Manual block; and the forced MIR/direct parity matrix |
 | Accepted ADR-0040 owned list/str slices under the unified ADR-0043 index domain: all omitted endpoint forms, `int64` endpoints with scoped lossless widening, once-only negative normalization, no clamping, invalid/reversed `AU4003`, Unicode-scalar str O(n) behavior, list clone-safety and task-repeatability, retained evaluate-once order, source/result independence, reserved step/assignment `AU2005`, str integer-index rejection, and MIR/direct parity | slice parser/check/run/failure fixture families; focused semantic, MIR, runtime, analysis, completion, language-server, and extension tests; `examples/collections/slices.au`; the executable Collections Manual block; and the forced MIR/direct parity matrix |
 | Accepted ADR-0041 contiguous numeric Arrays and explicit integer modes: four exact dtypes, rank-at-least-one row-major owned storage, zero dimensions, constructor/count checks, multidimensional indexing, first-axis copy slices, exact-shape/scalar kernels, float-only division, deterministic row-major map/reductions, `float64` mean, checked/wrapping/saturating integer behavior, `AU4002` checked Array overflow and `AU4004` floating Array zero-divisor failures, `AU4003` coordinate/slice bounds, `AU4005` allocation/element-count failures, `AU4007` shape/rank/count/empty-reduction failures, and no array-shape broadcasting/views/promotion/accelerator | numeric-array semantic/MIR/runtime/native/parity fixture families, including synchronized checked-overflow and floating-zero-divisor diagnostics; compiler analysis, language-server, and extension protocol tests; `examples/numbers/numeric_arrays.au`; the executable Numeric Arrays Manual block; the tested `bench-numeric-arrays.py` raw/summary evidence protocol; and the forced MIR/direct parity matrix |
@@ -4614,6 +4646,8 @@ For the maintained source subset, the paths MUST agree on:
 - return values and pattern results
 - checked arithmetic and collection failures
 - move/borrow-sensitive mutation and writeback
+- place/view identity, returned provenance, reborrowing, immediate mutable
+  write-through, closure-loan calls, and exit cleanup
 - eager comprehension order, ownership, target scope, and partial-result cleanup
 - owned list/str slice endpoint order, bounds failures, Unicode scalar
   selection, clone safety, and source/result independence
@@ -4996,9 +5030,11 @@ This page documents known current limits of the Aura compiler and runtime.
   `round` has no digit-count overload.
 - Non-numeric casts are not implemented.
 - Direct recursive fields require `indirect`.
-- Return values are always owned. Copy results are ordinary copies; a non-copy
-  result must be constructed, cloned when clone-safe, moved from owned input,
-  or produced by an owner operation.
+- Ordinary `-> T` return values are always owned. Copy results are ordinary
+  copies; a non-copy result must be constructed, cloned when clone-safe, moved
+  from owned input, or produced by an owner operation. ADR-0038 separately
+  permits one `-> view [mut] T from origin` result tied to a receiver or
+  parameter place.
 - Empty list, dictionary, and set literals need an expected collection type.
 - Class field defaults cannot call user-defined functions in the current compiler. Compute the value before construction and pass it as an explicit field argument.
 - `str(...)` is not a constructor; use string literals and string methods.
@@ -5027,6 +5063,13 @@ This page documents known current limits of the Aura compiler and runtime.
   ordering, named/rest unpacking, mutable tuple-target writeback,
   dynamic/negative tuple indexing, or tuple-to-collection conversion. Unpack a
   tuple to take ownership of a non-copy element.
+- Views have identity only for local/parameter/receiver roots, existing views,
+  class-field paths, and fixed tuple positions. Collection indexes and keys,
+  set elements, arbitrary temporaries, and escaping enum-payload views are not
+  loanable. View-bearing aggregates, module storage, multi-origin results,
+  returned loan closures, and lifetime-parameterized structural callable
+  types remain unavailable. Views
+  and loan closures are always non-Transfer.
 - Statement match arms cannot be inline. Expression match arms may use a same-line expression after `case pattern:` or an indented expression body.
 - `for` loop bindings cannot shadow names already visible in the same scope.
 - Duration literals have only the integral `ms`, `s`, and `m` suffixes; there is no `ns` or fractional Duration literal and no unary `-Duration`. Associated constructors and checked Duration arithmetic provide signed and sub-millisecond results instead.
@@ -5037,10 +5080,11 @@ This page documents known current limits of the Aura compiler and runtime.
   API retains its direct associated-method-without-`self` target carve-out.
 - Lambdas with parameters require complete expected parameter types; a
   zero-parameter lambda may infer `def() -> R` from its expression body.
-  Captures are by value and closure environments are read-only in Phase 6.3.
-  Shared/mutable capability capture, inline parameter types, defaults,
-  generics, statement bodies, and capture lists remain
-  unavailable. A consuming closure is single-use. Capturing closures cannot
+  A lambda without a capture list captures by value. An explicit exhaustive
+  `[value, mut value, own value]` list creates shared/mutable loans or an owned
+  capture. Inline parameter types, defaults, generics, and statement bodies
+  remain unavailable. A mutable-loan closure is mutable-repeatable through a
+  mutable place; a consuming closure is single-use. Capturing closures cannot
   pass through arbitrary written-`def` parameters, fields, collections, or
   annotated returns because those boundaries describe capture-free code
   pointers. Compiler-known repeatable callback sites preserve closure
@@ -5060,7 +5104,7 @@ This page documents known current limits of the Aura compiler and runtime.
   and invalid or reversed ranges trap with `AU4003`. Endpoints are not clamped.
   str endpoints count Unicode scalar values and slicing is O(n). Slice
   steps and slice assignment remain reserved `AU2005` forms; arbitrary
-  sliceable types, zero-copy views, str integer indexing, grapheme slicing,
+  sliceable types, indexed zero-copy views, str integer indexing, grapheme slicing,
   and Python-style endpoint clamping are unavailable. List slicing requires
   clone-safe, repeatably observable elements.
 - Numeric `Array[T]` is CPU-only, contiguous, row-major, and specialized only
@@ -5319,7 +5363,7 @@ the phase that owns the failure:
 | `AU10xx` | lexical analysis | `AU1001` invalid lexical input; `AU1002` invalid f-string delimiter |
 | `AU11xx` | parsing | `AU1101` invalid syntax |
 | `AU20xx` | names and types | `AU2001` name resolution; `AU2002` type mismatch; `AU2003` unsupported operator; `AU2004` argument binding; `AU2005` unsupported syntax or feature; `AU2006` builtin method collision; `AU2007` builtin function redefinition; `AU2008` equality unavailable; `AU2999` general compile-time rejection |
-| `AU30xx` | ownership, borrows, and transfer | `AU3001` moved value; `AU3002` borrow violation; `AU3003` mutability violation; `AU3004` ownership mode; `AU3005` non-copy indexed read; `AU3006` non-copy indexed compound assignment; `AU3007` non-cloneable state duplication; `AU3008` non-transferable task/Queue boundary; `AU3009` single-consumer task-result duplication |
+| `AU30xx` | ownership, loans, and transfer | `AU3001` moved value; `AU3002` borrow/loan conflict; `AU3003` mutability violation; `AU3004` ownership or place mode; `AU3005` non-copy indexed read; `AU3006` non-copy indexed compound assignment; `AU3007` non-cloneable state duplication; `AU3008` non-transferable task/Queue boundary; `AU3009` single-consumer task-result duplication; `AU3010` view escape or returned provenance |
 | `AU40xx` | runtime-checked traps | `AU4001` general runtime trap; `AU4002` arithmetic overflow or underflow; `AU4003` bounds or lookup violation; `AU4004` zero divisor; `AU4005` resource, allocation, or I/O failure; `AU4006` invalid runtime configuration; `AU4007` numeric Array shape or reduction violation |
 
 `AU1001` also owns source-delimiter pairing. An unexpected closer is primary at
@@ -5441,6 +5485,21 @@ Transfer-boundary failure: the contained task handle is Transfer, but is
 non-copy because its result is non-repeatable. A later use of the same binding
 after a consuming result observation is `AU3001`; trying to consume the right
 through shared access is `AU3002`.
+
+`AU3010` rejects a view that escapes into ordinary storage, a returned view
+whose expression does not derive from its declared receiver/parameter origin,
+an invalid returned kind, or a call whose origin is not an addressable place.
+The diagnostic identifies the declared origin and the incompatible expression
+or destination. Return an owned clone/index/handle when the access must escape,
+or keep a local/closure loan synchronous and inside the owner's region.
+
+For explicit views, `AU3002` labels both the view creation and the final use
+that keeps its inferred region live. Removing a later use can shorten the loan;
+otherwise shorten the lexical scope, select a proven-disjoint place, or create
+an owned clone. `AU3003` covers mutation through a shared view and calling a
+mutable-repeatable closure through an immutable place. `AU3004` covers
+non-place sources, immutable mutable-view targets, and unsupported projections
+such as collection indexes.
 
 For `select(...)`, `AU3009` also rejects the same statically visible
 non-repeatable Task source appearing twice in one call. `AU3002` explains that
@@ -6279,8 +6338,9 @@ Except for short-circuit boolean operators and control-flow constructs, subexpre
   left to right; omitted endpoints evaluate nothing
 - a receiver is evaluated before call arguments
 - every supplied call or constructor argument is evaluated in call-site source order
-- a lambda copies or moves every by-value capture when the lambda expression
-  is evaluated, before any later sibling expression
+- a lambda acquires every capture from left to right when the lambda expression
+  is evaluated: implicit and `own` captures copy or move, while explicit bare
+  and `mut` entries begin loans before any later sibling expression
 - a comprehension allocates its result, then evaluates clause iterables and
   filters in nested outer-major order before evaluating its textually leading
   output; a dictionary output evaluates its key before its value
@@ -6331,10 +6391,12 @@ replaces the earlier value and the key keeps its first insertion position.
 `and` evaluates the right operand only when the left value is `true`. `or` evaluates the right operand only when the left value is `false`. Both operands have static type `bool`.
 
 A lambda call evaluates arguments under its contextual structural function
-type. A read-only closure borrows its owned environment for the body and may be
-called repeatedly. A closure whose body consumes a non-Copy capture is
-consumed by the call. Never-called and called closure environments are cleaned
-up exactly once on both maintained backends.
+type. A read-only or shared-loan closure may be called repeatedly. A
+mutable-loan closure may be called sequentially through a mutable closure
+place and writes directly to its captured source. A closure whose body
+consumes a non-Copy owned capture is consumed by the call. Never-called and
+called closure environments release owned values and loan registrations
+exactly once on both maintained backends.
 
 A comparison chain evaluates its operand expressions from left to right at
 most once. It evaluates each adjacent link after obtaining that link's right
@@ -6361,7 +6423,29 @@ runs active lexical cleanups, and returns to the caller. Reaching the end of a
 `None` function returns `None`. A non-`None` function cannot pass static
 checking if a reachable path falls through.
 
+`return view [mut] place` instead hands one checked loan to the caller. The
+declaration's `from` slot fixes its origin, and the caller continues the exact
+selected projection without an unlock/relock or clone. Every other callee loan
+ends before control returns. A trap before the handoff transfers no loan.
+
 A recursive Aura call consumes one logical call-depth unit. The maintained runtime rejects execution after 256 nested Aura calls with a source diagnostic rather than allowing the host stack to overflow.
+
+## Loan Lifetime And Cleanup
+
+A local view begins a shared or mutable loan over one place and storage
+generation. Both maintained backends resolve reads and writes through that
+identity; mutable writes happen immediately. Static final-use analysis may end
+the loan before lexical scope ends. Branch joins and loop edges extend regions
+conservatively, and every iteration releases its iteration-local loans.
+
+Exit actions form one reverse-acquisition stack containing loan ends, closure
+environment drops, mutable writebacks, match/iteration reconstruction, and
+resource cleanup. Normal fallthrough, return, escaping loop control, `try`
+propagation, maintained traps, and cancellation drain the required suffix.
+Consequently a view into a resource ends before `close`, and an inner reborrow
+ends before its parent. A task may retain a loan to its own storage across a
+scheduler suspension, but no descriptor or loan closure may cross to another
+task or worker.
 
 ## Foreign Calls
 
@@ -8318,7 +8402,9 @@ The complete declaration grammar is in [Grammar](/manual/grammar#functions-metho
 
 ## Signatures And Return Types
 
-Every ordinary parameter has an explicit type. A return annotation is optional; omitting it is exactly equivalent to `-> None`.
+Every ordinary parameter has an explicit type. A return annotation is optional;
+omitting it is exactly equivalent to `-> None`. Ordinary `-> T` returns are
+owned; a returned view uses the separate `-> view [mut] T from origin` form.
 
 ```aura
 def square(value: int32) -> int32:
@@ -8504,7 +8590,7 @@ def parse_total(left: str, right: str) -> Result[int32, str]:
 
 ## Owned Returns
 
-Every return annotation describes an owned result:
+Every ordinary type return annotation describes an owned result:
 
 ```aura
 class User:
@@ -8534,8 +8620,46 @@ A bare or `mut` parameter grants access but does not give the function
 ownership of a non-copy value stored behind that access. Moving such a value
 into the result is rejected; use one of the owned-result patterns above.
 
-Every result is an owned value. See [Ownership And
+Every ordinary result is an owned value. See [Ownership And
 Borrowing](/manual/ownership-and-borrowing#owned-returns).
+
+## Returned Views
+
+A function or method can return non-owning access to one declared receiver or
+parameter origin:
+
+    class User:
+        name: str
+
+    def name(user: User) -> view str from user:
+        return view user.name
+
+    def name_mut(user: mut User) -> view mut str from user:
+        return view mut user.name
+
+The `from` origin is mandatory and belongs to the signature. It is encoded by
+receiver/parameter slot across modules and trait conformance, so an
+implementation may rename its parameter but may not select another slot. A
+shared result may use a bare or `mut` origin. A mutable result requires a
+`mut` origin. Owned and defaulted parameters cannot be origins.
+
+Every reachable `return view` must trace to the origin or one of its supported
+fixed field or tuple projections. Locals, temporaries, enum arm payloads, and
+newly allocated values cannot escape. At a call, the origin argument must be
+an addressable place and the result must initialize a matching local view:
+
+    mut user = User(name="Ada")
+    view current = name(user)
+    print(current)
+
+    view mut editable = name_mut(user)
+    editable = "Grace"
+
+Return paths may select different fixed projections of the one declared
+origin. The caller locks that origin conservatively and execution retains the
+exact selected projection; selecting a different root is `AU3010`. Structural
+`def(...) -> R` types cannot represent returned-view origin metadata and
+therefore do not accept these functions.
 
 ## Generic Functions
 
@@ -8713,7 +8837,8 @@ callable rejection without a narrower compile-time code.
 conflict; `AU3003` means a mutability violation; and `AU3004` means an invalid
 parameter, receiver, return, or task-capture ownership mode. `AU3007` means a
 call specialization would duplicate non-cloneable `random.Rng` state or could
-not satisfy a callable clone-safety obligation. `AU4001` means a
+not satisfy a callable clone-safety obligation. `AU3010` means a returned view
+has an invalid escape, origin, caller place, kind, or provenance path. `AU4001` means a
 call-depth or general call trap. A callee's `AU4002` means arithmetic overflow
 or underflow, `AU4003` means bounds or lookup violation, `AU4004` means zero divisor, and
 `AU4005` means a trapping resource or I/O failure; each retains the same typed
@@ -8721,9 +8846,9 @@ Aura call frames and task ancestry on MIR and direct-native execution.
 
 ## Backend Support
 
-Ordinary, indirect function-value, generic, imported, associated,
-trait-dispatched, and maintained task-target calls are implemented for MIR
-execution and direct native builds.
+Ordinary, returned-view, indirect function-value, generic, imported,
+associated, trait-dispatched, and maintained task-target calls are implemented
+for MIR execution and direct native builds.
 Shared semantic checking and the forced parity matrix require identical call
 results and primary failures. Compiler analysis and the LSP use the same
 resolved signature metadata, including inferred clone-safety obligations.
@@ -9394,8 +9519,10 @@ return assert if elif else and or not match case for in while break
 continue pass try with as true false
 ```
 
-`from` is contextual: it introduces a from-import at module level and may also
-be used as an identifier where the grammar expects one. `lambda` is lexed as
+`from` is contextual: it introduces a from-import at module level, completes a
+returned-view annotation, and may also be used as an identifier where the
+grammar expects one. `view` is contextual in complete local-view,
+returned-view, and `return view` forms. `lambda` is lexed as
 an identifier but introduces a lambda at the start of an expression; member
 and named-argument positions may still use that spelling. `copy`, `self`,
 `None`, `set`, `Self`, and `_` are lexed as identifiers and acquire special
@@ -9692,12 +9819,17 @@ parameter
       [ "=", expression ] ;
 
 return-annotation
-    = "->", type ;
+    = "->", type
+    | "->", "view", [ "mut" ], type,
+      "from", identifier ;
 ```
 
 A receiver, when present, is the first method parameter. Bare `self` is the shared receiver, `mut self` is mutable, and `own self` is consuming. There is exactly one spelling per capability. A first method parameter written as `self: Type` is rejected rather than interpreted as an ordinary parameter; use one of the receiver forms above. Ordinary parameter capabilities appear after the colon: bare `T` is shared, `mut T` is mutable, and `own T` is consuming. Call sites pass the value directly and never prefix an argument with a capability.
 
-Bare means shared access for every type, including declaration-known copy types. Return annotations carry no capability: every return is an ordinary owned return.
+Bare means shared access for every type, including declaration-known copy
+types. An ordinary type annotation is an owned return. A view annotation names
+one receiver or ordinary parameter origin; static semantics validates its
+kind, provenance, and caller-place requirements.
 
 Parameter lists, calls, and return annotations do not accept trailing commas. Static checking further restricts duplicate names, default placement/availability, and mutable task targets.
 
@@ -9745,6 +9877,7 @@ suite = INDENT, statement, { statement }, DEDENT ;
 
 statement
     = assignment-statement
+    | view-statement
     | return-statement
     | assert-statement
     | pass-statement
@@ -9765,6 +9898,10 @@ assignment-statement
       assignment-operator,
       expression, statement-end
     | unpack-target, "=", expression, statement-end ;
+
+view-statement
+    = "view", [ "mut" ], identifier,
+      "=", expression, statement-end ;
 
 assignment-target
     = identifier,
@@ -9788,7 +9925,10 @@ assignment-operator
     = "=" | "+=" | "-=" | "*=" | "**=" | "/=" | "//=" | "%="
     | "&=" | "|=" | "^=" | "<<=" | ">>=" ;
 
-return-statement     = "return", [ expression ], statement-end ;
+return-statement
+    = "return", [ expression ], statement-end
+    | "return", "view", [ "mut" ],
+      expression, statement-end ;
 assert-statement     = "assert", non-tuple-expression,
                        [ ",", non-tuple-expression ], statement-end ;
 pass-statement       = "pass", NEWLINE ;
@@ -9942,8 +10082,16 @@ expression           = lambda-expression | non-tuple-expression ;
 non-tuple-expression = conditional-expression ;
 
 lambda-expression
-    = "lambda", [ lambda-parameter,
+    = "lambda", [ lambda-capture-list ],
+      [ lambda-parameter,
       { ",", lambda-parameter } ], ":", expression ;
+
+lambda-capture-list
+    = "[", lambda-capture,
+      { ",", lambda-capture }, "]" ;
+
+lambda-capture
+    = [ "mut" | "own" ], identifier ;
 
 lambda-parameter
     = [ "mut" | "own" ], identifier ;
@@ -10110,7 +10258,8 @@ Lambda parameters receive their types from an expected structural function
 type, whose result also constrains the body. A zero-parameter lambda may infer
 its result from the body. The colon introduces one expression, not a suite.
 Lambda parameters do not accept annotations, defaults, generics, or a trailing
-comma.
+comma. A capture list is exhaustive and nonempty; its entries name outer local
+places and request shared, mutable, or by-value owned capture.
 
 `(value)` is grouping and `(value,)` is a singleton tuple. Tuple value
 expressions require parentheses; an unparenthesized comma is accepted only in
@@ -12520,6 +12669,10 @@ the source usable.
 | `match own value:` | Consuming pattern matching. |
 | `match mut value:` | Mutable borrowed pattern matching with writeback. |
 | `-> T` | Owned result. A copy result is an ordinary independent copy. |
+| `view name = place` | Shared view whose lifetime is inferred from its final use. |
+| `view mut name = place` | Exclusive mutable write-through view. |
+| `-> view T from source` | Shared returned view tied to one receiver or parameter. |
+| `-> view mut T from source` | Mutable returned view tied to one mutable receiver or parameter. |
 
 The spelling asymmetry is intentional: parameter ownership occupies the type position as `value: own T`, parallel to `value: T`, while loop ownership prefixes the iterable as `for value in own values` because loops have no type position.
 
@@ -12557,6 +12710,39 @@ Only a mutable place can satisfy `mut T`. A local becomes mutable with `mut`; a
 field is mutable when its base place is mutable; a `mut` receiver or parameter
 is a mutable place inside its body. Parameter bindings themselves are not
 reassigned.
+
+## Local Views And Place Identity
+
+`view` creates a non-owning alias to one addressable place. Supported places
+are local roots, parameters, receivers, existing views, class-field paths,
+and fixed tuple positions. A source is evaluated once. Collection indexes,
+map keys, set elements, Queue receives, Range values, and computed temporaries
+do not have view identity in Aura 0.3.
+
+    class Counter:
+        value: int64
+
+    def main():
+        mut counter = Counter(value=1)
+        view mut value = counter.value
+        view mut nested = value
+        nested = nested + 1
+        print(counter.value)
+
+The mutable assignment writes immediately to `counter.value`; ending the loan
+does not perform delayed copy-back. A shared view permits reads. A mutable view
+is exclusive and blocks every overlapping source access except through itself
+or a contained reborrow. Ancestors overlap descendants, while distinct fixed
+fields and tuple positions are disjoint. A view binding cannot be rebound,
+moved, cloned as a descriptor, stored in an aggregate, or sent across a task
+or Queue boundary.
+
+Loan regions begin at view creation and end after the final possible use,
+conservatively across branches and loops. Their lexical scope is only an upper
+bound. Rebinding, moving, cleaning up, or structurally mutating an overlapping
+source is rejected while the loan remains live. Scope exits, `return`,
+`break`, `continue`, propagated errors, traps, and cancellation release every
+loan they leave in reverse acquisition order.
 
 ## Call-Boundary Exclusivity
 
@@ -12646,9 +12832,36 @@ Shared or mutable access does not transfer ownership of a non-copy field, so
 returning that field directly is rejected as an invalid move through access
 the function does not own.
 
-Every result is owned. Return syntax carries only a result type and no source
-label or access capability. The detailed rules are in
+Every ordinary `-> T` result is owned. The detailed rules are in
 [Functions](/manual/functions#owned-returns).
+
+## Returned Views
+
+A declaration can instead return a view tied to exactly one receiver or
+ordinary parameter:
+
+    class User:
+        name: str
+
+    def name(user: User) -> view str from user:
+        return view user.name
+
+    def name_mut(user: mut User) -> view mut str from user:
+        return view mut user.name
+
+The origin is part of the callable contract. A shared result may originate
+from bare or mutable access; a mutable result requires a `mut` origin. An
+`own` or defaulted parameter, callee local, temporary, or newly allocated
+value cannot be an origin. A caller must supply an addressable origin and bind
+the result with a matching `view` form. Trait implementations must use the
+same receiver or parameter slot as the trait declaration even if parameter
+names differ.
+
+Different return paths may select different fixed projections of the declared
+origin; the caller locks that origin conservatively while execution retains the
+exact selected projection. A different root is `AU3010`. Ordinary `-> T`
+remains an owned return and structural `def(...) -> R` types do not erase a
+returned view's origin.
 
 ## Borrowed Pattern Matching
 
@@ -12736,10 +12949,10 @@ with `AU3007`.
 
 ## Closures And Capture
 
-Closure capture is an ownership operation at lambda creation. A referenced
-outer Copy value is copied into the closure environment. A referenced outer
-non-Copy owned value is moved, so the source cannot be used afterward unless
-the program cloned before creation.
+Closure capture without a capture list is an ownership operation at lambda
+creation. A referenced outer Copy value is copied into the closure environment.
+A referenced outer non-Copy owned value is moved, so the source cannot be used
+afterward unless the program cloned before creation.
 
 A read-only closure borrows its environment for each call and is repeatable,
 including when it owns non-Copy data. A closure whose body consumes any
@@ -12747,9 +12960,18 @@ non-Copy capture is itself consumed by the call and is single-use under
 `AU3001`. Capturing closures are non-Copy. Their environment is Transfer only
 when every captured value is Transfer.
 
-Enclosing bare and `mut` parameters are shared and mutable capabilities rather
-than owned values and cannot be captured. Captured state is read-only. See
-[Closures](/manual/closures) and Accepted ADR-0037.
+An explicit exhaustive capture list requests live capabilities:
+
+    read = lambda [settings] key: settings.lookup(key)
+    mut update = lambda [mut stats] value: stats.record(value)
+    snapshot = lambda [own cache] key: cache.get(key)
+
+A bare entry creates a shared loan, `mut` creates an exclusive mutable loan,
+and `own` retains ADR-0037 copy/move capture. Every used outer local must be
+listed exactly once and every listed local must be used. A mutable-loan closure
+is mutable-repeatable and must be called through a mutable closure place. A
+loan closure is non-Copy, non-Transfer, synchronous, and local. See
+[Closures](/manual/closures) and ADR-0038.
 
 ## FFI Views And Opaque Handles
 
@@ -12846,9 +13068,10 @@ Builtin resource behavior is defined by its module chapter. A user class must be
 The normative capability spellings are bare, `own`, and `mut` ordinary
 parameters; `self`, `own self`, and `mut self` receivers; bare, `own`, and
 `mut` collection loops where the iterable supports them; bare, `match own`,
-and `match mut` matching; mutable bindings; owned return annotations; and
-`with`. Their productions are in [Grammar](/manual/grammar). Call arguments
-themselves never carry a capability prefix.
+and `match mut` matching; mutable bindings; local and returned `view` forms;
+explicit lambda capture lists; owned return annotations; and `with`. Their
+productions are in [Grammar](/manual/grammar). Call arguments themselves never
+carry a capability prefix.
 
 ## Typing Rules
 
@@ -12858,17 +13081,19 @@ for every type; an implementation may pass copy bits directly. Explicit `own`
 consumes; `mut` requires one exclusive mutable place. Shared and owned
 defaults are legal, with shared temporaries lasting through the call;
 `mut` defaults are rejected. Place-prefix overlap, partial moves,
-control-flow joins, loop repetition, owned-return moves, borrowed matches,
-borrowed iteration, task capture, and managed-resource containment are
-checked before lowering. Clone-producing generic operations infer obligations
-that are propagated through calls and discharged after specialization.
+control-flow joins, loop repetition, owned-return moves, view provenance and
+last-use regions, borrowed matches, borrowed iteration, task capture, and
+managed-resource containment are checked before lowering. Clone-producing
+generic operations infer obligations that are propagated through calls and
+discharged after specialization.
 
 ## Runtime Semantics
 
-A copy use duplicates a value and a move transfers it. Shared and mutable
-borrows are statically enforced access contracts rather than first-class
-runtime reference values in Aura 0.3. Mutable borrowed calls and list
-iteration write through the original place; `match mut` reconstructs
+A copy use duplicates a value and a move transfers it. Ordinary parameter
+borrows remain call-scoped access contracts. An explicit view carries a
+compiler/runtime loan descriptor for one source place and generation; reads
+and writes resolve through that descriptor without cloning. Mutable borrowed
+calls and list iteration write through the original place; `match mut` reconstructs
 and writes back on every arm exit. Simple dict indexed assignment accepts and
 owns any value type; direct compound indexed assignment requires a copy `list`
 element or `dict` value.
@@ -12932,6 +13157,10 @@ reports a non-Transfer task or Queue boundary. `AU3009` rejects clone,
 clone-producing collection read, or aggregate copy that would duplicate a
 single-consumer task-result right. Reuse after direct observation is the
 ordinary moved-value `AU3001`; shared-access consumption is `AU3002`.
+`AU3010` reports an invalid view escape, returned-view origin, or provenance
+path. View diagnostics identify the creation and final use that retain the
+conflicting loan and recommend shortening the region, using a disjoint place,
+or producing an owned clone.
 Ownership failures are static. A runtime operation reached through an owned or
 borrowed value keeps its own code: `AU4001` for a general trap, `AU4002` for
 arithmetic overflow or underflow, `AU4003` for a bounds or lookup violation,
@@ -12948,8 +13177,11 @@ and primary-diagnostic behavior.
 
 ## Limits And Implementation-Defined Behavior
 
-Place analysis tracks local roots and field-prefix paths; it proves disjoint
-sibling fields but is not a general alias theorem. Mutable set iteration,
+Place analysis tracks local roots, fixed tuple positions, and field-prefix
+paths; it proves disjoint fixed projections but is not a general alias theorem.
+Indexed/keyed views, view-bearing aggregates, multi-origin returned views,
+returned loan closures, and lifetime-parameterized callable types are
+unavailable. Mutable set iteration,
 explicit Queue ownership modifiers,
 mutable-borrow task targets, moving out of a managed resource, and arbitrary
 reference values are unavailable. Loop move analysis intentionally uses only
@@ -12964,7 +13196,9 @@ partial moves and reinitialization, flow-sensitive checks, owned returns,
 borrowed matching and list/set iteration, task capture, cloning,
 and lexical resource ownership are implemented for the post-Phase 1.5
 surface; the one-time list/set/Queue iteration-source rule is accepted under
-ADR-0017. Mutable set iteration, Queue ownership modifiers, and mutable task
+ADR-0017. Place-based local and returned views, inferred regions, reborrowing,
+explicit loan closure captures, and unified loan cleanup are implemented under
+ADR-0038. Mutable set iteration, Queue ownership modifiers, and mutable task
 capture are unavailable.
 
 ## Source: docs/manual/packages.md
@@ -14020,6 +14254,7 @@ Statements introduce and update bindings, control execution, or evaluate an expr
 Aura 0.3 statements are:
 
 - binding and assignment
+- local `view` bindings
 - expression statements
 - `return`
 - `assert`
@@ -14163,6 +14398,24 @@ language-level partial assignment contract.
 
 See [Ownership And Borrowing](/manual/ownership-and-borrowing) for moves, partial field moves, and mutable-place rules.
 
+## View Bindings
+
+`view name = place` creates an immutable shared alias, and `view mut name =
+place` creates a non-rebindable mutable write-through alias. The initializer
+must resolve to a supported addressable root, field path, fixed tuple position,
+or existing view; collection indexes and computed temporaries are rejected.
+
+    mut pair = (1, 2)
+    view mut second = pair[1]
+    second = 7
+    print(pair)
+
+The binding's pointee type is inferred. Assigning through a mutable view
+changes the source; it does not retarget the view. Static final-use analysis
+ends its loan as early as control flow safely permits. Overlapping mutation,
+move, rebind, cleanup, or another mutable loan is rejected while it remains
+live. Scope and control-flow exits release active loans before outer cleanup.
+
 ## Expression Statements
 
 Any expression may be used as a statement when its produced value is not needed:
@@ -14184,7 +14437,11 @@ def answer() -> int32:
     return 42
 ```
 
-The expression is evaluated before control returns. Its type must equal the declared return type. Bare `return` produces `None` and is valid only where `None` is a valid return.
+The expression is evaluated before control returns. Its type must equal the
+declared return type. Bare `return` produces `None` and is valid only where
+`None` is a valid return. Inside a declared view-returning function, `return
+view [mut] place` hands a matching loan derived from the named `from` origin to
+the caller.
 
 ```aura
 def maybe_log(enabled: bool):
@@ -14706,11 +14963,13 @@ once under those parameter bindings. Aura does not infer parameter types
 from body operations. A zero-parameter lambda may infer `def() -> R` from its
 body when no expected callable type is present.
 
-Outer owned locals and `own` parameters referenced by the body are captured by
-value. Copy values are snapshotted and non-Copy values move when the lambda
-expression is evaluated. Bare and `mut` enclosing parameters are capabilities
-and cannot be captured. Captured values permit shared reads or consumption,
-but not mutation in Phase 6.3. See [Closures](/manual/closures).
+Without a capture list, outer owned locals and `own` parameters referenced by
+the body are captured by value. Copy values snapshot and non-Copy values move
+when the lambda expression is evaluated. An explicit exhaustive list may
+instead request a shared loan, mutable loan, or owned capture for each used
+outer local. Mutable-loan closures require a mutable closure place for calls;
+loan closures are non-Transfer and remain inside synchronous local use. See
+[Closures](/manual/closures).
 
 Capture-free lambdas may cross every ordinary structural function-value
 boundary. Capturing closures retain environment and call-kind metadata, so
@@ -14735,6 +14994,8 @@ A declaration is valid only when:
 - all referenced types exist with the correct arity
 - default expressions have exactly the declared parameter or field type
 - a non-`None` function or method returns on every statically reachable fallthrough path
+- every view-returning declaration names one bare or mutable receiver/parameter
+  origin, and every `return view` derives from that origin with matching kind
 - copy classes contain only copy-compatible fields
 - trait implementations satisfy the trait's type arguments, supertraits, method set, and method signatures
 
@@ -15048,7 +15309,10 @@ is safe.
 
 ## Control Flow
 
-`return` is valid only in a function or method. Its value must equal the declared return type; an omitted value has type `None`.
+`return` is valid only in a function or method. Its ordinary value must equal
+the declared return type; an omitted value has type `None`. `return view` is
+valid only under a matching declared view return and must preserve the exact
+receiver/parameter provenance root.
 
 `break` and `continue` are valid only inside `for` or `while`. A loop-local binding does not escape. Moving a non-copy outer value for the first time inside a repeatable loop is rejected unless the checker can prove the path does not create an invalid next iteration.
 
@@ -15109,11 +15373,10 @@ rejection uses `AU3008`, identifies the task or Queue boundary, and gives the
 nested component path that caused it, such as a field that contains `fs.File`;
 it does not suggest implementing a `Transfer` trait.
 
-A closure target is Transfer exactly when every stored capture is Transfer.
+A by-value closure target is Transfer exactly when every stored capture is Transfer.
 The complete closure value is moved or copied into task-owned storage before
-the child calls it. Capture-free lambdas are Copy and Transfer. By-value
-closure capture cannot launder shared or mutable capabilities because those
-captures are rejected when the closure is created.
+the child calls it. Capture-free lambdas are Copy and Transfer. A closure with
+any shared or mutable loan capture is non-Transfer and rejected with `AU3008`.
 
 Task-target resolution accepts a concrete function value. Explicit
 `function[Types]` specialization may produce such a value before the call;
@@ -15201,14 +15464,24 @@ capabilities are exact: code must pass bare/shared element callbacks rather
 than relying on adaptation from `mut` or `own`.
 
 Contextually typed `lambda parameters: expression` closures follow Accepted
-ADR-0037. Captures are by value: Copy values are copied,
-owned non-Copy values move at creation, read-only capture use is repeatable,
-and consuming capture use makes the closure single-use. A closure is Transfer
-only when every capture is Transfer. Shared or mutable capability capture and
-mutable captured state are unavailable. Zero-parameter lambdas may infer their result
+ADR-0037. Without a capture list, Copy values copy and owned non-Copy values
+move at creation. ADR-0038 adds exhaustive lists with shared, mutable, and
+owned entries. Shared-loan use is repeatable, mutable-loan use is repeatable
+through a mutable closure place, and consuming owned-capture use is single-use.
+A by-value closure is Transfer only when every capture is Transfer; a loan
+closure is never Transfer. Zero-parameter lambdas may infer their result
 without a contextual callable type. Capturing closures retain compiler
 metadata and therefore do not cross arbitrary written-`def` parameter, field,
 collection, or annotated return boundaries.
+
+Phase 6.5 implements ADR-0038 place-based loans and views. Local shared and
+mutable views cover roots, fixed class fields, and tuple positions; lifetimes
+end after conservative final use; reborrows preserve source identity; and
+mutable views write through immediately. One declared receiver or parameter
+may be the origin of `-> view [mut] T from source`. MIR execution, direct
+native builds, analysis/LSP, and editor tooling share semantic-interface
+schema 6 for this surface. Views and loan closures remain task-local and
+non-Transfer.
 
 Phase 6.4 adds explicitly authorized FFI v0 packages. Bodyless
 `extern "C"` functions call process-global symbols synchronously through
@@ -15235,8 +15508,9 @@ reversed range traps with `AU4003`; endpoints are not clamped. String positions
 count Unicode scalar values and require an O(n)
 scan. Every result owns independent storage: list elements copy or clone under
 clone-safety and task-repeatability rules, while str produces a fresh valid
-UTF-8 value. String integer indexing, steps, slice assignment, and views remain
-unavailable; this feature does not implement ADR-0038.
+UTF-8 value. String integer indexing, steps, slice assignment, and indexed
+slice views remain unavailable. The separate ADR-0038 `view` forms do not
+reinterpret owned slice syntax.
 
 Phase 7.3 adds global contiguous `Array[T]` values under Accepted ADR-0041.
 The four dtypes are `int32`, `int64`, `float32`, and `float64`; every value
@@ -20292,9 +20566,11 @@ This is repeatable because the body only reads `name`. A body that returns or
 otherwise consumes a non-Copy capture makes the closure single-use. Clone
 before creation when the outer code must keep an independent owner.
 
-Shared or mutable enclosing parameters cannot be captured, captured state
-cannot be mutated in this phase, and a closure can cross a task boundary only
-when every captured value is Transfer.
+Without a capture list, shared or mutable enclosing parameters are not
+captured. An explicit exhaustive list may request `[value]`, `[mut value]`, or
+`[own value]`. Mutable-loan closures are called through a `mut` local and write
+through to their source. A closure can cross a task boundary only when every
+capture is owned and Transfer; any loan capture makes it non-Transfer.
 
 Capture-free lambdas work anywhere a function value works. A capturing
 closure may stay in an immutable local, be called directly, enter a
@@ -20307,7 +20583,8 @@ normative [Closures](../docs/manual/closures.md) page.
 
 ## Current Limits
 
-- return values are always owned
+- ordinary `-> T` return values are owned; `-> view [mut] T from origin` is the
+  explicit non-owning exception
 - clone-based non-copy returns require the returned type to be clone-safe
 - method values and multi-statement closure bodies are not part of this stage
 
@@ -21043,15 +21320,97 @@ def main():
     print(length())
 ```
 
-Bare and `mut` enclosing parameters are borrowed capabilities and cannot be
-captured. Closure environments are read-only in Phase 6.3. A closure may cross
-a task boundary only when every captured value is Transfer.
+Without a capture list, bare and `mut` enclosing parameters are not captured.
+Use an explicit exhaustive list for a live shared or mutable loan. A by-value
+closure may cross a task boundary only when every captured value is Transfer;
+a loan closure is always local and non-Transfer.
 
 Stored and arbitrary parameter `def` types remain capture-free. Keep a
 capturing closure in an immutable local, call it directly, pass it to a
 compiler-known repeatable callback, or move a qualifying closure into one task
 start; do not erase its environment metadata through a field, collection, or
 annotated return.
+
+## Local Views, Reborrowing, And Inferred Lifetimes
+
+A view names a live place without taking ownership:
+
+```aura check-pass
+class Counter:
+    value: int64
+
+def main():
+    mut counter = Counter(value=1)
+    view mut value = counter.value
+    view mut nested = value
+    nested = nested + 1
+    print(counter.value)
+```
+
+`nested` is a reborrow of `value`, and its assignment writes immediately to
+`counter.value`. The compiler ends both loans after their final possible use,
+so the later source read is legal even though the view bindings remain in
+lexical scope. Shared views may overlap shared views; a mutable view excludes
+all overlapping source access. Proven-disjoint fields and fixed tuple
+positions can be loaned independently. Collection indexes are not view places
+in Aura 0.3.
+
+## Returned Views
+
+A function can return access tied to one named receiver or parameter:
+
+```aura check-pass
+class User:
+    name: str
+
+def name(user: User) -> view str from user:
+    return view user.name
+
+def rename(user: mut User) -> view mut str from user:
+    return view mut user.name
+
+def main():
+    mut user = User(name="Ada")
+    view current = name(user)
+    print(current)
+
+    view mut editable = rename(user)
+    editable = "Grace"
+    print(user.name)
+```
+
+The `from` origin is part of the function contract. Mutable results require a
+mutable origin and a mutable view binding. A local, temporary, owned/defaulted
+parameter, or different root cannot escape as the result. Ordinary `-> T`
+returns remain owned.
+
+## Explicit Loan Captures
+
+Capture lists are exhaustive and make live access visible:
+
+```aura check-pass
+class Counter:
+    value: int64
+
+    def add(mut self, amount: int64):
+        self.value += amount
+
+def main():
+    mut counter = Counter(value=1)
+    mut update: def(int64) -> None = lambda [mut counter] amount: counter.add(amount)
+    update(2)
+    update(3)
+    print(counter.value)
+```
+
+`[counter]` is a shared loan, `[mut counter]` is a mutable loan, and `[own
+counter]` is the original by-value Copy/move capture. A mutable-loan closure is
+repeatable through a `mut` closure local. Its source remains exclusively
+loaned until the closure's final use, and the closure cannot enter a task,
+Queue, aggregate, or arbitrary structural `def` boundary.
+
+Run the combined maintained example at
+[examples/basics/views.au](../examples/basics/views.au).
 
 ## Passing Values To Functions
 
@@ -23597,11 +23956,13 @@ outside the implemented surface.
 Contextually typed expression lambdas use `lambda parameters: expression`.
 The expected `def(...) -> ...` type supplies parameter types and constrains
 the result; `lambda: expression` may infer `def() -> R` without context.
-Captures are by value: Copy values are snapshotted and owned non-Copy values
-move at creation. A read-only closure is repeatable, a closure that consumes a
-non-Copy capture is single-use, and a closure is Transfer exactly when every
-capture is Transfer. Captured environments are read-only in Phase 6.3 and
-cannot be erased through arbitrary stored or parameter `def` types.
+Without a capture list, Copy values are snapshotted and owned non-Copy values
+move at creation. An explicit exhaustive list uses `[value]`, `[mut value]`,
+and `[own value]` for shared loans, mutable loans, and by-value capture. A
+shared closure is repeatable, a mutable-loan closure is repeatable through a
+mutable local, and a closure that consumes a non-Copy owned capture is
+single-use. Loan closures are non-Transfer and cannot be erased through
+arbitrary stored or parameter `def` types.
 
 These built-in type names are reserved and cannot be reused for user-defined classes, enums, or traits.
 
@@ -23773,7 +24134,10 @@ The current compiler supports these expression forms:
 - owned list/str slicing with `expr[start:end]`, `expr[:end]`,
   `expr[start:]`, and `expr[:]`
 - owned first-axis Array slicing with the same one-colon forms; the result is
-  a fresh Array, and views remain unavailable
+  a fresh Array, and indexed Array views remain unavailable
+- place-based `view name = place` and `view mut name = place`, including fixed
+  field/tuple projections, inferred final-use lifetimes, reborrowing, and
+  `-> view [mut] T from origin` returned access
 - function and method calls
 - explicit type arguments on call targets such as `Box[int32](...)` and `Result[int32, str].Ok(...)`
 - enum and built-in enum variant construction
@@ -23826,7 +24190,9 @@ the `int64` position domain, negatives normalize once, both effective endpoints 
 in `0..=len`, and start must not exceed end. Invalid bounds trap with `AU4003`;
 Aura never clamps them. String positions count Unicode scalar values and require
 an O(n) scan. Integer str indexing, step syntax, slice assignment, and
-views remain unavailable.
+indexed slice views remain unavailable. Use the separate `view` forms for an
+addressable root, field, or fixed tuple position; slice syntax always owns its
+result.
 
 Numeric `Array[T]` values have rank at least one, may contain zero-sized
 dimensions, and use contiguous row-major storage. The constructors are
@@ -26995,10 +27361,12 @@ The current tutorial set covers:
   types, copy and `Transfer` semantics, indirect calls, storage, and task
   targets
 - contextually typed expression lambdas with by-value Copy/non-Copy capture,
-  repeatable reads, consuming single-use calls, and structural Transfer
+  exhaustive shared/mutable/owned capture lists, repeatable shared/mutable
+  calls, consuming single-use calls, and structural Transfer
 - classes with fields, default values, receiver forms, mutating methods, and `public` field syntax
 - ownership, declaration-stable parameter defaults, explicit `own`, move
-  semantics, copy types, and the exclusivity rule for mutable borrows
+  semantics, copy types, place-based shared/mutable views, returned views,
+  reborrowing, inferred loan lifetimes, and exclusivity
 - owned `list[T]`, `dict[K, V]`, and `set[T]` collections with literals,
   storing APIs, bare-shared/`own` iteration, mutable list iteration, stable
   sorting, eager callback-powered `map`/`filter`, and eager owned list/set/dictionary

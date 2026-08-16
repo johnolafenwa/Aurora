@@ -307,9 +307,11 @@ This is repeatable because the body only reads `name`. A body that returns or
 otherwise consumes a non-Copy capture makes the closure single-use. Clone
 before creation when the outer code must keep an independent owner.
 
-Shared or mutable enclosing parameters cannot be captured, captured state
-cannot be mutated in this phase, and a closure can cross a task boundary only
-when every captured value is Transfer.
+Without a capture list, shared or mutable enclosing parameters are not
+captured. An explicit exhaustive list may request `[value]`, `[mut value]`, or
+`[own value]`. Mutable-loan closures are called through a `mut` local and write
+through to their source. A closure can cross a task boundary only when every
+capture is owned and Transfer; any loan capture makes it non-Transfer.
 
 Capture-free lambdas work anywhere a function value works. A capturing
 closure may stay in an immutable local, be called directly, enter a
@@ -322,6 +324,7 @@ normative [Closures](../docs/manual/closures.md) page.
 
 ## Current Limits
 
-- return values are always owned
+- ordinary `-> T` return values are owned; `-> view [mut] T from origin` is the
+  explicit non-owning exception
 - clone-based non-copy returns require the returned type to be clone-safe
 - method values and multi-statement closure bodies are not part of this stage

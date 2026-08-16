@@ -107,6 +107,10 @@ the source usable.
 | `match own value:` | Consuming pattern matching. |
 | `match mut value:` | Mutable borrowed pattern matching with writeback. |
 | `-> T` | Owned result. A copy result is an ordinary independent copy. |
+| `view name = place` | Shared view whose lifetime is inferred from its final use. |
+| `view mut name = place` | Exclusive mutable write-through view. |
+| `-> view T from source` | Shared returned view tied to one receiver or parameter. |
+| `-> view mut T from source` | Mutable returned view tied to one mutable receiver or parameter. |
 
 The spelling asymmetry is intentional: parameter ownership occupies the type position as `value: own T`, parallel to `value: T`, while loop ownership prefixes the iterable as `for value in own values` because loops have no type position.
 
@@ -144,6 +148,39 @@ Only a mutable place can satisfy `mut T`. A local becomes mutable with `mut`; a
 field is mutable when its base place is mutable; a `mut` receiver or parameter
 is a mutable place inside its body. Parameter bindings themselves are not
 reassigned.
+
+## Local Views And Place Identity
+
+`view` creates a non-owning alias to one addressable place. Supported places
+are local roots, parameters, receivers, existing views, class-field paths,
+and fixed tuple positions. A source is evaluated once. Collection indexes,
+map keys, set elements, Queue receives, Range values, and computed temporaries
+do not have view identity in Aura 0.3.
+
+    class Counter:
+        value: int64
+
+    def main():
+        mut counter = Counter(value=1)
+        view mut value = counter.value
+        view mut nested = value
+        nested = nested + 1
+        print(counter.value)
+
+The mutable assignment writes immediately to `counter.value`; ending the loan
+does not perform delayed copy-back. A shared view permits reads. A mutable view
+is exclusive and blocks every overlapping source access except through itself
+or a contained reborrow. Ancestors overlap descendants, while distinct fixed
+fields and tuple positions are disjoint. A view binding cannot be rebound,
+moved, cloned as a descriptor, stored in an aggregate, or sent across a task
+or Queue boundary.
+
+Loan regions begin at view creation and end after the final possible use,
+conservatively across branches and loops. Their lexical scope is only an upper
+bound. Rebinding, moving, cleaning up, or structurally mutating an overlapping
+source is rejected while the loan remains live. Scope exits, `return`,
+`break`, `continue`, propagated errors, traps, and cancellation release every
+loan they leave in reverse acquisition order.
 
 ## Call-Boundary Exclusivity
 
@@ -233,9 +270,36 @@ Shared or mutable access does not transfer ownership of a non-copy field, so
 returning that field directly is rejected as an invalid move through access
 the function does not own.
 
-Every result is owned. Return syntax carries only a result type and no source
-label or access capability. The detailed rules are in
+Every ordinary `-> T` result is owned. The detailed rules are in
 [Functions](/manual/functions#owned-returns).
+
+## Returned Views
+
+A declaration can instead return a view tied to exactly one receiver or
+ordinary parameter:
+
+    class User:
+        name: str
+
+    def name(user: User) -> view str from user:
+        return view user.name
+
+    def name_mut(user: mut User) -> view mut str from user:
+        return view mut user.name
+
+The origin is part of the callable contract. A shared result may originate
+from bare or mutable access; a mutable result requires a `mut` origin. An
+`own` or defaulted parameter, callee local, temporary, or newly allocated
+value cannot be an origin. A caller must supply an addressable origin and bind
+the result with a matching `view` form. Trait implementations must use the
+same receiver or parameter slot as the trait declaration even if parameter
+names differ.
+
+Different return paths may select different fixed projections of the declared
+origin; the caller locks that origin conservatively while execution retains the
+exact selected projection. A different root is `AU3010`. Ordinary `-> T`
+remains an owned return and structural `def(...) -> R` types do not erase a
+returned view's origin.
 
 ## Borrowed Pattern Matching
 
@@ -323,10 +387,10 @@ with `AU3007`.
 
 ## Closures And Capture
 
-Closure capture is an ownership operation at lambda creation. A referenced
-outer Copy value is copied into the closure environment. A referenced outer
-non-Copy owned value is moved, so the source cannot be used afterward unless
-the program cloned before creation.
+Closure capture without a capture list is an ownership operation at lambda
+creation. A referenced outer Copy value is copied into the closure environment.
+A referenced outer non-Copy owned value is moved, so the source cannot be used
+afterward unless the program cloned before creation.
 
 A read-only closure borrows its environment for each call and is repeatable,
 including when it owns non-Copy data. A closure whose body consumes any
@@ -334,9 +398,18 @@ non-Copy capture is itself consumed by the call and is single-use under
 `AU3001`. Capturing closures are non-Copy. Their environment is Transfer only
 when every captured value is Transfer.
 
-Enclosing bare and `mut` parameters are shared and mutable capabilities rather
-than owned values and cannot be captured. Captured state is read-only. See
-[Closures](/manual/closures) and Accepted ADR-0037.
+An explicit exhaustive capture list requests live capabilities:
+
+    read = lambda [settings] key: settings.lookup(key)
+    mut update = lambda [mut stats] value: stats.record(value)
+    snapshot = lambda [own cache] key: cache.get(key)
+
+A bare entry creates a shared loan, `mut` creates an exclusive mutable loan,
+and `own` retains ADR-0037 copy/move capture. Every used outer local must be
+listed exactly once and every listed local must be used. A mutable-loan closure
+is mutable-repeatable and must be called through a mutable closure place. A
+loan closure is non-Copy, non-Transfer, synchronous, and local. See
+[Closures](/manual/closures) and ADR-0038.
 
 ## FFI Views And Opaque Handles
 
@@ -433,9 +506,10 @@ Builtin resource behavior is defined by its module chapter. A user class must be
 The normative capability spellings are bare, `own`, and `mut` ordinary
 parameters; `self`, `own self`, and `mut self` receivers; bare, `own`, and
 `mut` collection loops where the iterable supports them; bare, `match own`,
-and `match mut` matching; mutable bindings; owned return annotations; and
-`with`. Their productions are in [Grammar](/manual/grammar). Call arguments
-themselves never carry a capability prefix.
+and `match mut` matching; mutable bindings; local and returned `view` forms;
+explicit lambda capture lists; owned return annotations; and `with`. Their
+productions are in [Grammar](/manual/grammar). Call arguments themselves never
+carry a capability prefix.
 
 ## Typing Rules
 
@@ -445,17 +519,19 @@ for every type; an implementation may pass copy bits directly. Explicit `own`
 consumes; `mut` requires one exclusive mutable place. Shared and owned
 defaults are legal, with shared temporaries lasting through the call;
 `mut` defaults are rejected. Place-prefix overlap, partial moves,
-control-flow joins, loop repetition, owned-return moves, borrowed matches,
-borrowed iteration, task capture, and managed-resource containment are
-checked before lowering. Clone-producing generic operations infer obligations
-that are propagated through calls and discharged after specialization.
+control-flow joins, loop repetition, owned-return moves, view provenance and
+last-use regions, borrowed matches, borrowed iteration, task capture, and
+managed-resource containment are checked before lowering. Clone-producing
+generic operations infer obligations that are propagated through calls and
+discharged after specialization.
 
 ## Runtime Semantics
 
-A copy use duplicates a value and a move transfers it. Shared and mutable
-borrows are statically enforced access contracts rather than first-class
-runtime reference values in Aura 0.3. Mutable borrowed calls and list
-iteration write through the original place; `match mut` reconstructs
+A copy use duplicates a value and a move transfers it. Ordinary parameter
+borrows remain call-scoped access contracts. An explicit view carries a
+compiler/runtime loan descriptor for one source place and generation; reads
+and writes resolve through that descriptor without cloning. Mutable borrowed
+calls and list iteration write through the original place; `match mut` reconstructs
 and writes back on every arm exit. Simple dict indexed assignment accepts and
 owns any value type; direct compound indexed assignment requires a copy `list`
 element or `dict` value.
@@ -519,6 +595,10 @@ reports a non-Transfer task or Queue boundary. `AU3009` rejects clone,
 clone-producing collection read, or aggregate copy that would duplicate a
 single-consumer task-result right. Reuse after direct observation is the
 ordinary moved-value `AU3001`; shared-access consumption is `AU3002`.
+`AU3010` reports an invalid view escape, returned-view origin, or provenance
+path. View diagnostics identify the creation and final use that retain the
+conflicting loan and recommend shortening the region, using a disjoint place,
+or producing an owned clone.
 Ownership failures are static. A runtime operation reached through an owned or
 borrowed value keeps its own code: `AU4001` for a general trap, `AU4002` for
 arithmetic overflow or underflow, `AU4003` for a bounds or lookup violation,
@@ -535,8 +615,11 @@ and primary-diagnostic behavior.
 
 ## Limits And Implementation-Defined Behavior
 
-Place analysis tracks local roots and field-prefix paths; it proves disjoint
-sibling fields but is not a general alias theorem. Mutable set iteration,
+Place analysis tracks local roots, fixed tuple positions, and field-prefix
+paths; it proves disjoint fixed projections but is not a general alias theorem.
+Indexed/keyed views, view-bearing aggregates, multi-origin returned views,
+returned loan closures, and lifetime-parameterized callable types are
+unavailable. Mutable set iteration,
 explicit Queue ownership modifiers,
 mutable-borrow task targets, moving out of a managed resource, and arbitrary
 reference values are unavailable. Loop move analysis intentionally uses only
@@ -551,5 +634,7 @@ partial moves and reinitialization, flow-sensitive checks, owned returns,
 borrowed matching and list/set iteration, task capture, cloning,
 and lexical resource ownership are implemented for the post-Phase 1.5
 surface; the one-time list/set/Queue iteration-source rule is accepted under
-ADR-0017. Mutable set iteration, Queue ownership modifiers, and mutable task
+ADR-0017. Place-based local and returned views, inferred regions, reborrowing,
+explicit loan closure captures, and unified loan cleanup are implemented under
+ADR-0038. Mutable set iteration, Queue ownership modifiers, and mutable task
 capture are unavailable.

@@ -158,6 +158,29 @@ test("extension packages an expression-lambda snippet", () => {
   assert.match(snippets.Lambda.description, /expression/i);
 });
 
+test("extension highlights and snippets ADR-0038 views and loan captures", () => {
+  const extensionRoot = path.resolve(__dirname, "..");
+  const grammar = JSON.parse(
+    fs.readFileSync(path.join(extensionRoot, "syntaxes", "aura.tmLanguage.json"), "utf8")
+  );
+  const snippets = JSON.parse(
+    fs.readFileSync(path.join(extensionRoot, "snippets", "aura.json"), "utf8")
+  );
+  const viewRule = grammar.repository.keywords.patterns.find(
+    (pattern) => pattern.name === "keyword.declaration.view.aura"
+  );
+
+  assert.ok(viewRule);
+  assert.equal(new RegExp(viewRule.match).test("view"), true);
+  assert.equal(new RegExp(viewRule.match).test("from"), true);
+  assert.deepEqual(snippets["Shared view"].body, ["view ${1:name} = ${2:place}"]);
+  assert.deepEqual(snippets["Mutable view"].body, [
+    "view mut ${1:name} = ${2:place}"
+  ]);
+  assert.match(snippets["Loan capture lambda"].body[0], /lambda \[.*mut.*own/);
+  assert.match(snippets["Returned view function"].body[0], /-> view.*from/);
+});
+
 test("extension highlights and snippets the maintained extern C surface", () => {
   const extensionRoot = path.resolve(__dirname, "..");
   const grammar = JSON.parse(

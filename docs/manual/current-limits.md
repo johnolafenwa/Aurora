@@ -17,9 +17,11 @@ This page documents known current limits of the Aura compiler and runtime.
   `round` has no digit-count overload.
 - Non-numeric casts are not implemented.
 - Direct recursive fields require `indirect`.
-- Return values are always owned. Copy results are ordinary copies; a non-copy
-  result must be constructed, cloned when clone-safe, moved from owned input,
-  or produced by an owner operation.
+- Ordinary `-> T` return values are always owned. Copy results are ordinary
+  copies; a non-copy result must be constructed, cloned when clone-safe, moved
+  from owned input, or produced by an owner operation. ADR-0038 separately
+  permits one `-> view [mut] T from origin` result tied to a receiver or
+  parameter place.
 - Empty list, dictionary, and set literals need an expected collection type.
 - Class field defaults cannot call user-defined functions in the current compiler. Compute the value before construction and pass it as an explicit field argument.
 - `str(...)` is not a constructor; use string literals and string methods.
@@ -48,6 +50,13 @@ This page documents known current limits of the Aura compiler and runtime.
   ordering, named/rest unpacking, mutable tuple-target writeback,
   dynamic/negative tuple indexing, or tuple-to-collection conversion. Unpack a
   tuple to take ownership of a non-copy element.
+- Views have identity only for local/parameter/receiver roots, existing views,
+  class-field paths, and fixed tuple positions. Collection indexes and keys,
+  set elements, arbitrary temporaries, and escaping enum-payload views are not
+  loanable. View-bearing aggregates, module storage, multi-origin results,
+  returned loan closures, and lifetime-parameterized structural callable
+  types remain unavailable. Views
+  and loan closures are always non-Transfer.
 - Statement match arms cannot be inline. Expression match arms may use a same-line expression after `case pattern:` or an indented expression body.
 - `for` loop bindings cannot shadow names already visible in the same scope.
 - Duration literals have only the integral `ms`, `s`, and `m` suffixes; there is no `ns` or fractional Duration literal and no unary `-Duration`. Associated constructors and checked Duration arithmetic provide signed and sub-millisecond results instead.
@@ -58,10 +67,11 @@ This page documents known current limits of the Aura compiler and runtime.
   API retains its direct associated-method-without-`self` target carve-out.
 - Lambdas with parameters require complete expected parameter types; a
   zero-parameter lambda may infer `def() -> R` from its expression body.
-  Captures are by value and closure environments are read-only in Phase 6.3.
-  Shared/mutable capability capture, inline parameter types, defaults,
-  generics, statement bodies, and capture lists remain
-  unavailable. A consuming closure is single-use. Capturing closures cannot
+  A lambda without a capture list captures by value. An explicit exhaustive
+  `[value, mut value, own value]` list creates shared/mutable loans or an owned
+  capture. Inline parameter types, defaults, generics, and statement bodies
+  remain unavailable. A mutable-loan closure is mutable-repeatable through a
+  mutable place; a consuming closure is single-use. Capturing closures cannot
   pass through arbitrary written-`def` parameters, fields, collections, or
   annotated returns because those boundaries describe capture-free code
   pointers. Compiler-known repeatable callback sites preserve closure
@@ -81,7 +91,7 @@ This page documents known current limits of the Aura compiler and runtime.
   and invalid or reversed ranges trap with `AU4003`. Endpoints are not clamped.
   str endpoints count Unicode scalar values and slicing is O(n). Slice
   steps and slice assignment remain reserved `AU2005` forms; arbitrary
-  sliceable types, zero-copy views, str integer indexing, grapheme slicing,
+  sliceable types, indexed zero-copy views, str integer indexing, grapheme slicing,
   and Python-style endpoint clamping are unavailable. List slicing requires
   clone-safe, repeatably observable elements.
 - Numeric `Array[T]` is CPU-only, contiguous, row-major, and specialized only

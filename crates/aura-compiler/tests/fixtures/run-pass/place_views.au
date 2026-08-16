@@ -1,0 +1,57 @@
+class Profile:
+    name: str
+    visits: int64
+
+    def add_visits(mut self, amount: int64):
+        self.visits += amount
+
+
+class Choice:
+    left: int64
+    right: int64
+
+
+def profile_name(profile: Profile) -> view str from profile:
+    return view profile.name
+
+
+def profile_visits(profile: mut Profile) -> view mut int64 from profile:
+    return view mut profile.visits
+
+
+def choose(choice: mut Choice, left: bool) -> view mut int64 from choice:
+    if left:
+        return view mut choice.left
+    return view mut choice.right
+
+
+def increment(value: mut int64):
+    value += 1
+
+
+def main():
+    mut profile = Profile(name="Ada", visits=1)
+    view name = profile_name(profile)
+    print(name)
+
+    view mut visits = profile_visits(profile)
+    yield_now()
+    view mut nested = visits
+    nested = nested + 1
+    print(profile.visits)
+
+    mut add: def(int64) -> None = lambda [mut profile] amount: profile.add_visits(amount)
+    add(3)
+    add(4)
+    print(profile.visits)
+
+    mut pair = (10, 20)
+    view mut second = pair[1]
+    second = second + 1
+    print(pair)
+
+    mut choice = Choice(left=10, right=30)
+    view mut selected = choose(choice, false)
+    selected = selected + 2
+    increment(choose(choice, true))
+    print((choice.left, choice.right))

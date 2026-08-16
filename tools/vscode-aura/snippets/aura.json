@@ -22,6 +22,35 @@
     ],
     "description": "Aura expression lambda"
   },
+  "Loan capture lambda": {
+    "prefix": "lambda-view",
+    "body": [
+      "lambda [${1:value}, mut ${2:state}, own ${3:snapshot}] ${4:item}: ${5:expression}"
+    ],
+    "description": "Aura lambda with an exhaustive shared, mutable, and owned capture list"
+  },
+  "Shared view": {
+    "prefix": "view",
+    "body": [
+      "view ${1:name} = ${2:place}"
+    ],
+    "description": "Aura inferred shared view binding"
+  },
+  "Mutable view": {
+    "prefix": "view-mut",
+    "body": [
+      "view mut ${1:name} = ${2:place}"
+    ],
+    "description": "Aura inferred mutable write-through view binding"
+  },
+  "Returned view function": {
+    "prefix": "def-view",
+    "body": [
+      "def ${1:name}(${2:origin}: ${3:Type}) -> view ${4:ResultType} from ${2:origin}:",
+      "    return view ${2:origin}.${5:field}"
+    ],
+    "description": "Aura function returning a shared view tied to one origin"
+  },
   "Multiline string": {
     "prefix": "triple",
     "body": [

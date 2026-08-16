@@ -394,6 +394,129 @@ fn place_paths_overlap(left: &str, right: &str) -> bool {
     shared == left_segments.len() || shared == right_segments.len()
 }
 
+fn return_view_projection_expr(
+    expr: &Expr,
+    origin: &str,
+    aliases: &BTreeMap<String, String>,
+) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Name(name) if name == origin => Some(String::new()),
+        ExprKind::Name(name) => aliases.get(name).cloned(),
+        ExprKind::Group(inner) => return_view_projection_expr(inner, origin, aliases),
+        ExprKind::Member { object, field } => {
+            let parent = return_view_projection_expr(object, origin, aliases)?;
+            Some(if parent.is_empty() {
+                field.clone()
+            } else {
+                format!("{parent}.{field}")
+            })
+        }
+        ExprKind::Index { object, index } => {
+            let ExprKind::Int(index) = index.kind else {
+                return None;
+            };
+            let index = usize::try_from(index).ok()?;
+            let parent = return_view_projection_expr(object, origin, aliases)?;
+            Some(if parent.is_empty() {
+                index.to_string()
+            } else {
+                format!("{parent}.{index}")
+            })
+        }
+        _ => None,
+    }
+}
+
+fn collect_return_view_projections(
+    body: &[Stmt],
+    origin: &str,
+    aliases: &mut BTreeMap<String, String>,
+    projections: &mut Vec<String>,
+) {
+    for stmt in body {
+        match stmt {
+            Stmt::View(view) => {
+                if let Some(projection) = return_view_projection_expr(&view.source, origin, aliases)
+                {
+                    aliases.insert(view.name.clone(), projection);
+                }
+            }
+            Stmt::Return(return_stmt) if return_stmt.view.is_some() => {
+                if let Some(projection) = return_stmt
+                    .value
+                    .as_ref()
+                    .and_then(|value| return_view_projection_expr(value, origin, aliases))
+                {
+                    projections.push(projection);
+                }
+            }
+            Stmt::If(if_stmt) => {
+                for branch in &if_stmt.branches {
+                    collect_return_view_projections(
+                        &branch.body,
+                        origin,
+                        &mut aliases.clone(),
+                        projections,
+                    );
+                }
+                if let Some(body) = &if_stmt.else_body {
+                    collect_return_view_projections(
+                        body,
+                        origin,
+                        &mut aliases.clone(),
+                        projections,
+                    );
+                }
+            }
+            Stmt::Match(match_stmt) => {
+                for arm in &match_stmt.arms {
+                    collect_return_view_projections(
+                        &arm.body,
+                        origin,
+                        &mut aliases.clone(),
+                        projections,
+                    );
+                }
+            }
+            Stmt::For(for_stmt) => collect_return_view_projections(
+                &for_stmt.body,
+                origin,
+                &mut aliases.clone(),
+                projections,
+            ),
+            Stmt::With(with_stmt) => collect_return_view_projections(
+                &with_stmt.body,
+                origin,
+                &mut aliases.clone(),
+                projections,
+            ),
+            Stmt::While(while_stmt) => collect_return_view_projections(
+                &while_stmt.body,
+                origin,
+                &mut aliases.clone(),
+                projections,
+            ),
+            _ => {}
+        }
+    }
+}
+
+fn return_view_projections(function: &crate::ast::FunctionDecl) -> Vec<String> {
+    let Some(contract) = function.view_return.as_ref() else {
+        return Vec::new();
+    };
+    let mut projections = Vec::new();
+    collect_return_view_projections(
+        &function.body,
+        &contract.origin,
+        &mut BTreeMap::new(),
+        &mut projections,
+    );
+    projections.sort();
+    projections.dedup();
+    projections
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MirModule {
     pub functions: Vec<MirFunction>,
@@ -499,6 +622,38 @@ pub enum Instruction {
     /// one on each semantic backedge; runtimes amortize the actual yield with
     /// a per-function fuel counter.
     Safepoint,
+    BeginLoan {
+        loan: String,
+        source: String,
+        mutable: bool,
+    },
+    BeginReturnedLoan {
+        loan: String,
+        origin: String,
+        projections: Vec<String>,
+        mutable: bool,
+    },
+    Reborrow {
+        loan: String,
+        parent: String,
+        projection: String,
+        mutable: bool,
+    },
+    ReadLoan {
+        target: String,
+        loan: String,
+    },
+    WriteLoan {
+        loan: String,
+        value: Rvalue,
+    },
+    EndLoan {
+        loan: String,
+    },
+    ReturnLoan {
+        loan: String,
+        origin: String,
+    },
     Assign {
         target: String,
         value: Rvalue,
@@ -620,6 +775,9 @@ pub struct MirClosureCapture {
     pub name: String,
     pub value: Operand,
     pub ty: Type,
+    pub passing: MirReceiverKind,
+    #[serde(default)]
+    pub source_place: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1277,7 +1435,13 @@ fn lower_function(
         return_type.clone(),
         type_param_bounds,
     )
-    .with_metadata_owner(metadata_owner);
+    .with_metadata_owner(metadata_owner)
+    .with_view_return_origin(
+        function
+            .view_return
+            .as_ref()
+            .map(|contract| contract.origin.clone()),
+    );
     if let Some(receiver_type) = receiver_type {
         lowerer
             .local_types
@@ -1443,6 +1607,9 @@ struct Lowerer<'a> {
     non_owning_roots: BTreeSet<String>,
     scoped_names: Vec<std::collections::HashMap<String, String>>,
     generated_functions: Vec<MirFunction>,
+    view_sources: BTreeMap<String, String>,
+    loan_scopes: Vec<Vec<String>>,
+    view_return_origin: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1533,6 +1700,7 @@ struct LoopLabels {
     break_label: String,
     continue_label: String,
     cleanup_depth: usize,
+    loan_depth: usize,
 }
 
 struct ReturnRedirect {
@@ -1607,11 +1775,19 @@ impl<'a> Lowerer<'a> {
             non_owning_roots: BTreeSet::new(),
             scoped_names: Vec::new(),
             generated_functions: Vec::new(),
+            view_sources: BTreeMap::new(),
+            loan_scopes: Vec::new(),
+            view_return_origin: None,
         }
     }
 
     fn with_metadata_owner(mut self, owner: ClosureOwner) -> Self {
         self.metadata_owner = Some(owner);
+        self
+    }
+
+    fn with_view_return_origin(mut self, origin: Option<String>) -> Self {
+        self.view_return_origin = origin;
         self
     }
 
@@ -1871,7 +2047,11 @@ impl<'a> Lowerer<'a> {
             .iter()
             .map(|capture| MirParam {
                 name: capture.name.clone(),
-                passing: MirReceiverKind::Value,
+                passing: match capture.mode {
+                    ClosureCaptureMode::SharedView => MirReceiverKind::Borrow,
+                    ClosureCaptureMode::MutableView => MirReceiverKind::BorrowMut,
+                    ClosureCaptureMode::Copy | ClosureCaptureMode::Move => MirReceiverKind::Value,
+                },
                 ty: capture.ty.clone(),
                 default_function: None,
             })
@@ -1896,7 +2076,7 @@ impl<'a> Lowerer<'a> {
             lowerer
                 .local_types
                 .insert(capture.name.clone(), capture.ty.clone());
-            if info.call_kind == ClosureCallKind::Repeatable {
+            if info.call_kind != ClosureCallKind::Consuming {
                 lowerer.non_owning_roots.insert(capture.name.clone());
             }
         }
@@ -1935,10 +2115,25 @@ impl<'a> Lowerer<'a> {
                 MirClosureCapture {
                     name: capture.name.clone(),
                     value: match capture.mode {
-                        ClosureCaptureMode::Copy => Operand::Place(place),
-                        ClosureCaptureMode::Move => Operand::MovePlace(place),
+                        ClosureCaptureMode::Copy => Operand::Place(place.clone()),
+                        ClosureCaptureMode::Move => Operand::MovePlace(place.clone()),
+                        ClosureCaptureMode::SharedView | ClosureCaptureMode::MutableView => {
+                            Operand::Place(place.clone())
+                        }
                     },
                     ty: capture.ty.clone(),
+                    passing: match capture.mode {
+                        ClosureCaptureMode::SharedView => MirReceiverKind::Borrow,
+                        ClosureCaptureMode::MutableView => MirReceiverKind::BorrowMut,
+                        ClosureCaptureMode::Copy | ClosureCaptureMode::Move => {
+                            MirReceiverKind::Value
+                        }
+                    },
+                    source_place: matches!(
+                        capture.mode,
+                        ClosureCaptureMode::SharedView | ClosureCaptureMode::MutableView
+                    )
+                    .then_some(place),
                 }
             })
             .collect::<Vec<_>>();
@@ -2301,9 +2496,56 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_stmts(&mut self, statements: &[Stmt]) {
-        for stmt in statements {
+        self.loan_scopes.push(Vec::new());
+        for (index, stmt) in statements.iter().enumerate() {
             if !self.lower_stmt(stmt) {
                 break;
+            }
+            let ending = self
+                .loan_scopes
+                .last()
+                .into_iter()
+                .flatten()
+                .filter(|loan| {
+                    !statements[index + 1..]
+                        .iter()
+                        .any(|later| crate::sema::stmt_references_name(later, loan))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for loan in ending {
+                if self.view_sources.remove(&loan).is_some() {
+                    self.emit(Instruction::EndLoan { loan: loan.clone() });
+                }
+                if let Some(scope) = self.loan_scopes.last_mut() {
+                    scope.retain(|active| active != &loan);
+                }
+            }
+        }
+        if !self.current_terminated() {
+            let scoped_views = self.loan_scopes.last().cloned().unwrap_or_default();
+            for loan in scoped_views.into_iter().rev() {
+                if self.view_sources.remove(&loan).is_some() {
+                    self.emit(Instruction::EndLoan { loan });
+                }
+            }
+        }
+        self.loan_scopes.pop();
+    }
+
+    fn emit_loan_cleanup_from(&mut self, depth: usize, except: Option<&str>) {
+        let loans = self
+            .loan_scopes
+            .iter()
+            .skip(depth)
+            .rev()
+            .flat_map(|scope| scope.iter().rev())
+            .filter(|loan| except != Some(loan.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        for loan in loans {
+            if self.view_sources.remove(&loan).is_some() {
+                self.emit(Instruction::EndLoan { loan });
             }
         }
     }
@@ -2312,6 +2554,56 @@ impl<'a> Lowerer<'a> {
         match stmt {
             Stmt::Assign(assign) => {
                 self.lower_assign(assign);
+                true
+            }
+            Stmt::View(view) => {
+                let ty = self.infer_expr_type(&view.source);
+                if let Some(ty) = ty.clone() {
+                    self.local_types.entry(view.name.clone()).or_insert(ty);
+                }
+                let returned_source = self.returned_view_source(&view.source);
+                let source = if let Some(source) = self.render_place_expr_option(&view.source) {
+                    source
+                } else {
+                    let (origin, projections) = returned_source
+                        .clone()
+                        .expect("checked returned-view calls retain an addressable origin");
+                    let _ = self.lower_expr(&view.source);
+                    self.emit(Instruction::BeginReturnedLoan {
+                        loan: view.name.clone(),
+                        origin: origin.clone(),
+                        projections,
+                        mutable: view.mutable,
+                    });
+                    origin
+                };
+                let root = source.split('.').next().unwrap_or(source.as_str());
+                if returned_source.is_some() {
+                    // The call above transfers the exact selected projection
+                    // into the new caller-side descriptor.
+                } else if self.view_sources.contains_key(root) {
+                    let projection = source
+                        .strip_prefix(root)
+                        .unwrap_or_default()
+                        .trim_start_matches('.')
+                        .to_string();
+                    self.emit(Instruction::Reborrow {
+                        loan: view.name.clone(),
+                        parent: root.to_string(),
+                        projection,
+                        mutable: view.mutable,
+                    });
+                } else {
+                    self.emit(Instruction::BeginLoan {
+                        loan: view.name.clone(),
+                        source: source.clone(),
+                        mutable: view.mutable,
+                    });
+                }
+                self.view_sources.insert(view.name.clone(), source);
+                if let Some(scope) = self.loan_scopes.last_mut() {
+                    scope.push(view.name.clone());
+                }
                 true
             }
             Stmt::Destructure(destructure) => {
@@ -2337,6 +2629,25 @@ impl<'a> Lowerer<'a> {
                     Operand::Unit
                 };
                 self.emit_active_match_writebacks();
+                let mut returned_loan = None;
+                if return_stmt.view.is_some() {
+                    if let Some(value) = &return_stmt.value {
+                        if let Some(loan) = self.render_place_expr_option(value) {
+                            let root = loan.split('.').next().unwrap_or(loan.as_str());
+                            if self.view_sources.contains_key(root) {
+                                returned_loan = Some(root.to_string());
+                            }
+                            self.emit(Instruction::ReturnLoan {
+                                loan,
+                                origin: self
+                                    .view_return_origin
+                                    .clone()
+                                    .expect("checked view returns declare an origin"),
+                            });
+                        }
+                    }
+                }
+                self.emit_loan_cleanup_from(0, returned_loan.as_deref());
                 if let Some(redirect) = self.return_redirects.last() {
                     let return_place = redirect.return_place.clone();
                     let cleanup_depth = redirect.cleanup_depth;
@@ -2408,7 +2719,9 @@ impl<'a> Lowerer<'a> {
                 self.emit_active_match_writebacks();
                 let loop_labels = self.loop_stack.last().expect("checked loop context");
                 let cleanup_depth = loop_labels.cleanup_depth;
+                let loan_depth = loop_labels.loan_depth;
                 let break_label = loop_labels.break_label.clone();
+                self.emit_loan_cleanup_from(loan_depth, None);
                 self.emit_cleanup_range(cleanup_depth, true);
                 self.terminate(Terminator::Goto(break_label));
                 false
@@ -2417,7 +2730,9 @@ impl<'a> Lowerer<'a> {
                 self.emit_active_match_writebacks();
                 let loop_labels = self.loop_stack.last().expect("checked loop context");
                 let cleanup_depth = loop_labels.cleanup_depth;
+                let loan_depth = loop_labels.loan_depth;
                 let continue_label = loop_labels.continue_label.clone();
+                self.emit_loan_cleanup_from(loan_depth, None);
                 self.emit_cleanup_range(cleanup_depth, true);
                 self.terminate(Terminator::Goto(continue_label));
                 false
@@ -3132,6 +3447,57 @@ impl<'a> Lowerer<'a> {
             }
             _ => "<expr>".to_string(),
         }
+    }
+
+    fn returned_view_source(&self, expr: &Expr) -> Option<(String, Vec<String>)> {
+        let ExprKind::Call { callee, args } = &expr.kind else {
+            return None;
+        };
+        let callee = match &callee.kind {
+            ExprKind::Specialize { expr, .. } => expr.as_ref(),
+            _ => callee.as_ref(),
+        };
+        let (decl, receiver) = match &callee.kind {
+            ExprKind::Name(name) => (&self.resolve_function_info(name)?.decl, None),
+            ExprKind::Member { object, field } => {
+                let Type::Named(class_name, _) = self.infer_expr_type(object)? else {
+                    return None;
+                };
+                let method = self.resolve_class_info(&class_name)?.methods.get(field)?;
+                (&method.decl, Some(&**object))
+            }
+            _ => return None,
+        };
+        let contract = decl.view_return.as_ref()?;
+        let origin = if contract.origin == "self" {
+            self.render_place_expr_option(receiver?)?
+        } else {
+            let origin_index = decl
+                .params
+                .iter()
+                .position(|param| param.name == contract.origin)?;
+            let ordered = bind_call_arguments(
+                &format!("callable `{}`", decl.name),
+                &callable_params_from_decl(&decl.params),
+                args,
+                callee.span,
+                CallConvention::PositionalOrNamed,
+            )
+            .ok()?;
+            let origin = ordered.get(origin_index).copied().flatten()?;
+            self.render_place_expr_option(&origin.value)?
+        };
+        let projections = return_view_projections(decl);
+        (!projections.is_empty()).then_some((origin, projections))
+    }
+
+    fn lowered_writeback_place(&self, expr: &Expr, value: &Operand) -> Option<String> {
+        self.render_place_expr_option(expr).or_else(|| {
+            self.returned_view_source(expr).and_then(|_| match value {
+                Operand::Place(place) | Operand::MovePlace(place) => Some(place.clone()),
+                _ => None,
+            })
+        })
     }
 
     fn scoped_local_name(&self, name: &str) -> Option<&str> {
@@ -3945,6 +4311,7 @@ impl<'a> Lowerer<'a> {
             break_label: self.label(after_block),
             continue_label: self.label(safepoint_block),
             cleanup_depth: self.with_stack.len(),
+            loan_depth: self.loan_scopes.len(),
         });
         let target_scope = self.fresh_scoped_binding_target_slots(&for_stmt.target, &tuple_ty);
         self.scoped_names.push(target_scope);
@@ -4233,6 +4600,7 @@ impl<'a> Lowerer<'a> {
                         break_label: self.label(break_block),
                         continue_label: self.label(continue_block),
                         cleanup_depth,
+                        loan_depth: self.loan_scopes.len(),
                     });
                     self.return_redirects.push(ReturnRedirect {
                         label: self.label(return_block),
@@ -4427,6 +4795,7 @@ impl<'a> Lowerer<'a> {
             break_label: self.label(after_block),
             continue_label: self.label(safepoint_block),
             cleanup_depth: self.with_stack.len(),
+            loan_depth: self.loan_scopes.len(),
         });
         self.switch_to(body_block);
         self.scoped_names.push(target_scope);
@@ -4515,6 +4884,7 @@ impl<'a> Lowerer<'a> {
             break_label: self.label(after_block),
             continue_label: self.label(safepoint_block),
             cleanup_depth: self.with_stack.len(),
+            loan_depth: self.loan_scopes.len(),
         });
         self.switch_to(body_block);
         self.lower_stmts(&while_stmt.body);
@@ -4751,10 +5121,26 @@ impl<'a> Lowerer<'a> {
         match &expr.kind {
             ExprKind::Name(name) if name == "None" => Operand::Unit,
             ExprKind::BuiltinOmitted => Operand::Unit,
-            ExprKind::Lambda { params, body } => self.lower_lambda(expr, params, body),
+            ExprKind::Lambda { params, body, .. } => self.lower_lambda(expr, params, body),
             ExprKind::Name(name) => {
                 if let Some(constant) = self.resolve_constant_info(name).cloned() {
                     self.lower_constant_read(&constant)
+                } else if self
+                    .view_sources
+                    .contains_key(&self.render_local_name(name))
+                {
+                    let loan = self.render_local_name(name);
+                    let ty = self
+                        .local_types
+                        .get(&loan)
+                        .cloned()
+                        .unwrap_or_else(|| Type::named("Unknown"));
+                    let target = self.new_typed_temp(ty);
+                    self.emit(Instruction::ReadLoan {
+                        target: target.clone(),
+                        loan,
+                    });
+                    Operand::Place(target)
                 } else {
                     Operand::Place(self.render_local_name(name))
                 }
@@ -6588,6 +6974,25 @@ impl<'a> Lowerer<'a> {
         passing: ReceiverKind,
     ) -> Operand {
         if matches!(passing, ReceiverKind::Borrow | ReceiverKind::BorrowMut) {
+            if let Some((origin, projections)) = self.returned_view_source(expr) {
+                let _ = self.lower_expr_with_expected(expr, expected);
+                let ty = expected
+                    .cloned()
+                    .or_else(|| self.infer_expr_type(expr))
+                    .unwrap_or_else(|| Type::named("Unknown"));
+                let loan = self.new_typed_temp(ty);
+                self.emit(Instruction::BeginReturnedLoan {
+                    loan: loan.clone(),
+                    origin: origin.clone(),
+                    projections,
+                    mutable: passing == ReceiverKind::BorrowMut,
+                });
+                self.view_sources.insert(loan.clone(), origin);
+                if let Some(scope) = self.loan_scopes.last_mut() {
+                    scope.push(loan.clone());
+                }
+                return Operand::Place(loan);
+            }
             return self.lower_expr_with_expected(expr, expected);
         }
         self.lower_expr_for_owned_value(expr, expected)
@@ -8671,7 +9076,7 @@ impl<'a> Lowerer<'a> {
                         self.lower_expr_for_passing(&argument.value, expected.as_ref(), passing)
                     };
                     let writeback_place = (passing == ReceiverKind::BorrowMut)
-                        .then(|| self.render_place_expr_option(&argument.value))
+                        .then(|| self.lowered_writeback_place(&argument.value, &value))
                         .flatten();
                     lowered_by_param[index] = Some(MirArg {
                         name: argument.name.clone(),
@@ -8827,7 +9232,7 @@ impl<'a> Lowerer<'a> {
             let writeback_place = if passing == Some(ReceiverKind::BorrowMut)
                 || param.mode == crate::ast::ParamMode::BorrowMut
             {
-                self.render_place_expr_option(&argument.value)
+                self.lowered_writeback_place(&argument.value, &value)
             } else {
                 None
             };
@@ -8915,15 +9320,13 @@ impl<'a> Lowerer<'a> {
                     )
                     .expect("bound indirect argument should retain its declaration slot");
                 let param = &params[index];
+                let value =
+                    self.lower_expr_for_passing(&argument.value, Some(&param.ty), param.passing);
                 MirArg {
                     name: argument.name.clone(),
-                    value: self.lower_expr_for_passing(
-                        &argument.value,
-                        Some(&param.ty),
-                        param.passing,
-                    ),
+                    value: value.clone(),
                     writeback_place: (param.passing == ReceiverKind::BorrowMut)
-                        .then(|| self.render_place_expr_option(&argument.value))
+                        .then(|| self.lowered_writeback_place(&argument.value, &value))
                         .flatten(),
                 }
             })
@@ -10746,6 +11149,14 @@ impl<'a> Lowerer<'a> {
                     Some(rendered)
                 }
             }
+            ExprKind::Index { object, index } => {
+                let ExprKind::Int(index) = index.kind else {
+                    return None;
+                };
+                let index = usize::try_from(index).ok()?;
+                self.render_place_expr_option(object)
+                    .map(|object| format!("{object}.{index}"))
+            }
             _ => None,
         }
     }
@@ -10763,6 +11174,14 @@ impl<'a> Lowerer<'a> {
             ExprKind::Member { object, field } => self
                 .render_addressable_place_expr_option(object)
                 .map(|object| format!("{object}.{field}")),
+            ExprKind::Index { object, index } => {
+                let ExprKind::Int(index) = index.kind else {
+                    return None;
+                };
+                let index = usize::try_from(index).ok()?;
+                self.render_addressable_place_expr_option(object)
+                    .map(|object| format!("{object}.{index}"))
+            }
             _ => None,
         }
     }
@@ -10772,11 +11191,25 @@ impl<'a> Lowerer<'a> {
             ExprKind::Name(name) => self.non_owning_roots.contains(name),
             ExprKind::Group(inner) => self.is_non_owning_place_expr(inner),
             ExprKind::Member { object, .. } => self.is_non_owning_place_expr(object),
+            ExprKind::Index { object, .. } => self.is_non_owning_place_expr(object),
             _ => false,
         }
     }
 
     fn emit(&mut self, instruction: Instruction) {
+        let instruction = match instruction {
+            Instruction::Assign { target, value }
+                if self
+                    .view_sources
+                    .contains_key(target.split('.').next().unwrap_or_default()) =>
+            {
+                Instruction::WriteLoan {
+                    loan: target,
+                    value,
+                }
+            }
+            instruction => instruction,
+        };
         let match_writeback_flag = self.match_writeback_flag_for_instruction(&instruction);
         self.blocks[self.current_block]
             .instructions

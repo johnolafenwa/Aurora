@@ -156,17 +156,17 @@ The JSON result is an array of `{ "name": str, "kind": str, "detail": str }` obj
 `ast-json`, `analyze`, `complete`, and `lsp` emit JSON. The `analyze` and `complete` shapes described here are maintained tooling contracts for Aura 0.3. `ast`, `ast-json`, and `mir` expose compiler inspection data for people and tests; their exact formatting and internal node/block shape are not a stable cross-version serialization API.
 
 `aura lsp` is a persistent JSON-lines compiler service. Every request requires
-`semantic_interface_version: 5` plus string fields `method`, `path`, and
+`semantic_interface_version: 6` plus string fields `method`, `path`, and
 `source`; `id` is optional and is echoed in the response. Supported requests
 are:
 
 ```json
-{"id":1,"semantic_interface_version":5,"method":"analyze","path":"/absolute/app.au","source":"print(1)\n"}
-{"id":2,"semantic_interface_version":5,"method":"complete","path":"/absolute/app.au","source":"value.\n","line":0,"character":6,"trigger":"."}
+{"id":1,"semantic_interface_version":6,"method":"analyze","path":"/absolute/app.au","source":"print(1)\n"}
+{"id":2,"semantic_interface_version":6,"method":"complete","path":"/absolute/app.au","source":"value.\n","line":0,"character":6,"trigger":"."}
 ```
 
 Each response is one line containing the same `id`,
-`semantic_interface_version: 5`, and either `result` or an `error` string.
+`semantic_interface_version: 6`, and either `result` or an `error` string.
 Paths give the virtual source a package/import context; ranges and completion
 positions are zero-based. A missing or different semantic interface version is
 an incompatible request and returns a schema-mismatch error.
@@ -354,7 +354,7 @@ Tool-side mutations are explicit: `fmt` without `--check`, `deps update`, and su
 
 ## Diagnostics
 
-Compiler-backed commands can surface the complete append-only registry. `AU1001` means invalid lexical input; `AU1002` means an invalid f-string delimiter; and `AU1101` means invalid syntax. `AU2001` means name-resolution failure; `AU2002` means type mismatch; `AU2003` means unsupported operator; `AU2004` means argument-binding failure; `AU2005` means unsupported syntax or feature; `AU2006` means a builtin method collision; `AU2007` means builtin function redefinition; `AU2008` means equality unavailable; and `AU2999` means a general compile-time rejection without a narrower code. `AU3001` means use of a moved value; `AU3002` means a borrow violation; `AU3003` means a mutability violation; `AU3004` means an invalid ownership mode; `AU3005` means a non-copy indexed read; `AU3006` means a non-copy indexed compound assignment; `AU3007` means non-cloneable state duplication; `AU3008` means a non-transferable task or Queue boundary; and `AU3009` means single-consumer task-result duplication. `AU4001` means a general runtime trap; `AU4002` means arithmetic overflow or underflow; `AU4003` means a bounds or lookup violation; `AU4004` means a zero divisor; `AU4005` means a resource, allocation, or I/O failure; `AU4006` means invalid runtime configuration; and `AU4007` means a numeric Array shape or reduction violation. The structured schema is defined in [Diagnostics](/manual/diagnostics).
+Compiler-backed commands can surface the complete append-only registry. `AU1001` means invalid lexical input; `AU1002` means an invalid f-string delimiter; and `AU1101` means invalid syntax. `AU2001` means name-resolution failure; `AU2002` means type mismatch; `AU2003` means unsupported operator; `AU2004` means argument-binding failure; `AU2005` means unsupported syntax or feature; `AU2006` means a builtin method collision; `AU2007` means builtin function redefinition; `AU2008` means equality unavailable; and `AU2999` means a general compile-time rejection without a narrower code. `AU3001` means use of a moved value; `AU3002` means a borrow violation; `AU3003` means a mutability violation; `AU3004` means an invalid ownership mode; `AU3005` means a non-copy indexed read; `AU3006` means a non-copy indexed compound assignment; `AU3007` means non-cloneable state duplication; `AU3008` means a non-transferable task or Queue boundary; `AU3009` means single-consumer task-result duplication; and `AU3010` means a view escape or returned-view provenance failure. `AU4001` means a general runtime trap; `AU4002` means arithmetic overflow or underflow; `AU4003` means a bounds or lookup violation; `AU4004` means a zero divisor; `AU4005` means a resource, allocation, or I/O failure; `AU4006` means invalid runtime configuration; and `AU4007` means a numeric Array shape or reduction violation. The structured schema is defined in [Diagnostics](/manual/diagnostics).
 
 Human diagnostics render as `error[AU####]` with source context when a span is
 available. Ordinary notes are followed by readable call-chain and task-entry

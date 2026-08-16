@@ -43,12 +43,12 @@ class ReferenceIntegrityTests(unittest.TestCase):
         self.assertEqual(len(requests), 2)
         self.assertEqual(
             [request["semantic_interface_version"] for request in requests],
-            [5, 5],
+            [6, 6],
         )
         lsp_readme = (root / "tools/aura-language-server/README.md").read_text(
             encoding="utf-8"
         )
-        self.assertIn('"semantic_interface_version":5', lsp_readme)
+        self.assertIn('"semantic_interface_version":6', lsp_readme)
 
     def test_cli_tooling_registry_matches_the_complete_diagnostic_code_table(
         self,

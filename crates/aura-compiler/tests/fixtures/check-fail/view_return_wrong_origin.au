@@ -1,0 +1,7 @@
+class User:
+    name: str
+
+
+def bad(user: User) -> view str from user:
+    local = User(name="local")
+    return view local.name

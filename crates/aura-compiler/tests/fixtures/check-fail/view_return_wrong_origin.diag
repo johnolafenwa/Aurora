@@ -1,0 +1,6 @@
+error[AU3010]: returned view derives from `local`, but the declaration names origin `user`
+ --> crates/aura-compiler/tests/fixtures/check-fail/view_return_wrong_origin.au:7:23
+  |
+7 |     return view local.name
+  |                       ^
+  = related crates/aura-compiler/tests/fixtures/check-fail/view_return_wrong_origin.au:5:24: returned-view origin is declared here

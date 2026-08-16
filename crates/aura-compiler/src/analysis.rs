@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::ast::{
     AssignStmt, AssignTarget, BinaryOp, ComprehensionOutput, Expr, ExprKind, FunctionDecl,
     ImportKind, Item, LambdaParam, MatchArm, Module, Param, ParamMode, Pattern, ReceiverKind, Stmt,
-    TypeRef, VariantPattern,
+    TypeRef, VariantPattern, ViewStmt,
 };
 use crate::call::{
     BuiltinAssociatedFunction, BuiltinClassConstructor, BuiltinFunction, BuiltinMember,
@@ -674,6 +674,9 @@ impl<'a> AnalysisBuilder<'a> {
                         AssignTarget::Name(_) => {}
                     }
                 }
+                Stmt::View(view) => {
+                    self.extend_lambda_scope_from_expr(&view.source, target_line, character, scope)
+                }
                 Stmt::Destructure(destructure) => self.extend_lambda_scope_from_expr(
                     &destructure.value,
                     target_line,
@@ -792,7 +795,7 @@ impl<'a> AnalysisBuilder<'a> {
         scope: &mut BTreeMap<String, BindingInfo>,
     ) {
         match &expr.kind {
-            ExprKind::Lambda { params, body } => {
+            ExprKind::Lambda { params, body, .. } => {
                 if expression_contains_position(body, target_line, character) {
                     if let Some(info) = self.closure_info(expr) {
                         for (param, contract) in params.iter().zip(&info.params) {
@@ -1190,6 +1193,18 @@ impl<'a> AnalysisBuilder<'a> {
 
             match stmt {
                 Stmt::Assign(assign) => self.bind_assignment(assign, scope),
+                Stmt::View(view) => {
+                    let ty = self
+                        .infer_expr_type(&view.source, scope)
+                        .unwrap_or(Type::Unit);
+                    self.insert_scope_binding(
+                        &view.name,
+                        ty,
+                        view.span.line,
+                        if view.mutable { "mutable view" } else { "view" },
+                        scope,
+                    );
+                }
                 Stmt::Destructure(destructure) => {
                     let ty = self
                         .infer_expr_type(&destructure.value, scope)
@@ -1958,6 +1973,13 @@ impl<'a> AnalysisBuilder<'a> {
     fn visit_stmt(&mut self, stmt: &Stmt, scope: &mut BTreeMap<String, BindingInfo>) {
         match stmt {
             Stmt::Assign(assign) => self.visit_assign(assign, scope),
+            Stmt::View(view) => {
+                self.visit_expr(&view.source, scope);
+                let ty = self
+                    .infer_expr_type(&view.source, scope)
+                    .unwrap_or(Type::Unit);
+                self.bind_view_value(view, ty, scope);
+            }
             Stmt::Return(ret) => {
                 if let Some(value) = &ret.value {
                     self.visit_expr(value, scope);
@@ -2249,6 +2271,39 @@ impl<'a> AnalysisBuilder<'a> {
         self.push_occurrence(definition.clone(), hover, Some(definition));
     }
 
+    fn bind_view_value(
+        &mut self,
+        view: &ViewStmt,
+        ty: Type,
+        scope: &mut BTreeMap<String, BindingInfo>,
+    ) {
+        let declaration = self
+            .find_identifier_range(view.span.line, &view.name)
+            .unwrap_or_else(|| range_from_span(view.span, view.name.len()));
+        let source = render_view_source(&view.source).unwrap_or_else(|| "<place>".to_string());
+        let definition = view_source_root(&view.source)
+            .and_then(|root| scope.get(root))
+            .map(|binding| binding.definition.clone())
+            .unwrap_or_else(|| declaration.clone());
+        let hover = format!(
+            "```aura\nview {}{}: {} from {}\n```",
+            if view.mutable { "mut " } else { "" },
+            view.name,
+            ty,
+            source
+        );
+        scope.insert(
+            view.name.clone(),
+            BindingInfo {
+                ty,
+                trait_bounds: Vec::new(),
+                definition: definition.clone(),
+                hover: hover.clone(),
+            },
+        );
+        self.push_occurrence(declaration, hover, Some(definition));
+    }
+
     fn bind_target_value(
         &mut self,
         target: &crate::ast::BindingTarget,
@@ -2395,7 +2450,7 @@ impl<'a> AnalysisBuilder<'a> {
                 }
                 self.visit_comprehension_output(output, &comprehension_scope);
             }
-            ExprKind::Lambda { params, body } => {
+            ExprKind::Lambda { params, body, .. } => {
                 let mut lambda_scope = scope.clone();
                 if let Some(contracts) = self.closure_info(expr).map(|info| info.params.clone()) {
                     for (param, contract) in params.iter().zip(&contracts) {
@@ -4557,7 +4612,7 @@ fn symbols_from_module(module: &Module) -> Vec<AnalysisSymbol> {
                         .chain(class_decl.methods.iter().map(|method| AnalysisSymbol {
                             name: method.name.clone(),
                             kind: "method".to_string(),
-                            detail: lower_type_ref(&method.return_type).to_string(),
+                            detail: format_decl_return(method),
                             line: method.span.line.saturating_sub(1),
                             start_character: method.span.column.saturating_sub(1),
                             end_character: method.span.column.saturating_sub(1) + method.name.len(),
@@ -4603,7 +4658,7 @@ fn symbols_from_module(module: &Module) -> Vec<AnalysisSymbol> {
                 symbols.push(AnalysisSymbol {
                     name: function_decl.name.clone(),
                     kind: "function".to_string(),
-                    detail: lower_type_ref(&function_decl.return_type).to_string(),
+                    detail: format_decl_return(function_decl),
                     line: function_decl.span.line.saturating_sub(1),
                     start_character: function_decl.span.column.saturating_sub(1),
                     end_character: function_decl.span.column.saturating_sub(1)
@@ -4653,7 +4708,7 @@ fn symbols_from_module(module: &Module) -> Vec<AnalysisSymbol> {
                         .map(|method| AnalysisSymbol {
                             name: method.name.clone(),
                             kind: "method".to_string(),
-                            detail: lower_type_ref(&method.return_type).to_string(),
+                            detail: format_decl_return(method),
                             line: method.span.line.saturating_sub(1),
                             start_character: method.span.column.saturating_sub(1),
                             end_character: method.span.column.saturating_sub(1) + method.name.len(),
@@ -5077,6 +5132,46 @@ fn format_value_hover(kind: &str, name: &str, ty: &Type) -> String {
     format!("```aura\n{} {}: {}\n```", kind, name, ty)
 }
 
+fn view_source_root(expr: &Expr) -> Option<&str> {
+    match &expr.kind {
+        ExprKind::Name(name) => Some(name),
+        ExprKind::Group(inner)
+        | ExprKind::Member { object: inner, .. }
+        | ExprKind::Index { object: inner, .. } => view_source_root(inner),
+        _ => None,
+    }
+}
+
+fn render_view_source(expr: &Expr) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Name(name) => Some(name.clone()),
+        ExprKind::Group(inner) => render_view_source(inner),
+        ExprKind::Member { object, field } => {
+            Some(format!("{}.{}", render_view_source(object)?, field))
+        }
+        ExprKind::Index { object, index } => {
+            let ExprKind::Int(index) = index.kind else {
+                return None;
+            };
+            Some(format!("{}[{index}]", render_view_source(object)?))
+        }
+        _ => None,
+    }
+}
+
+fn format_decl_return(function_decl: &FunctionDecl) -> String {
+    let ty = lower_type_ref(&function_decl.return_type);
+    match &function_decl.view_return {
+        Some(view_return) => format!(
+            "view {}{} from {}",
+            if view_return.mutable { "mut " } else { "" },
+            ty,
+            view_return.origin
+        ),
+        None => ty.to_string(),
+    }
+}
+
 fn format_param_hover(param: &Param, ty: &Type) -> String {
     let mode = match param.mode {
         ParamMode::Default => "",
@@ -5139,7 +5234,7 @@ fn format_function_hover(function_decl: &FunctionDecl) -> String {
         "```aura\nfunction {}({}) -> {}\n```",
         function_decl.name,
         params,
-        lower_type_ref(&function_decl.return_type)
+        format_decl_return(function_decl)
     )
 }
 
@@ -5179,7 +5274,7 @@ fn format_method_hover(method_decl: &FunctionDecl) -> String {
         "```aura\nmethod {}({}) -> {}\n```",
         method_decl.name,
         params,
-        lower_type_ref(&method_decl.return_type)
+        format_decl_return(method_decl)
     )
 }
 
@@ -5941,7 +6036,7 @@ fn format_function_detail(function_decl: &FunctionDecl) -> String {
         "{}({}) -> {}",
         function_decl.name,
         params,
-        lower_type_ref(&function_decl.return_type)
+        format_decl_return(function_decl)
     )
 }
 
@@ -5989,6 +6084,7 @@ fn block_contains_line(stmts: &[Stmt], line: usize) -> bool {
 fn stmt_start_line(stmt: &Stmt) -> usize {
     match stmt {
         Stmt::Assign(assign) => assign.span.line,
+        Stmt::View(view) => view.span.line,
         Stmt::Destructure(destructure) => destructure.span.line,
         Stmt::Assert(assert_stmt) => assert_stmt.span.line,
         Stmt::Return(ret) => ret.span.line,
@@ -6020,6 +6116,7 @@ fn stmt_end_line(stmt: &Stmt) -> usize {
                 .max(target_end)
                 .max(expression_end_line(&assign.value))
         }
+        Stmt::View(view) => view.span.line.max(expression_end_line(&view.source)),
         Stmt::Destructure(destructure) => destructure
             .span
             .line

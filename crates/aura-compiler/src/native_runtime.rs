@@ -440,6 +440,7 @@ struct DirectTaskRuntimeState {
     call_frames: DirectCallFrameStorage,
     task_ancestry: DirectTaskAncestry,
     fallback_cancellation: CancellationContext,
+    returned_view_projection: Option<String>,
 }
 
 impl Default for DirectTaskRuntimeState {
@@ -456,6 +457,7 @@ impl Default for DirectTaskRuntimeState {
             call_frames: DirectCallFrameStorage::Empty,
             task_ancestry: DirectTaskAncestry::default(),
             fallback_cancellation: CancellationContext::default(),
+            returned_view_projection: None,
         }
     }
 }
@@ -3805,6 +3807,7 @@ pub extern "C-unwind" fn aura_direct_closure_value(
     function: *mut OpaqueValue,
     captures_ptr: *mut i64,
     capture_count: i64,
+    capture_modes_ptr: *const i64,
     consuming: i64,
 ) -> *mut OpaqueValue {
     task_runtime_boundary(|| {
@@ -3829,11 +3832,36 @@ pub extern "C-unwind" fn aura_direct_closure_value(
                     name: format!("__capture_{index}"),
                     ty: Type::named("Unknown"),
                     value,
+                    source_place: None,
+                    mutable: !capture_modes_ptr.is_null()
+                        && unsafe { *capture_modes_ptr.add(index) } != 0,
                 })
                 .collect(),
             consuming != 0,
         )));
         boxed_value(Value::Function(function))
+    })
+}
+
+#[cfg_attr(not(coverage), no_mangle)]
+pub extern "C-unwind" fn aura_direct_closure_capture(
+    function: *mut OpaqueValue,
+    index: i64,
+) -> *mut OpaqueValue {
+    task_runtime_boundary(|| {
+        let index = usize::try_from(index)
+            .unwrap_or_else(|_| runtime_error("invalid closure capture index"));
+        let Value::Function(function) = (unsafe { value_ref(function) }) else {
+            runtime_error("closure capture access expected a function value");
+        };
+        let environment = function
+            .closure_environment
+            .as_ref()
+            .unwrap_or_else(|| runtime_error("function has no closure environment"));
+        let value = environment
+            .capture_value(index)
+            .unwrap_or_else(|error| runtime_diagnostic_error(error));
+        boxed_value(value)
     })
 }
 
@@ -3932,6 +3960,11 @@ pub extern "C-unwind" fn aura_direct_function_call(
             .arguments(&function.name)
             .unwrap_or_else(|error| runtime_diagnostic_error(error));
         let capture_count = captures.len();
+        let mutable_capture_indices = captures
+            .iter()
+            .enumerate()
+            .filter_map(|(index, capture)| capture.mutable.then_some(index))
+            .collect::<Vec<_>>();
         let mut buffer = DirectClosureCallBuffer {
             handles: Vec::with_capacity(capture_count + arg_count),
             public_args: args,
@@ -3950,6 +3983,15 @@ pub extern "C-unwind" fn aura_direct_function_call(
             unsafe { *args.add(index) = 0 };
         }
         let result = unsafe { thunk(buffer.handles.as_mut_ptr(), buffer.handles.len()) };
+        for index in mutable_capture_indices {
+            let handle = buffer.handles[index] as *mut OpaqueValue;
+            let value = unsafe { value_ref(handle) };
+            let value = try_clone_array_containing_value(&value)
+                .unwrap_or_else(|error| runtime_diagnostic_error(error));
+            environment
+                .write_back_mutable(index, value)
+                .unwrap_or_else(|error| runtime_diagnostic_error(error));
+        }
         buffer.copy_public_writebacks();
         result
     })
@@ -7251,26 +7293,48 @@ fn set_direct_instance_field_owned(
     full_path: &str,
     new_value: Value,
 ) -> std::result::Result<(), String> {
-    let Value::Instance(instance) = value else {
-        return Err(format!(
-            "cannot assign field `{full_path}` on non-instance `{}`",
-            value_type_name(value)
-        ));
-    };
-    let Some((field, rest)) = segments.split_first() else {
+    let Some((projection, rest)) = segments.split_first() else {
         return Err("direct runtime received an empty instance assignment path".to_string());
     };
-    if rest.is_empty() {
-        instance.fields.insert((*field).to_string(), new_value);
-        return Ok(());
+    match value {
+        Value::Instance(instance) => {
+            if rest.is_empty() {
+                instance.fields.insert((*projection).to_string(), new_value);
+                return Ok(());
+            }
+            let nested = instance.fields.get_mut(*projection).ok_or_else(|| {
+                format!(
+                    "class `{}` has no field `{}` in assignment path `{full_path}`",
+                    instance.class_name, projection
+                )
+            })?;
+            set_direct_instance_field_owned(nested, rest, full_path, new_value)
+        }
+        Value::Tuple(tuple) => {
+            let index = projection.parse::<usize>().map_err(|_| {
+                format!(
+                    "tuple projection `{projection}` is not a fixed position in assignment path `{full_path}`"
+                )
+            })?;
+            let tuple_len = tuple.elements.len();
+            let nested = tuple.elements.get_mut(index).ok_or_else(|| {
+                format!(
+                    "tuple of length {} has no element at index {index} in assignment path `{full_path}`",
+                    tuple_len
+                )
+            })?;
+            if rest.is_empty() {
+                *nested = new_value;
+                Ok(())
+            } else {
+                set_direct_instance_field_owned(nested, rest, full_path, new_value)
+            }
+        }
+        other => Err(format!(
+            "cannot assign field `{full_path}` on non-instance `{}`",
+            value_type_name(other)
+        )),
     }
-    let nested = instance.fields.get_mut(*field).ok_or_else(|| {
-        format!(
-            "class `{}` has no field `{}` in assignment path `{full_path}`",
-            instance.class_name, field
-        )
-    })?;
-    set_direct_instance_field_owned(nested, rest, full_path, new_value)
 }
 
 #[cfg_attr(not(coverage), no_mangle)]
@@ -7518,6 +7582,41 @@ pub extern "C-unwind" fn aura_direct_cancelled() -> i64 {
 #[cfg_attr(not(coverage), no_mangle)]
 pub extern "C-unwind" fn aura_direct_yield_now() {
     task_runtime_boundary(yield_now_with_runtime_scheduler)
+}
+
+#[cfg_attr(not(coverage), no_mangle)]
+pub extern "C-unwind" fn aura_direct_set_returned_view_projection(
+    projection_ptr: *const u8,
+    projection_len: usize,
+) {
+    task_runtime_boundary(|| {
+        let projection = decode_bytes(projection_ptr, projection_len);
+        with_direct_task_runtime_state(|state| {
+            state.returned_view_projection = Some(projection);
+        });
+    })
+}
+
+#[cfg_attr(not(coverage), no_mangle)]
+pub extern "C-unwind" fn aura_direct_take_returned_view_projection(
+    projections_ptr: *const u8,
+    projections_len: usize,
+) -> i64 {
+    task_runtime_boundary(|| {
+        let projections = unsafe { slice::from_raw_parts(projections_ptr, projections_len) };
+        let selected =
+            with_direct_task_runtime_state(|state| state.returned_view_projection.take())
+                .unwrap_or_else(|| {
+                    runtime_error("direct returned view has no transferred projection")
+                });
+        projections
+            .split(|byte| *byte == 0)
+            .position(|projection| projection == selected.as_bytes())
+            .and_then(|index| i64::try_from(index).ok())
+            .unwrap_or_else(|| {
+                runtime_error("direct returned view selected an undeclared projection")
+            })
+    })
 }
 
 #[cfg_attr(not(coverage), no_mangle)]

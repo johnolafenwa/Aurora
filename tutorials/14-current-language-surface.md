@@ -114,11 +114,13 @@ outside the implemented surface.
 Contextually typed expression lambdas use `lambda parameters: expression`.
 The expected `def(...) -> ...` type supplies parameter types and constrains
 the result; `lambda: expression` may infer `def() -> R` without context.
-Captures are by value: Copy values are snapshotted and owned non-Copy values
-move at creation. A read-only closure is repeatable, a closure that consumes a
-non-Copy capture is single-use, and a closure is Transfer exactly when every
-capture is Transfer. Captured environments are read-only in Phase 6.3 and
-cannot be erased through arbitrary stored or parameter `def` types.
+Without a capture list, Copy values are snapshotted and owned non-Copy values
+move at creation. An explicit exhaustive list uses `[value]`, `[mut value]`,
+and `[own value]` for shared loans, mutable loans, and by-value capture. A
+shared closure is repeatable, a mutable-loan closure is repeatable through a
+mutable local, and a closure that consumes a non-Copy owned capture is
+single-use. Loan closures are non-Transfer and cannot be erased through
+arbitrary stored or parameter `def` types.
 
 These built-in type names are reserved and cannot be reused for user-defined classes, enums, or traits.
 
@@ -290,7 +292,10 @@ The current compiler supports these expression forms:
 - owned list/str slicing with `expr[start:end]`, `expr[:end]`,
   `expr[start:]`, and `expr[:]`
 - owned first-axis Array slicing with the same one-colon forms; the result is
-  a fresh Array, and views remain unavailable
+  a fresh Array, and indexed Array views remain unavailable
+- place-based `view name = place` and `view mut name = place`, including fixed
+  field/tuple projections, inferred final-use lifetimes, reborrowing, and
+  `-> view [mut] T from origin` returned access
 - function and method calls
 - explicit type arguments on call targets such as `Box[int32](...)` and `Result[int32, str].Ok(...)`
 - enum and built-in enum variant construction
@@ -343,7 +348,9 @@ the `int64` position domain, negatives normalize once, both effective endpoints 
 in `0..=len`, and start must not exceed end. Invalid bounds trap with `AU4003`;
 Aura never clamps them. String positions count Unicode scalar values and require
 an O(n) scan. Integer str indexing, step syntax, slice assignment, and
-views remain unavailable.
+indexed slice views remain unavailable. Use the separate `view` forms for an
+addressable root, field, or fixed tuple position; slice syntax always owns its
+result.
 
 Numeric `Array[T]` values have rank at least one, may contain zero-sized
 dimensions, and use contiguous row-major storage. The constructors are

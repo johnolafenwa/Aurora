@@ -43,8 +43,9 @@ Except for short-circuit boolean operators and control-flow constructs, subexpre
   left to right; omitted endpoints evaluate nothing
 - a receiver is evaluated before call arguments
 - every supplied call or constructor argument is evaluated in call-site source order
-- a lambda copies or moves every by-value capture when the lambda expression
-  is evaluated, before any later sibling expression
+- a lambda acquires every capture from left to right when the lambda expression
+  is evaluated: implicit and `own` captures copy or move, while explicit bare
+  and `mut` entries begin loans before any later sibling expression
 - a comprehension allocates its result, then evaluates clause iterables and
   filters in nested outer-major order before evaluating its textually leading
   output; a dictionary output evaluates its key before its value
@@ -95,10 +96,12 @@ replaces the earlier value and the key keeps its first insertion position.
 `and` evaluates the right operand only when the left value is `true`. `or` evaluates the right operand only when the left value is `false`. Both operands have static type `bool`.
 
 A lambda call evaluates arguments under its contextual structural function
-type. A read-only closure borrows its owned environment for the body and may be
-called repeatedly. A closure whose body consumes a non-Copy capture is
-consumed by the call. Never-called and called closure environments are cleaned
-up exactly once on both maintained backends.
+type. A read-only or shared-loan closure may be called repeatedly. A
+mutable-loan closure may be called sequentially through a mutable closure
+place and writes directly to its captured source. A closure whose body
+consumes a non-Copy owned capture is consumed by the call. Never-called and
+called closure environments release owned values and loan registrations
+exactly once on both maintained backends.
 
 A comparison chain evaluates its operand expressions from left to right at
 most once. It evaluates each adjacent link after obtaining that link's right
@@ -125,7 +128,29 @@ runs active lexical cleanups, and returns to the caller. Reaching the end of a
 `None` function returns `None`. A non-`None` function cannot pass static
 checking if a reachable path falls through.
 
+`return view [mut] place` instead hands one checked loan to the caller. The
+declaration's `from` slot fixes its origin, and the caller continues the exact
+selected projection without an unlock/relock or clone. Every other callee loan
+ends before control returns. A trap before the handoff transfers no loan.
+
 A recursive Aura call consumes one logical call-depth unit. The maintained runtime rejects execution after 256 nested Aura calls with a source diagnostic rather than allowing the host stack to overflow.
+
+## Loan Lifetime And Cleanup
+
+A local view begins a shared or mutable loan over one place and storage
+generation. Both maintained backends resolve reads and writes through that
+identity; mutable writes happen immediately. Static final-use analysis may end
+the loan before lexical scope ends. Branch joins and loop edges extend regions
+conservatively, and every iteration releases its iteration-local loans.
+
+Exit actions form one reverse-acquisition stack containing loan ends, closure
+environment drops, mutable writebacks, match/iteration reconstruction, and
+resource cleanup. Normal fallthrough, return, escaping loop control, `try`
+propagation, maintained traps, and cancellation drain the required suffix.
+Consequently a view into a resource ends before `close`, and an inner reborrow
+ends before its parent. A task may retain a loan to its own storage across a
+scheduler suspension, but no descriptor or loan closure may cross to another
+task or worker.
 
 ## Foreign Calls
 

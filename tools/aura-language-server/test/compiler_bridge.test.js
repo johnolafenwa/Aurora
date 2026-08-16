@@ -689,7 +689,7 @@ test("compiler bridge reuses one persistent compiler process", async () => {
 });
 
 test("persistent compiler service sends and accepts the current semantic schema", async () => {
-  assert.equal(SUPPORTED_SEMANTIC_INTERFACE_SCHEMA_VERSION, 5);
+  assert.equal(SUPPORTED_SEMANTIC_INTERFACE_SCHEMA_VERSION, 6);
   const script = [
     "const readline = require('node:readline');",
     "const lines = readline.createInterface({ input: process.stdin });",
@@ -742,7 +742,7 @@ test("persistent compiler service rejects and disposes a mismatched semantic sch
       path: "/virtual/main.au",
       source: "def main():\n    pass\n"
     }),
-    /semantic schema mismatch.*received `1`.*expected `5`/
+    /semantic schema mismatch.*received `1`.*expected `6`/
   );
   assert.equal(service.closed, true);
   assert.equal(invalidations, 1);
@@ -5370,6 +5370,53 @@ test("compiler bridge exposes contextual lambda scope, hover, definitions, and c
     const completionNames = new Set(completions.map((item) => item.name));
     assert.ok(completionNames.has("value"), "lambda parameters belong to the body scope");
     assert.ok(completionNames.has("offset"), "outer locals remain visible for capture");
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("compiler bridge exposes ADR-0038 view provenance and returned-view contracts", async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "aura-lsp-place-views-"));
+  const sourceLines = [
+    "class User:",
+    "    name: str",
+    "",
+    "def name(user: User) -> view str from user:",
+    "    return view user.name",
+    "",
+    "def main():",
+    "    user = User(name=\"Ada\")",
+    "    view display = name(user)",
+    "    print(display)",
+    ""
+  ];
+  const source = sourceLines.join("\n");
+
+  try {
+    setWorkspaceRoots([repoRoot, tempRoot]);
+    const mainPath = path.join(tempRoot, "main.au");
+    const mainUri = `file://${mainPath}`;
+    const analysis = await analyzeWithCompiler(mainUri, source);
+
+    assert.ok(analysis);
+    assert.deepEqual(analysis.diagnostics, []);
+    assert.ok(
+      analysis.occurrences.some((occurrence) =>
+        occurrence.hover.includes("function name(user: User) -> view str from user")
+      ),
+      "returned-view function hover should retain its origin contract"
+    );
+    const display = analysis.occurrences.find((occurrence) =>
+      occurrence.hover.includes("view display: str from <place>")
+    );
+    assert.ok(display, "local view hover should expose kind, pointee type, and provenance");
+    assert.ok(display.definition, "a view use should navigate to its source place");
+    assert.ok(
+      analysis.symbols.some(
+        (symbol) => symbol.name === "name" && symbol.detail === "view str from user"
+      ),
+      "document symbols should expose returned-view metadata"
+    );
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }

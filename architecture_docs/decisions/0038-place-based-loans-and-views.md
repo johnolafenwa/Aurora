@@ -1,17 +1,24 @@
 # ADR-0038: Place-based loans and views
 
-- Status: Accepted (design; implementation targets 0.3; not authorized in the 0.2 cycle)
+- Status: Implemented
 - Date: 2026-07-30
 - Accepted at: Batch 6 opening checkpoint
 - Roadmap decision: Batch 5, Phase 6.5
-- Implementation: Not started; no 0.2 implementation is authorized
+- Implementation: Complete
 - Version target: 0.3
 - Related: ADR-0009, ADR-0013, ADR-0016, ADR-0022, ADR-0033, ADR-0037
 
 ## Status boundary
 
-This is an accepted design, not an implemented language feature. It changes
-no Aurora 0.2 grammar, type, ownership, closure, backend, or FFI behavior.
+This is an implemented Aura 0.3 language feature. It changes the grammar,
+ownership model, closure capture contract, semantic interface, MIR, direct
+backend, diagnostics, editor tooling, examples, tutorials, and Manual as one
+versioned implementation family.
+
+Returned-view declarations lock their one declared origin conservatively while
+the runtime handoff preserves the exact field or tuple projection selected by
+control flow. MIR and direct execution therefore write through the same caller
+place without a clone or delayed-writeback approximation.
 
 This ADR supersedes ADR-0009's deferred live-alias reservation at the design
 level and is the designed-from-scratch successor to borrowed returns. It does
@@ -20,9 +27,9 @@ containment rule remains binding until a later implementation of this ADR
 lands. ADR-0016's retained-expression sequencing remains binding and becomes
 an input to the broader loan analysis rather than being silently replaced.
 
-This accepted design amends ADR-0013 and ADR-0037 only for the future,
-explicitly requested in-loan closure captures. Their implemented by-value
-capture rules remain unchanged.
+This decision amends ADR-0013 and ADR-0037 for explicitly requested in-loan
+closure captures. A lambda without a capture list retains ADR-0037 by-value
+capture behavior.
 
 ADR-0040's Aurora 0.2 Vec and String slices are deliberately not an
 implementation of this design. `value[start:end]` produces a fresh owned
@@ -628,19 +635,11 @@ exit-action stack, new MIR/runtime operations, callable metadata, and a cache
 schema change. Compressing that storage-model work into 0.2 would put
 correctness and backend parity at risk.
 
-Internal stable-place and exit-action infrastructure may land in separately
-gated 0.3 commits. No parser-only or one-backend view feature should be
-accepted. The user-facing syntax flips on atomically only when
-static checking, MIR, direct execution, malformed-MIR defense, LSP, extension,
-reference, tutorials, examples, migration diagnostics, and parity tests are
-all ready.
-
-The normative Manual remains unchanged until implementation. Accepted status
-binds the future 0.3 design; it does not advertise an implemented 0.2 surface.
-On implementation, ordinary owned-return wording remains and gains an
-explicit view-return exception; the grammar, ownership, functions, closures,
-execution, diagnostic, tooling, conformance, and status chapters update in
-the same change family.
+The implementation landed atomically across static checking, MIR and direct
+execution, analysis/LSP, extension grammar and snippets, semantic-interface
+schema 6, reference material, tutorials, examples, diagnostics, and parity
+tests. Ordinary `-> T` returns remain owned; `-> view ... from ...` is the
+only returned-view exception.
 
 ## Consequences
 

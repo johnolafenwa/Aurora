@@ -16,7 +16,7 @@ the phase that owns the failure:
 | `AU10xx` | lexical analysis | `AU1001` invalid lexical input; `AU1002` invalid f-string delimiter |
 | `AU11xx` | parsing | `AU1101` invalid syntax |
 | `AU20xx` | names and types | `AU2001` name resolution; `AU2002` type mismatch; `AU2003` unsupported operator; `AU2004` argument binding; `AU2005` unsupported syntax or feature; `AU2006` builtin method collision; `AU2007` builtin function redefinition; `AU2008` equality unavailable; `AU2999` general compile-time rejection |
-| `AU30xx` | ownership, borrows, and transfer | `AU3001` moved value; `AU3002` borrow violation; `AU3003` mutability violation; `AU3004` ownership mode; `AU3005` non-copy indexed read; `AU3006` non-copy indexed compound assignment; `AU3007` non-cloneable state duplication; `AU3008` non-transferable task/Queue boundary; `AU3009` single-consumer task-result duplication |
+| `AU30xx` | ownership, loans, and transfer | `AU3001` moved value; `AU3002` borrow/loan conflict; `AU3003` mutability violation; `AU3004` ownership or place mode; `AU3005` non-copy indexed read; `AU3006` non-copy indexed compound assignment; `AU3007` non-cloneable state duplication; `AU3008` non-transferable task/Queue boundary; `AU3009` single-consumer task-result duplication; `AU3010` view escape or returned provenance |
 | `AU40xx` | runtime-checked traps | `AU4001` general runtime trap; `AU4002` arithmetic overflow or underflow; `AU4003` bounds or lookup violation; `AU4004` zero divisor; `AU4005` resource, allocation, or I/O failure; `AU4006` invalid runtime configuration; `AU4007` numeric Array shape or reduction violation |
 
 `AU1001` also owns source-delimiter pairing. An unexpected closer is primary at
@@ -138,6 +138,21 @@ Transfer-boundary failure: the contained task handle is Transfer, but is
 non-copy because its result is non-repeatable. A later use of the same binding
 after a consuming result observation is `AU3001`; trying to consume the right
 through shared access is `AU3002`.
+
+`AU3010` rejects a view that escapes into ordinary storage, a returned view
+whose expression does not derive from its declared receiver/parameter origin,
+an invalid returned kind, or a call whose origin is not an addressable place.
+The diagnostic identifies the declared origin and the incompatible expression
+or destination. Return an owned clone/index/handle when the access must escape,
+or keep a local/closure loan synchronous and inside the owner's region.
+
+For explicit views, `AU3002` labels both the view creation and the final use
+that keeps its inferred region live. Removing a later use can shorten the loan;
+otherwise shorten the lexical scope, select a proven-disjoint place, or create
+an owned clone. `AU3003` covers mutation through a shared view and calling a
+mutable-repeatable closure through an immutable place. `AU3004` covers
+non-place sources, immutable mutable-view targets, and unsupported projections
+such as collection indexes.
 
 For `select(...)`, `AU3009` also rejects the same statically visible
 non-repeatable Task source appearing twice in one call. `AU3002` explains that

@@ -2487,6 +2487,8 @@ fn closure_environments_share_identity_and_enforce_capture_ownership() {
         name: "offset".to_string(),
         ty: capture_type.clone(),
         value: Value::Int(IntegerValue::from_signed(9)),
+        source_place: None,
+        mutable: false,
     };
 
     let repeatable = Arc::new(ClosureEnvironment::new(vec![captured()], false));
@@ -2579,6 +2581,104 @@ fn closure_environments_share_identity_and_enforce_capture_ownership() {
         shared.render(),
         "<function main::__lambda_repeatable>",
         "rendering remains stable without exposing captured values"
+    );
+}
+
+#[test]
+fn adr0038_closure_environment_mutable_capture_helpers_cover_success_and_errors() {
+    let environment = ClosureEnvironment::new(
+        vec![
+            ClosureCaptureValue {
+                name: "items".to_string(),
+                ty: Type::named("list[int64]"),
+                value: Value::Vec(VecValue {
+                    element_type: Type::named("int64"),
+                    elements: vec![Value::Int(IntegerValue::from_signed(1))],
+                }),
+                source_place: Some("items".to_string()),
+                mutable: true,
+            },
+            ClosureCaptureValue {
+                name: "label".to_string(),
+                ty: Type::named("str"),
+                value: Value::String("fixed".to_string()),
+                source_place: Some("label".to_string()),
+                mutable: false,
+            },
+        ],
+        false,
+    );
+
+    let arguments = environment
+        .arguments("main::__lambda_mutable")
+        .expect("repeatable capture arguments should clone their values");
+    assert_eq!(arguments[0].source_place.as_deref(), Some("items"));
+    assert!(arguments[0].mutable);
+    assert!(!arguments[1].mutable);
+
+    environment
+        .write_back_mutable(
+            0,
+            Value::Vec(VecValue {
+                element_type: Type::named("int64"),
+                elements: vec![Value::Int(IntegerValue::from_signed(2))],
+            }),
+        )
+        .expect("mutable captures accept writeback");
+    assert_eq!(
+        environment
+            .capture_value(0)
+            .expect("a live capture can be observed"),
+        Value::Vec(VecValue {
+            element_type: Type::named("int64"),
+            elements: vec![Value::Int(IntegerValue::from_signed(2))],
+        })
+    );
+
+    let immutable = environment
+        .write_back_mutable(1, Value::String("changed".to_string()))
+        .expect_err("shared captures reject mutable writeback");
+    assert_eq!(immutable.message, "closure capture `label` is not mutable");
+    assert_eq!(
+        environment
+            .write_back_mutable(9, Value::Unit)
+            .expect_err("an unknown capture index must be diagnosed")
+            .message,
+        "closure has no capture at index 9"
+    );
+    assert_eq!(
+        environment
+            .capture_value(9)
+            .expect_err("an unknown live capture must be diagnosed")
+            .message,
+        "closure has no live capture at index 9"
+    );
+
+    let unavailable = ClosureEnvironment::new(Vec::new(), true);
+    *unavailable
+        .captures
+        .lock()
+        .expect("fresh capture lock should be healthy") = None;
+    assert_eq!(
+        unavailable
+            .arguments("main::__lambda_unavailable")
+            .expect_err("a missing consuming environment must be diagnosed")
+            .message,
+        "closure `main::__lambda_unavailable` has already consumed its captured environment"
+    );
+    assert_eq!(
+        unavailable
+            .write_back_mutable(0, Value::Unit)
+            .expect_err("a missing environment cannot accept writeback")
+            .message,
+        "cannot write back into a consumed closure environment"
+    );
+    assert_eq!(
+        unavailable
+            .capture_value(0)
+            .expect_err("a missing environment has no live captures")
+            .message,
+        "closure has no live capture at index 0"
     );
 }
 

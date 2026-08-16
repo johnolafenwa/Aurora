@@ -390,6 +390,8 @@ struct NativeCodegen<'a> {
     run_root: FuncId,
     enter_call: FuncId,
     exit_call: FuncId,
+    set_returned_view_projection: FuncId,
+    take_returned_view_projection: FuncId,
     print_i64: FuncId,
     print_u64: FuncId,
     print_f32: FuncId,
@@ -416,6 +418,7 @@ struct NativeCodegen<'a> {
     function_value: FuncId,
     module_constant: FuncId,
     closure_value: FuncId,
+    closure_capture: FuncId,
     function_call: FuncId,
     function_bind_defaults: FuncId,
     box_unit: FuncId,
@@ -892,6 +895,8 @@ impl<'a> NativeCodegen<'a> {
             run_root => ("aura_direct_run_root", [types::I64], Some(types::I32)),
             enter_call => ("aura_direct_enter_call_with_frame", [types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], None),
             exit_call => ("aura_direct_exit_call", [], None),
+            set_returned_view_projection => ("aura_direct_set_returned_view_projection", [types::I64, types::I64], None),
+            take_returned_view_projection => ("aura_direct_take_returned_view_projection", [types::I64, types::I64], Some(types::I64)),
             print_i64 => ("aura_direct_print_i64", [types::I64], None),
             print_u64 => ("aura_direct_print_u64", [types::I64], None),
             print_f32 => ("aura_direct_print_f32", [types::F64], None),
@@ -917,7 +922,8 @@ impl<'a> NativeCodegen<'a> {
             box_bool => ("aura_direct_box_bool", [types::I64], Some(types::I64)),
             function_value => ("aura_direct_function_value", [types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
             module_constant => ("aura_direct_module_constant", [types::I64, types::I64, types::I64], Some(types::I64)),
-            closure_value => ("aura_direct_closure_value", [types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+            closure_value => ("aura_direct_closure_value", [types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+            closure_capture => ("aura_direct_closure_capture", [types::I64, types::I64], Some(types::I64)),
             function_call => ("aura_direct_function_call", [types::I64, types::I64, types::I64], Some(types::I64)),
             function_bind_defaults => ("aura_direct_function_bind_defaults", [types::I64, types::I64, types::I64, types::I64], None),
             box_unit => ("aura_direct_box_unit", [], Some(types::I64)),
@@ -1328,6 +1334,8 @@ impl<'a> NativeCodegen<'a> {
             run_root,
             enter_call,
             exit_call,
+            set_returned_view_projection,
+            take_returned_view_projection,
             print_i64,
             print_u64,
             print_f32,
@@ -1354,6 +1362,7 @@ impl<'a> NativeCodegen<'a> {
             function_value,
             module_constant,
             closure_value,
+            closure_capture,
             function_call,
             function_bind_defaults,
             box_unit,
@@ -1722,6 +1731,12 @@ impl<'a> NativeCodegen<'a> {
         let exit_call = self
             .object
             .declare_func_in_func(self.exit_call, builder.func);
+        let set_returned_view_projection = self
+            .object
+            .declare_func_in_func(self.set_returned_view_projection, builder.func);
+        let take_returned_view_projection = self
+            .object
+            .declare_func_in_func(self.take_returned_view_projection, builder.func);
         let line = builder.ins().iconst(types::I64, function.span.line as i64);
         let column = builder
             .ins()
@@ -2027,6 +2042,9 @@ impl<'a> NativeCodegen<'a> {
         let closure_value = self
             .object
             .declare_func_in_func(self.closure_value, builder.func);
+        let closure_capture = self
+            .object
+            .declare_func_in_func(self.closure_capture, builder.func);
         let function_call = self
             .object
             .declare_func_in_func(self.function_call, builder.func);
@@ -2968,6 +2986,8 @@ impl<'a> NativeCodegen<'a> {
             trait_impls: self.trait_impls.clone(),
             return_type: function.return_type.clone(),
             owned_opaque_temporaries: HashSet::new(),
+            view_places: HashMap::new(),
+            closure_capture_writebacks: HashMap::new(),
             object: &mut self.object,
             string_data: &mut self.string_data,
             cleanup_places,
@@ -2975,6 +2995,8 @@ impl<'a> NativeCodegen<'a> {
             cleanup_registration_vars,
             safepoint_fuel,
             exit_call,
+            set_returned_view_projection,
+            take_returned_view_projection,
             print_i64,
             print_u64,
             print_f32,
@@ -3000,6 +3022,7 @@ impl<'a> NativeCodegen<'a> {
             function_value,
             module_constant,
             closure_value,
+            closure_capture,
             function_call,
             function_bind_defaults,
             box_unit,
@@ -3811,6 +3834,38 @@ impl<'a> NativeCodegen<'a> {
     }
 }
 
+#[derive(Clone)]
+struct DirectViewPlace {
+    alternatives: Vec<DirectViewAlternative>,
+}
+
+#[derive(Clone)]
+struct DirectViewAlternative {
+    place: String,
+    conditions: Vec<(Value, i64)>,
+}
+
+impl DirectViewPlace {
+    fn static_place(place: String) -> Self {
+        Self {
+            alternatives: vec![DirectViewAlternative {
+                place,
+                conditions: Vec::new(),
+            }],
+        }
+    }
+
+    fn project(mut self, projection: &str) -> Self {
+        if projection.is_empty() {
+            return self;
+        }
+        for alternative in &mut self.alternatives {
+            alternative.place = format!("{}.{}", alternative.place, projection);
+        }
+        self
+    }
+}
+
 struct FunctionCompiler<'a> {
     builder: FunctionBuilder<'a>,
     blocks: HashMap<String, cranelift_codegen::ir::Block>,
@@ -3832,6 +3887,8 @@ struct FunctionCompiler<'a> {
     trait_impls: Vec<MirTraitImpl>,
     return_type: Type,
     owned_opaque_temporaries: HashSet<Value>,
+    view_places: HashMap<String, DirectViewPlace>,
+    closure_capture_writebacks: HashMap<String, Vec<(usize, String, DirectType)>>,
     object: &'a mut ObjectModule,
     string_data: &'a mut HashMap<Vec<u8>, DataId>,
     cleanup_places: Vec<String>,
@@ -3839,6 +3896,8 @@ struct FunctionCompiler<'a> {
     cleanup_registration_vars: HashMap<String, Variable>,
     safepoint_fuel: Option<Variable>,
     exit_call: cranelift_codegen::ir::FuncRef,
+    set_returned_view_projection: cranelift_codegen::ir::FuncRef,
+    take_returned_view_projection: cranelift_codegen::ir::FuncRef,
     print_i64: cranelift_codegen::ir::FuncRef,
     print_u64: cranelift_codegen::ir::FuncRef,
     print_f32: cranelift_codegen::ir::FuncRef,
@@ -3864,6 +3923,7 @@ struct FunctionCompiler<'a> {
     function_value: cranelift_codegen::ir::FuncRef,
     module_constant: cranelift_codegen::ir::FuncRef,
     closure_value: cranelift_codegen::ir::FuncRef,
+    closure_capture: cranelift_codegen::ir::FuncRef,
     function_call: cranelift_codegen::ir::FuncRef,
     function_bind_defaults: cranelift_codegen::ir::FuncRef,
     box_unit: cranelift_codegen::ir::FuncRef,
@@ -4229,6 +4289,18 @@ impl<'a> FunctionCompiler<'a> {
         self.owned_opaque_temporaries.clear();
     }
 
+    fn release_temporary_owned_since(&mut self, baseline: &HashSet<Value>) {
+        let created = self
+            .owned_opaque_temporaries
+            .difference(baseline)
+            .copied()
+            .collect::<Vec<_>>();
+        for value in created {
+            self.release_opaque_handle(value);
+            self.owned_opaque_temporaries.remove(&value);
+        }
+    }
+
     fn release_root_if_opaque(&mut self, name: &str) -> std::result::Result<(), String> {
         let ty = self.local_type(name)?;
         if !matches!(ty, DirectType::Opaque(_)) {
@@ -4344,7 +4416,120 @@ impl<'a> FunctionCompiler<'a> {
 
                 self.builder.switch_to_block(continue_block);
             }
+            Instruction::BeginLoan { loan, source, .. } => {
+                let source = self.resolve_view_place(source)?;
+                self.view_places.insert(loan.clone(), source);
+            }
+            Instruction::BeginReturnedLoan {
+                loan,
+                origin,
+                projections,
+                ..
+            } => {
+                let mut encoded = Vec::new();
+                for (index, projection) in projections.iter().enumerate() {
+                    if index != 0 {
+                        encoded.push(0);
+                    }
+                    encoded.extend_from_slice(projection.as_bytes());
+                }
+                let (projections_ptr, projections_len) = self.string_constant(&encoded)?;
+                let selected = self.builder.ins().call(
+                    self.take_returned_view_projection,
+                    &[projections_ptr, projections_len],
+                );
+                let selected = self.builder.inst_results(selected)[0];
+                let origin = self.resolve_view_place(origin)?;
+                let mut alternatives = Vec::new();
+                for origin in origin.alternatives {
+                    for (index, projection) in projections.iter().enumerate() {
+                        let mut conditions = origin.conditions.clone();
+                        conditions.push((selected, index as i64));
+                        alternatives.push(DirectViewAlternative {
+                            place: if projection.is_empty() {
+                                origin.place.clone()
+                            } else {
+                                format!("{}.{}", origin.place, projection)
+                            },
+                            conditions,
+                        });
+                    }
+                }
+                self.view_places
+                    .insert(loan.clone(), DirectViewPlace { alternatives });
+            }
+            Instruction::Reborrow {
+                loan,
+                parent,
+                projection,
+                ..
+            } => {
+                let source = self.resolve_view_place(parent)?.project(projection);
+                self.view_places.insert(loan.clone(), source);
+            }
+            Instruction::ReadLoan { target, loan } => {
+                let loaded = self.load_place(loan)?;
+                let target_ty = self.type_of_place(target)?;
+                let loaded = self.coerce_value(loaded, &target_ty)?;
+                self.store_place(target, loaded)?;
+            }
+            Instruction::WriteLoan { loan, value } => {
+                let target_ty = self.type_of_place(loan)?;
+                let compiled = self.compile_rvalue_for_target(value, &target_ty)?;
+                let coerced = self.coerce_value(compiled, &target_ty)?;
+                self.store_place(loan, coerced)?;
+            }
+            Instruction::EndLoan { loan } => {
+                self.view_places.remove(loan);
+            }
+            Instruction::ReturnLoan { loan, origin } => {
+                self.emit_returned_view_projection(loan, origin)?;
+            }
             Instruction::Assign { target, value } => {
+                if let Rvalue::Closure { captures, .. } = value {
+                    let writebacks = captures
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, capture)| {
+                            (capture.passing == MirReceiverKind::BorrowMut)
+                                .then_some((index, capture))
+                        })
+                        .map(|(index, capture)| {
+                            let source = capture.source_place.clone().ok_or_else(|| {
+                                format!(
+                                    "direct backend mutable closure capture `{}` has no source place",
+                                    capture.name
+                                )
+                            })?;
+                            let ty = ensure_direct_type(
+                                &capture.ty,
+                                &self.classes,
+                                &format!("mutable closure capture `{}`", capture.name),
+                            )?;
+                            Ok((index, source, ty))
+                        })
+                        .collect::<std::result::Result<Vec<_>, String>>()?;
+                    let root = target.split('.').next().unwrap_or(target).to_string();
+                    if writebacks.is_empty() {
+                        self.closure_capture_writebacks.remove(&root);
+                    } else {
+                        self.closure_capture_writebacks.insert(root, writebacks);
+                    }
+                } else if let Rvalue::Use(Operand::Place(source) | Operand::MovePlace(source)) =
+                    value
+                {
+                    let source_root = source.split('.').next().unwrap_or(source);
+                    let target_root = target.split('.').next().unwrap_or(target).to_string();
+                    match self.closure_capture_writebacks.get(source_root).cloned() {
+                        Some(writebacks) => {
+                            self.closure_capture_writebacks
+                                .insert(target_root, writebacks);
+                        }
+                        None => {
+                            self.closure_capture_writebacks.remove(&target_root);
+                        }
+                    }
+                }
                 if let Rvalue::Try { value: try_value } = value {
                     let target_ty = self.type_of_place(target)?;
                     self.compile_try_assign(target, target_ty, try_value)?;
@@ -4761,10 +4946,28 @@ impl<'a> FunctionCompiler<'a> {
                 .ins()
                 .call(self.arg_buffer_store_owned, &[buffer, index, value]);
         }
+        let mode_buffer_size = u32::try_from(captures.len().max(1).saturating_mul(8))
+            .ok()
+            .ok_or("direct backend closure capture-mode buffer is too large".to_string())?;
+        let mode_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            mode_buffer_size,
+            3,
+        ));
+        let modes = self.builder.ins().stack_addr(types::I64, mode_slot, 0);
+        for (index, capture) in captures.iter().enumerate() {
+            let mutable = self.builder.ins().iconst(
+                types::I64,
+                i64::from(capture.passing == MirReceiverKind::BorrowMut),
+            );
+            self.builder
+                .ins()
+                .store(MemFlags::new(), mutable, modes, (index as i32) * 8);
+        }
         let consuming = self.builder.ins().iconst(types::I64, i64::from(consuming));
         let call = self.builder.ins().call(
             self.closure_value,
-            &[function_value, buffer, count, consuming],
+            &[function_value, buffer, count, modes, consuming],
         );
         Ok(self.owned_opaque_result(self.builder.inst_results(call).to_vec(), signature.clone()))
     }
@@ -5832,6 +6035,14 @@ impl<'a> FunctionCompiler<'a> {
         let return_direct =
             ensure_direct_type(&return_type, &self.classes, "indirect-call return type")?;
 
+        let closure_writebacks = match function {
+            Operand::Place(place) | Operand::MovePlace(place) => self
+                .closure_capture_writebacks
+                .get(place.split('.').next().unwrap_or(place))
+                .cloned()
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
         let loaded_function = self.load_operand(function)?;
         let function = self.ensure_opaque(loaded_function)?;
         let count = self.builder.ins().iconst(types::I64, params.len() as i64);
@@ -5918,6 +6129,17 @@ impl<'a> FunctionCompiler<'a> {
                 ty: DirectType::Opaque(direct_type_to_type(&writeback_ty)),
             };
             self.mark_temporary_opaque_owned(&boxed);
+            let writeback = self.coerce_value(boxed, &writeback_ty)?;
+            self.store_place(&place, writeback)?;
+        }
+        for (index, place, writeback_ty) in closure_writebacks {
+            let index = self.builder.ins().iconst(types::I64, index as i64);
+            let call = self
+                .builder
+                .ins()
+                .call(self.closure_capture, &[function.values[0], index]);
+            let raw = self.builder.inst_results(call)[0];
+            let boxed = self.owned_opaque_result(vec![raw], direct_type_to_type(&writeback_ty));
             let writeback = self.coerce_value(boxed, &writeback_ty)?;
             self.store_place(&place, writeback)?;
         }
@@ -7548,7 +7770,22 @@ impl<'a> FunctionCompiler<'a> {
         ))
     }
 
+    fn resolve_view_place(&self, place: &str) -> std::result::Result<DirectViewPlace, String> {
+        let (root, projection) = place.split_once('.').unwrap_or((place, ""));
+        if let Some(source) = self.view_places.get(root) {
+            return Ok(source.clone().project(projection));
+        }
+        Ok(DirectViewPlace::static_place(place.to_string()))
+    }
+
     fn type_of_place(&self, place: &str) -> std::result::Result<DirectType, String> {
+        let resolved = self.resolve_view_place(place)?;
+        let place = resolved
+            .alternatives
+            .first()
+            .ok_or_else(|| format!("direct backend view `{place}` has no place alternatives"))?
+            .place
+            .as_str();
         let mut segments = place.split('.');
         let root = segments
             .next()
@@ -7723,6 +7960,14 @@ impl<'a> FunctionCompiler<'a> {
     }
 
     fn load_place(&mut self, place: &str) -> std::result::Result<ValueRef, String> {
+        let resolved = self.resolve_view_place(place)?;
+        if resolved.alternatives.len() == 1 && resolved.alternatives[0].conditions.is_empty() {
+            return self.load_static_place(&resolved.alternatives[0].place);
+        }
+        self.load_selected_view_place(place, resolved)
+    }
+
+    fn load_static_place(&mut self, place: &str) -> std::result::Result<ValueRef, String> {
         let mut segments = place.split('.');
         let root = segments
             .next()
@@ -7730,6 +7975,191 @@ impl<'a> FunctionCompiler<'a> {
         let mut value = self.load_root(root)?;
         for field in segments {
             value = self.extract_field(value, field)?;
+        }
+        Ok(value)
+    }
+
+    fn view_alternative_condition(&mut self, alternative: &DirectViewAlternative) -> Value {
+        let mut conditions = alternative.conditions.iter();
+        let Some((selector, expected)) = conditions.next() else {
+            return self.builder.ins().iconst(types::I64, 1);
+        };
+        let mut matches = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::Equal, *selector, *expected);
+        for (selector, expected) in conditions {
+            let next = self
+                .builder
+                .ins()
+                .icmp_imm(IntCC::Equal, *selector, *expected);
+            matches = self.builder.ins().band(matches, next);
+        }
+        matches
+    }
+
+    fn emit_returned_view_projection(
+        &mut self,
+        loan: &str,
+        origin: &str,
+    ) -> std::result::Result<(), String> {
+        let sources = self.resolve_view_place(loan)?;
+        let origins = self.resolve_view_place(origin)?;
+        let mut alternatives = Vec::<(String, Vec<(Value, i64)>)>::new();
+        for source in &sources.alternatives {
+            for origin in &origins.alternatives {
+                let projection = if source.place == origin.place {
+                    Some(String::new())
+                } else {
+                    source
+                        .place
+                        .strip_prefix(&format!("{}.", origin.place))
+                        .map(str::to_string)
+                };
+                let Some(projection) = projection else {
+                    continue;
+                };
+                let mut conditions = origin.conditions.clone();
+                let mut compatible = true;
+                for condition in &source.conditions {
+                    if let Some((_, expected)) = conditions
+                        .iter()
+                        .find(|(selector, _)| selector == &condition.0)
+                    {
+                        if *expected != condition.1 {
+                            compatible = false;
+                            break;
+                        }
+                    } else {
+                        conditions.push(*condition);
+                    }
+                }
+                if compatible
+                    && !alternatives
+                        .iter()
+                        .any(|candidate| candidate.0 == projection && candidate.1 == conditions)
+                {
+                    alternatives.push((projection, conditions));
+                }
+            }
+        }
+        if alternatives.is_empty() {
+            return Err(format!(
+                "direct returned loan `{loan}` has no projection within origin `{origin}`"
+            ));
+        }
+
+        let merge = self.builder.create_block();
+        let alternative_count = alternatives.len();
+        for (index, (projection, conditions)) in alternatives.into_iter().enumerate() {
+            if index + 1 < alternative_count {
+                let selected = self.view_alternative_condition(&DirectViewAlternative {
+                    place: String::new(),
+                    conditions,
+                });
+                let set_block = self.builder.create_block();
+                let next_block = self.builder.create_block();
+                self.builder
+                    .ins()
+                    .brif(selected, set_block, &[], next_block, &[]);
+                self.builder.switch_to_block(set_block);
+                self.set_returned_view_projection_value(&projection)?;
+                self.builder.ins().jump(merge, &[]);
+                self.builder.seal_block(set_block);
+                self.builder.switch_to_block(next_block);
+                self.builder.seal_block(next_block);
+            } else {
+                self.set_returned_view_projection_value(&projection)?;
+                self.builder.ins().jump(merge, &[]);
+            }
+        }
+        self.builder.switch_to_block(merge);
+        self.builder.seal_block(merge);
+        Ok(())
+    }
+
+    fn set_returned_view_projection_value(
+        &mut self,
+        projection: &str,
+    ) -> std::result::Result<(), String> {
+        let (projection_ptr, projection_len) = self.string_constant(projection.as_bytes())?;
+        self.builder.ins().call(
+            self.set_returned_view_projection,
+            &[projection_ptr, projection_len],
+        );
+        Ok(())
+    }
+
+    fn load_selected_view_place(
+        &mut self,
+        view: &str,
+        resolved: DirectViewPlace,
+    ) -> std::result::Result<ValueRef, String> {
+        let target_ty = self.type_of_place(view)?;
+        let merge = self.builder.create_block();
+        for abi in target_ty.abi_types() {
+            self.builder.append_block_param(merge, abi);
+        }
+
+        let caller_owned = self.owned_opaque_temporaries.clone();
+        let alternative_count = resolved.alternatives.len();
+        let mut merged_owned = None;
+        for (index, alternative) in resolved.alternatives.into_iter().enumerate() {
+            if index + 1 < alternative_count {
+                let selected = self.view_alternative_condition(&alternative);
+                let load_block = self.builder.create_block();
+                let next_block = self.builder.create_block();
+                self.builder
+                    .ins()
+                    .brif(selected, load_block, &[], next_block, &[]);
+                self.builder.switch_to_block(load_block);
+                self.owned_opaque_temporaries = caller_owned.clone();
+                let value = self.load_static_place(&alternative.place)?;
+                let value = self.coerce_value(value, &target_ty)?;
+                let value_is_owned = self.temporary_owns_opaque(&value);
+                if let Some(expected) = merged_owned {
+                    if expected != value_is_owned {
+                        return Err(format!(
+                            "direct view `{view}` alternatives disagree on value ownership"
+                        ));
+                    }
+                } else {
+                    merged_owned = Some(value_is_owned);
+                }
+                self.clear_temporary_opaque_owned(&value);
+                self.release_temporary_owned_since(&caller_owned);
+                self.builder.ins().jump(merge, &value.values);
+                self.builder.seal_block(load_block);
+                self.builder.switch_to_block(next_block);
+                self.builder.seal_block(next_block);
+            } else {
+                self.owned_opaque_temporaries = caller_owned.clone();
+                let value = self.load_static_place(&alternative.place)?;
+                let value = self.coerce_value(value, &target_ty)?;
+                let value_is_owned = self.temporary_owns_opaque(&value);
+                if let Some(expected) = merged_owned {
+                    if expected != value_is_owned {
+                        return Err(format!(
+                            "direct view `{view}` alternatives disagree on value ownership"
+                        ));
+                    }
+                } else {
+                    merged_owned = Some(value_is_owned);
+                }
+                self.clear_temporary_opaque_owned(&value);
+                self.release_temporary_owned_since(&caller_owned);
+                self.builder.ins().jump(merge, &value.values);
+            }
+        }
+        self.builder.switch_to_block(merge);
+        self.builder.seal_block(merge);
+        self.owned_opaque_temporaries = caller_owned;
+        let value = ValueRef {
+            values: self.builder.block_params(merge).to_vec(),
+            ty: target_ty,
+        };
+        if merged_owned == Some(true) {
+            self.mark_temporary_opaque_owned(&value);
         }
         Ok(value)
     }
@@ -7836,6 +8266,29 @@ impl<'a> FunctionCompiler<'a> {
                     values: object.values[start..end].to_vec(),
                     ty: field_ty,
                 })
+            }
+            DirectType::Opaque(Type::Tuple(elements)) => {
+                let index = field.parse::<usize>().map_err(|_| {
+                    format!("direct backend tuple projection `{field}` is not a fixed position")
+                })?;
+                let element_type = elements.get(index).cloned().ok_or_else(|| {
+                    format!(
+                        "direct backend tuple of length {} has no element at index {index}",
+                        elements.len()
+                    )
+                })?;
+                let index_value = self.builder.ins().iconst(types::I64, index as i64);
+                let inst = self
+                    .builder
+                    .ins()
+                    .call(self.tuple_element, &[object.values[0], index_value]);
+                let element = self.owned_opaque_result(
+                    self.builder.inst_results(inst).to_vec(),
+                    element_type.clone(),
+                );
+                let direct_type =
+                    ensure_direct_type(&element_type, &self.classes, "tuple view element")?;
+                self.coerce_value(element, &direct_type)
             }
             DirectType::Opaque(_) => {
                 let (field_ptr, field_len) = self.string_constant(field.as_bytes())?;
@@ -8183,6 +8636,18 @@ impl<'a> FunctionCompiler<'a> {
     }
 
     fn store_place(&mut self, place: &str, value: ValueRef) -> std::result::Result<(), String> {
+        let resolved = self.resolve_view_place(place)?;
+        if resolved.alternatives.len() == 1 && resolved.alternatives[0].conditions.is_empty() {
+            return self.store_static_place(&resolved.alternatives[0].place, value);
+        }
+        self.store_selected_view_place(resolved, value)
+    }
+
+    fn store_static_place(
+        &mut self,
+        place: &str,
+        value: ValueRef,
+    ) -> std::result::Result<(), String> {
         let mut segments = place.split('.').collect::<Vec<_>>();
         let root = segments.remove(0);
         let result = if segments.is_empty() {
@@ -8206,6 +8671,47 @@ impl<'a> FunctionCompiler<'a> {
         };
         result?;
         self.refresh_cleanup_registrations_for_mutation(place)
+    }
+
+    fn store_selected_view_place(
+        &mut self,
+        resolved: DirectViewPlace,
+        value: ValueRef,
+    ) -> std::result::Result<(), String> {
+        let merge = self.builder.create_block();
+        let caller_owned = self.owned_opaque_temporaries.clone();
+        let value_was_owned = self.temporary_owns_opaque(&value);
+        let alternative_count = resolved.alternatives.len();
+        for (index, alternative) in resolved.alternatives.into_iter().enumerate() {
+            if index + 1 < alternative_count {
+                let selected = self.view_alternative_condition(&alternative);
+                let store_block = self.builder.create_block();
+                let next_block = self.builder.create_block();
+                self.builder
+                    .ins()
+                    .brif(selected, store_block, &[], next_block, &[]);
+                self.builder.switch_to_block(store_block);
+                self.owned_opaque_temporaries = caller_owned.clone();
+                self.store_static_place(&alternative.place, value.clone())?;
+                self.release_temporary_owned_since(&caller_owned);
+                self.builder.ins().jump(merge, &[]);
+                self.builder.seal_block(store_block);
+                self.builder.switch_to_block(next_block);
+                self.builder.seal_block(next_block);
+            } else {
+                self.owned_opaque_temporaries = caller_owned.clone();
+                self.store_static_place(&alternative.place, value.clone())?;
+                self.release_temporary_owned_since(&caller_owned);
+                self.builder.ins().jump(merge, &[]);
+            }
+        }
+        self.builder.switch_to_block(merge);
+        self.builder.seal_block(merge);
+        self.owned_opaque_temporaries = caller_owned;
+        if value_was_owned {
+            self.clear_temporary_opaque_owned(&value);
+        }
+        Ok(())
     }
 
     fn replace_nested_field(
@@ -14226,6 +14732,13 @@ fn validate_function(
         for instruction in &block.instructions {
             match instruction {
                 Instruction::Safepoint => {}
+                Instruction::BeginLoan { .. }
+                | Instruction::BeginReturnedLoan { .. }
+                | Instruction::Reborrow { .. }
+                | Instruction::ReadLoan { .. }
+                | Instruction::EndLoan { .. }
+                | Instruction::ReturnLoan { .. } => {}
+                Instruction::WriteLoan { value, .. } => validate_rvalue(value, classes)?,
                 Instruction::Assign { value, .. } => validate_rvalue(value, classes)?,
                 Instruction::Eval { value } => validate_operand(value)?,
                 Instruction::PushCleanup { .. } | Instruction::PopCleanup { .. } => {}
@@ -16128,6 +16641,10 @@ fn direct_field_type(
 ) -> Option<DirectType> {
     if let Some((_, _, field_ty)) = ty.field_slice(field) {
         return Some(field_ty);
+    }
+    if let DirectType::Opaque(Type::Tuple(elements)) = ty {
+        let index = field.parse::<usize>().ok()?;
+        return direct_type(elements.get(index)?, classes);
     }
     let DirectType::Opaque(Type::Named(class_name, args)) = ty else {
         return None;

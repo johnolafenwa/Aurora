@@ -51,14 +51,24 @@ capabilities are exact: code must pass bare/shared element callbacks rather
 than relying on adaptation from `mut` or `own`.
 
 Contextually typed `lambda parameters: expression` closures follow Accepted
-ADR-0037. Captures are by value: Copy values are copied,
-owned non-Copy values move at creation, read-only capture use is repeatable,
-and consuming capture use makes the closure single-use. A closure is Transfer
-only when every capture is Transfer. Shared or mutable capability capture and
-mutable captured state are unavailable. Zero-parameter lambdas may infer their result
+ADR-0037. Without a capture list, Copy values copy and owned non-Copy values
+move at creation. ADR-0038 adds exhaustive lists with shared, mutable, and
+owned entries. Shared-loan use is repeatable, mutable-loan use is repeatable
+through a mutable closure place, and consuming owned-capture use is single-use.
+A by-value closure is Transfer only when every capture is Transfer; a loan
+closure is never Transfer. Zero-parameter lambdas may infer their result
 without a contextual callable type. Capturing closures retain compiler
 metadata and therefore do not cross arbitrary written-`def` parameter, field,
 collection, or annotated return boundaries.
+
+Phase 6.5 implements ADR-0038 place-based loans and views. Local shared and
+mutable views cover roots, fixed class fields, and tuple positions; lifetimes
+end after conservative final use; reborrows preserve source identity; and
+mutable views write through immediately. One declared receiver or parameter
+may be the origin of `-> view [mut] T from source`. MIR execution, direct
+native builds, analysis/LSP, and editor tooling share semantic-interface
+schema 6 for this surface. Views and loan closures remain task-local and
+non-Transfer.
 
 Phase 6.4 adds explicitly authorized FFI v0 packages. Bodyless
 `extern "C"` functions call process-global symbols synchronously through
@@ -85,8 +95,9 @@ reversed range traps with `AU4003`; endpoints are not clamped. String positions
 count Unicode scalar values and require an O(n)
 scan. Every result owns independent storage: list elements copy or clone under
 clone-safety and task-repeatability rules, while str produces a fresh valid
-UTF-8 value. String integer indexing, steps, slice assignment, and views remain
-unavailable; this feature does not implement ADR-0038.
+UTF-8 value. String integer indexing, steps, slice assignment, and indexed
+slice views remain unavailable. The separate ADR-0038 `view` forms do not
+reinterpret owned slice syntax.
 
 Phase 7.3 adds global contiguous `Array[T]` values under Accepted ADR-0041.
 The four dtypes are `int32`, `int64`, `float32`, and `float64`; every value

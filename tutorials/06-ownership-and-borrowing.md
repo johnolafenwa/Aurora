@@ -176,15 +176,97 @@ def main():
     print(length())
 ```
 
-Bare and `mut` enclosing parameters are borrowed capabilities and cannot be
-captured. Closure environments are read-only in Phase 6.3. A closure may cross
-a task boundary only when every captured value is Transfer.
+Without a capture list, bare and `mut` enclosing parameters are not captured.
+Use an explicit exhaustive list for a live shared or mutable loan. A by-value
+closure may cross a task boundary only when every captured value is Transfer;
+a loan closure is always local and non-Transfer.
 
 Stored and arbitrary parameter `def` types remain capture-free. Keep a
 capturing closure in an immutable local, call it directly, pass it to a
 compiler-known repeatable callback, or move a qualifying closure into one task
 start; do not erase its environment metadata through a field, collection, or
 annotated return.
+
+## Local Views, Reborrowing, And Inferred Lifetimes
+
+A view names a live place without taking ownership:
+
+```aura check-pass
+class Counter:
+    value: int64
+
+def main():
+    mut counter = Counter(value=1)
+    view mut value = counter.value
+    view mut nested = value
+    nested = nested + 1
+    print(counter.value)
+```
+
+`nested` is a reborrow of `value`, and its assignment writes immediately to
+`counter.value`. The compiler ends both loans after their final possible use,
+so the later source read is legal even though the view bindings remain in
+lexical scope. Shared views may overlap shared views; a mutable view excludes
+all overlapping source access. Proven-disjoint fields and fixed tuple
+positions can be loaned independently. Collection indexes are not view places
+in Aura 0.3.
+
+## Returned Views
+
+A function can return access tied to one named receiver or parameter:
+
+```aura check-pass
+class User:
+    name: str
+
+def name(user: User) -> view str from user:
+    return view user.name
+
+def rename(user: mut User) -> view mut str from user:
+    return view mut user.name
+
+def main():
+    mut user = User(name="Ada")
+    view current = name(user)
+    print(current)
+
+    view mut editable = rename(user)
+    editable = "Grace"
+    print(user.name)
+```
+
+The `from` origin is part of the function contract. Mutable results require a
+mutable origin and a mutable view binding. A local, temporary, owned/defaulted
+parameter, or different root cannot escape as the result. Ordinary `-> T`
+returns remain owned.
+
+## Explicit Loan Captures
+
+Capture lists are exhaustive and make live access visible:
+
+```aura check-pass
+class Counter:
+    value: int64
+
+    def add(mut self, amount: int64):
+        self.value += amount
+
+def main():
+    mut counter = Counter(value=1)
+    mut update: def(int64) -> None = lambda [mut counter] amount: counter.add(amount)
+    update(2)
+    update(3)
+    print(counter.value)
+```
+
+`[counter]` is a shared loan, `[mut counter]` is a mutable loan, and `[own
+counter]` is the original by-value Copy/move capture. A mutable-loan closure is
+repeatable through a `mut` closure local. Its source remains exclusively
+loaned until the closure's final use, and the closure cannot enter a task,
+Queue, aggregate, or arbitrary structural `def` boundary.
+
+Run the combined maintained example at
+[examples/basics/views.au](../examples/basics/views.au).
 
 ## Passing Values To Functions
 

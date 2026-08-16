@@ -73,8 +73,10 @@ return assert if elif else and or not match case for in while break
 continue pass try with as true false
 ```
 
-`from` is contextual: it introduces a from-import at module level and may also
-be used as an identifier where the grammar expects one. `lambda` is lexed as
+`from` is contextual: it introduces a from-import at module level, completes a
+returned-view annotation, and may also be used as an identifier where the
+grammar expects one. `view` is contextual in complete local-view,
+returned-view, and `return view` forms. `lambda` is lexed as
 an identifier but introduces a lambda at the start of an expression; member
 and named-argument positions may still use that spelling. `copy`, `self`,
 `None`, `set`, `Self`, and `_` are lexed as identifiers and acquire special
@@ -371,12 +373,17 @@ parameter
       [ "=", expression ] ;
 
 return-annotation
-    = "->", type ;
+    = "->", type
+    | "->", "view", [ "mut" ], type,
+      "from", identifier ;
 ```
 
 A receiver, when present, is the first method parameter. Bare `self` is the shared receiver, `mut self` is mutable, and `own self` is consuming. There is exactly one spelling per capability. A first method parameter written as `self: Type` is rejected rather than interpreted as an ordinary parameter; use one of the receiver forms above. Ordinary parameter capabilities appear after the colon: bare `T` is shared, `mut T` is mutable, and `own T` is consuming. Call sites pass the value directly and never prefix an argument with a capability.
 
-Bare means shared access for every type, including declaration-known copy types. Return annotations carry no capability: every return is an ordinary owned return.
+Bare means shared access for every type, including declaration-known copy
+types. An ordinary type annotation is an owned return. A view annotation names
+one receiver or ordinary parameter origin; static semantics validates its
+kind, provenance, and caller-place requirements.
 
 Parameter lists, calls, and return annotations do not accept trailing commas. Static checking further restricts duplicate names, default placement/availability, and mutable task targets.
 
@@ -424,6 +431,7 @@ suite = INDENT, statement, { statement }, DEDENT ;
 
 statement
     = assignment-statement
+    | view-statement
     | return-statement
     | assert-statement
     | pass-statement
@@ -444,6 +452,10 @@ assignment-statement
       assignment-operator,
       expression, statement-end
     | unpack-target, "=", expression, statement-end ;
+
+view-statement
+    = "view", [ "mut" ], identifier,
+      "=", expression, statement-end ;
 
 assignment-target
     = identifier,
@@ -467,7 +479,10 @@ assignment-operator
     = "=" | "+=" | "-=" | "*=" | "**=" | "/=" | "//=" | "%="
     | "&=" | "|=" | "^=" | "<<=" | ">>=" ;
 
-return-statement     = "return", [ expression ], statement-end ;
+return-statement
+    = "return", [ expression ], statement-end
+    | "return", "view", [ "mut" ],
+      expression, statement-end ;
 assert-statement     = "assert", non-tuple-expression,
                        [ ",", non-tuple-expression ], statement-end ;
 pass-statement       = "pass", NEWLINE ;
@@ -621,8 +636,16 @@ expression           = lambda-expression | non-tuple-expression ;
 non-tuple-expression = conditional-expression ;
 
 lambda-expression
-    = "lambda", [ lambda-parameter,
+    = "lambda", [ lambda-capture-list ],
+      [ lambda-parameter,
       { ",", lambda-parameter } ], ":", expression ;
+
+lambda-capture-list
+    = "[", lambda-capture,
+      { ",", lambda-capture }, "]" ;
+
+lambda-capture
+    = [ "mut" | "own" ], identifier ;
 
 lambda-parameter
     = [ "mut" | "own" ], identifier ;
@@ -789,7 +812,8 @@ Lambda parameters receive their types from an expected structural function
 type, whose result also constrains the body. A zero-parameter lambda may infer
 its result from the body. The colon introduces one expression, not a suite.
 Lambda parameters do not accept annotations, defaults, generics, or a trailing
-comma.
+comma. A capture list is exhaustive and nonempty; its entries name outer local
+places and request shared, mutable, or by-value owned capture.
 
 `(value)` is grouping and `(value,)` is a singleton tuple. Tuple value
 expressions require parentheses; an unparenthesized comma is accepted only in

@@ -222,6 +222,13 @@ fn reject_untrusted_extern_calls(module: &MirModule) -> Result<()> {
                 ..
             } => Some(call.symbol.as_str()),
             Instruction::Safepoint
+            | Instruction::BeginLoan { .. }
+            | Instruction::BeginReturnedLoan { .. }
+            | Instruction::Reborrow { .. }
+            | Instruction::ReadLoan { .. }
+            | Instruction::WriteLoan { .. }
+            | Instruction::EndLoan { .. }
+            | Instruction::ReturnLoan { .. }
             | Instruction::Assign { .. }
             | Instruction::Eval { .. }
             | Instruction::PushCleanup { .. }
@@ -262,6 +269,13 @@ fn function_uses_lightweight_tasks(function: &MirFunction) -> bool {
             .any(|instruction| match instruction {
                 Instruction::Assign { value, .. } => rvalue_uses_lightweight_tasks(value),
                 Instruction::Safepoint
+                | Instruction::BeginLoan { .. }
+                | Instruction::BeginReturnedLoan { .. }
+                | Instruction::Reborrow { .. }
+                | Instruction::ReadLoan { .. }
+                | Instruction::WriteLoan { .. }
+                | Instruction::EndLoan { .. }
+                | Instruction::ReturnLoan { .. }
                 | Instruction::Eval { .. }
                 | Instruction::PushCleanup { .. }
                 | Instruction::PopCleanup { .. } => false,
@@ -622,6 +636,7 @@ struct MirRuntime {
     task_ancestry: Vec<RuntimeTaskFrame>,
     return_type_stack: Vec<Type>,
     constant_states: Arc<Mutex<HashMap<String, MirConstantState>>>,
+    pending_returned_view_projection: Option<String>,
 }
 
 #[derive(Clone)]
@@ -682,6 +697,13 @@ struct Env {
     values: HashMap<String, Value>,
     shared_values: HashMap<String, Arc<Value>>,
     types: HashMap<String, Type>,
+    loans: HashMap<String, RuntimeLoan>,
+}
+
+#[derive(Clone)]
+struct RuntimeLoan {
+    source: String,
+    mutable: bool,
 }
 
 #[cfg(test)]
@@ -701,6 +723,70 @@ fn mir_array_place_clone_count() -> usize {
 }
 
 impl Env {
+    fn resolve_loan_place(&self, place: &str) -> Result<String> {
+        let mut resolved = place.to_string();
+        let mut seen = std::collections::BTreeSet::new();
+        loop {
+            let (root, suffix) = resolved
+                .split_once('.')
+                .map(|(root, suffix)| (root, Some(suffix)))
+                .unwrap_or((resolved.as_str(), None));
+            let Some(loan) = self.loans.get(root) else {
+                return Ok(resolved);
+            };
+            if !seen.insert(root.to_string()) {
+                return Err(Diagnostic::new(format!(
+                    "cyclic MIR loan descriptor rooted at `{root}`"
+                )));
+            }
+            resolved = match suffix {
+                Some(suffix) if !suffix.is_empty() => format!("{}.{}", loan.source, suffix),
+                _ => loan.source.clone(),
+            };
+        }
+    }
+
+    fn begin_loan(&mut self, loan: &str, source: &str, mutable: bool) -> Result<()> {
+        let source = self.resolve_loan_place(source)?;
+        if !self
+            .values
+            .contains_key(source.split('.').next().unwrap_or_default())
+            && !self
+                .shared_values
+                .contains_key(source.split('.').next().unwrap_or_default())
+        {
+            return Err(Diagnostic::new(format!(
+                "cannot begin MIR loan `{loan}` from unknown place `{source}`"
+            )));
+        }
+        self.loans
+            .insert(loan.to_string(), RuntimeLoan { source, mutable });
+        Ok(())
+    }
+
+    fn returned_view_projection(&self, loan: &str, origin: &str) -> Result<String> {
+        let source = self.resolve_loan_place(loan)?;
+        let origin = self.resolve_loan_place(origin)?;
+        if source == origin {
+            return Ok(String::new());
+        }
+        source
+            .strip_prefix(&format!("{origin}."))
+            .map(str::to_string)
+            .ok_or_else(|| {
+                Diagnostic::new(format!(
+                    "returned MIR loan `{loan}` resolves to `{source}`, outside declared origin `{origin}`"
+                ))
+            })
+    }
+
+    fn end_loan(&mut self, loan: &str) -> Result<()> {
+        self.loans
+            .remove(loan)
+            .map(|_| ())
+            .ok_or_else(|| Diagnostic::new(format!("cannot end unknown MIR loan `{loan}`")))
+    }
+
     fn define_typed(&mut self, name: impl Into<String>, ty: Type, value: Value) {
         let name = name.into();
         self.types.insert(name.clone(), ty);
@@ -709,6 +795,8 @@ impl Env {
     }
 
     fn read_member(&self, place: &str, field: &str) -> Result<Value> {
+        let resolved_place = self.resolve_loan_place(place)?;
+        let place = resolved_place.as_str();
         let segments = split_place_segments(place)?;
         let (root, rest) = segments
             .split_first()
@@ -756,6 +844,8 @@ impl Env {
     }
 
     fn place_ref(&self, place: &str) -> Result<&Value> {
+        let resolved_place = self.resolve_loan_place(place)?;
+        let place = resolved_place.as_str();
         let segments = split_place_segments(place)?;
         let (root, rest) = segments
             .split_first()
@@ -770,18 +860,28 @@ impl Env {
         let mut index = 0usize;
         while index < rest.len() {
             let segment = &rest[index];
-            let Value::Instance(instance) = value else {
-                return Err(Diagnostic::new(format!(
-                    "cannot access field `{}` on non-instance MIR place `{}`",
-                    segment, place
-                )));
-            };
-            value = match instance.fields.get(segment) {
-                Some(value) => value,
-                None => {
-                    return Err(Diagnostic::new(format!(
+            value = match value {
+                Value::Instance(instance) => instance.fields.get(segment).ok_or_else(|| {
+                    Diagnostic::new(format!(
                         "class `{}` has no field `{}` in MIR place `{}`",
                         instance.class_name, segment, place
+                    ))
+                })?,
+                Value::Tuple(tuple) => {
+                    let tuple_index = segment.parse::<usize>().map_err(|_| {
+                        Diagnostic::new(format!(
+                            "tuple projection `{segment}` is not a fixed position in MIR place `{place}`"
+                        ))
+                    })?;
+                    tuple.elements.get(tuple_index).ok_or_else(|| {
+                        Diagnostic::new(format!(
+                            "tuple MIR place `{place}` has no element at index {tuple_index}"
+                        ))
+                    })?
+                }
+                _ => {
+                    return Err(Diagnostic::new(format!(
+                        "cannot access field `{segment}` on non-instance MIR place `{place}`"
                     )))
                 }
             };
@@ -802,6 +902,8 @@ impl Env {
     }
 
     fn take_place(&mut self, place: &str) -> Result<Value> {
+        let resolved_place = self.resolve_loan_place(place)?;
+        let place = resolved_place.as_str();
         let segments = split_place_segments(place)?;
         let (root, rest) = segments
             .split_first()
@@ -828,6 +930,8 @@ impl Env {
     }
 
     fn place_mut(&mut self, place: &str) -> Result<&mut Value> {
+        let resolved_place = self.resolve_loan_place(place)?;
+        let place = resolved_place.as_str();
         let segments = split_place_segments(place)?;
         let (root, rest) = segments
             .split_first()
@@ -843,6 +947,8 @@ impl Env {
     }
 
     fn take_variant_payload(&mut self, place: &str, index: usize) -> Result<Value> {
+        let resolved_place = self.resolve_loan_place(place)?;
+        let place = resolved_place.as_str();
         let segments = split_place_segments(place)?;
         let (root, rest) = segments
             .split_first()
@@ -867,6 +973,8 @@ impl Env {
     }
 
     fn tuple_element(&self, place: &str, index: usize) -> Result<Value> {
+        let resolved_place = self.resolve_loan_place(place)?;
+        let place = resolved_place.as_str();
         let value = self.place_ref(place)?;
         let Value::Tuple(tuple) = value else {
             return Err(Diagnostic::new(format!(
@@ -885,6 +993,8 @@ impl Env {
     }
 
     fn take_tuple_element(&mut self, place: &str, index: usize) -> Result<Value> {
+        let resolved_place = self.resolve_loan_place(place)?;
+        let place = resolved_place.as_str();
         let segments = split_place_segments(place)?;
         let (root, rest) = segments
             .split_first()
@@ -913,6 +1023,16 @@ impl Env {
     }
 
     fn write_place(&mut self, place: &str, value: Value) -> Result<()> {
+        let original_root = place.split('.').next().unwrap_or_default();
+        if let Some(loan) = self.loans.get(original_root) {
+            if !loan.mutable {
+                return Err(Diagnostic::new(format!(
+                    "cannot write through shared MIR loan `{original_root}`"
+                )));
+            }
+        }
+        let resolved_place = self.resolve_loan_place(place)?;
+        let place = resolved_place.as_str();
         let segments = split_place_segments(place)?;
         let (root, rest) = segments
             .split_first()
@@ -1057,52 +1177,94 @@ fn write_nested_place(
     value: Value,
     full_place: &str,
 ) -> Result<()> {
-    let Value::Instance(instance) = current else {
+    let Some((segment, rest)) = segments.split_first() else {
         return Err(Diagnostic::new(format!(
-            "cannot assign nested MIR place `{}` on non-instance value",
-            full_place
+            "cannot assign empty nested MIR place `{full_place}`"
         )));
     };
-
-    if segments.len() == 1 {
-        instance.fields.insert(segments[0].to_string(), value);
-        return Ok(());
-    }
-
-    let child = match instance.fields.get_mut(segments[0]) {
-        Some(child) => child,
-        None => {
-            return Err(Diagnostic::new(format!(
-                "class `{}` has no field `{}` in MIR place `{}`",
-                instance.class_name, segments[0], full_place
-            )))
+    match current {
+        Value::Instance(instance) => {
+            if rest.is_empty() {
+                instance.fields.insert((*segment).to_string(), value);
+                return Ok(());
+            }
+            let child = instance.fields.get_mut(*segment).ok_or_else(|| {
+                Diagnostic::new(format!(
+                    "class `{}` has no field `{}` in MIR place `{}`",
+                    instance.class_name, segment, full_place
+                ))
+            })?;
+            write_nested_place(child, rest, value, full_place)
         }
-    };
-    write_nested_place(child, &segments[1..], value, full_place)
+        Value::Tuple(tuple) => {
+            let index = segment.parse::<usize>().map_err(|_| {
+                Diagnostic::new(format!(
+                    "tuple projection `{segment}` is not a fixed position in MIR place `{full_place}`"
+                ))
+            })?;
+            let child = tuple.elements.get_mut(index).ok_or_else(|| {
+                Diagnostic::new(format!(
+                    "tuple MIR place `{full_place}` has no element at index {index}"
+                ))
+            })?;
+            if rest.is_empty() {
+                *child = value;
+                Ok(())
+            } else {
+                write_nested_place(child, rest, value, full_place)
+            }
+        }
+        _ => Err(Diagnostic::new(format!(
+            "cannot assign nested MIR place `{full_place}` on non-instance value"
+        ))),
+    }
 }
 
 fn take_nested_place(value: &mut Value, segments: &[String], full_place: &str) -> Result<Value> {
-    let Value::Instance(instance) = value else {
+    let Some((segment, rest)) = segments.split_first() else {
         return Err(Diagnostic::new(format!(
-            "cannot move nested MIR place `{}` from a non-instance value",
-            full_place
+            "cannot move empty nested MIR place `{full_place}`"
         )));
     };
-    if segments.len() == 1 {
-        return instance.fields.remove(&segments[0]).ok_or_else(|| {
-            Diagnostic::new(format!(
-                "class `{}` has no field `{}` in MIR place `{}`",
-                instance.class_name, segments[0], full_place
-            ))
-        });
+    match value {
+        Value::Instance(instance) => {
+            if rest.is_empty() {
+                return instance.fields.remove(segment).ok_or_else(|| {
+                    Diagnostic::new(format!(
+                        "class `{}` has no field `{}` in MIR place `{}`",
+                        instance.class_name, segment, full_place
+                    ))
+                });
+            }
+            let child = instance.fields.get_mut(segment).ok_or_else(|| {
+                Diagnostic::new(format!(
+                    "class `{}` has no field `{}` in MIR place `{}`",
+                    instance.class_name, segment, full_place
+                ))
+            })?;
+            take_nested_place(child, rest, full_place)
+        }
+        Value::Tuple(tuple) => {
+            let index = segment.parse::<usize>().map_err(|_| {
+                Diagnostic::new(format!(
+                    "tuple projection `{segment}` is not a fixed position in MIR place `{full_place}`"
+                ))
+            })?;
+            let child = tuple.elements.get_mut(index).ok_or_else(|| {
+                Diagnostic::new(format!(
+                    "tuple MIR place `{full_place}` has no element at index {index}"
+                ))
+            })?;
+            if rest.is_empty() {
+                Ok(std::mem::replace(child, Value::Unit))
+            } else {
+                take_nested_place(child, rest, full_place)
+            }
+        }
+        _ => Err(Diagnostic::new(format!(
+            "cannot move nested MIR place `{full_place}` from a non-instance value"
+        ))),
     }
-    let child = instance.fields.get_mut(&segments[0]).ok_or_else(|| {
-        Diagnostic::new(format!(
-            "class `{}` has no field `{}` in MIR place `{}`",
-            instance.class_name, segments[0], full_place
-        ))
-    })?;
-    take_nested_place(child, &segments[1..], full_place)
 }
 
 fn nested_place_mut<'a>(
@@ -1113,17 +1275,31 @@ fn nested_place_mut<'a>(
     let Some((segment, rest)) = segments.split_first() else {
         return Ok(value);
     };
-    let Value::Instance(instance) = value else {
-        return Err(Diagnostic::new(format!(
-            "cannot access nested MIR place `{full_place}` on a non-instance value"
-        )));
+    let child = match value {
+        Value::Instance(instance) => instance.fields.get_mut(segment).ok_or_else(|| {
+            Diagnostic::new(format!(
+                "class `{}` has no field `{}` in MIR place `{full_place}`",
+                instance.class_name, segment
+            ))
+        })?,
+        Value::Tuple(tuple) => {
+            let index = segment.parse::<usize>().map_err(|_| {
+                Diagnostic::new(format!(
+                    "tuple projection `{segment}` is not a fixed position in MIR place `{full_place}`"
+                ))
+            })?;
+            tuple.elements.get_mut(index).ok_or_else(|| {
+                Diagnostic::new(format!(
+                    "tuple MIR place `{full_place}` has no element at index {index}"
+                ))
+            })?
+        }
+        _ => {
+            return Err(Diagnostic::new(format!(
+                "cannot access nested MIR place `{full_place}` on a non-instance value"
+            )))
+        }
     };
-    let child = instance.fields.get_mut(segment).ok_or_else(|| {
-        Diagnostic::new(format!(
-            "class `{}` has no field `{}` in MIR place `{full_place}`",
-            instance.class_name, segment
-        ))
-    })?;
     nested_place_mut(child, rest, full_place)
 }
 
@@ -1636,6 +1812,7 @@ impl MirRuntime {
             task_ancestry: Vec::new(),
             return_type_stack: Vec::new(),
             constant_states: Arc::new(Mutex::new(HashMap::new())),
+            pending_returned_view_projection: None,
         }
     }
 
@@ -2562,6 +2739,87 @@ impl MirRuntime {
                 }
                 Ok(None)
             }
+            Instruction::BeginLoan {
+                loan,
+                source,
+                mutable,
+            } => {
+                env.begin_loan(loan, source, *mutable)?;
+                Ok(None)
+            }
+            Instruction::BeginReturnedLoan {
+                loan,
+                origin,
+                projections,
+                mutable,
+            } => {
+                let projection = self
+                    .pending_returned_view_projection
+                    .take()
+                    .ok_or_else(|| {
+                        Diagnostic::new(format!(
+                            "MIR returned loan `{loan}` has no transferred projection"
+                        ))
+                    })?;
+                if !projections.contains(&projection) {
+                    return Err(Diagnostic::new(format!(
+                        "MIR returned loan `{loan}` selected undeclared projection `{projection}`"
+                    )));
+                }
+                let source = if projection.is_empty() {
+                    origin.clone()
+                } else {
+                    format!("{origin}.{projection}")
+                };
+                env.begin_loan(loan, &source, *mutable)?;
+                Ok(None)
+            }
+            Instruction::Reborrow {
+                loan,
+                parent,
+                projection,
+                mutable,
+            } => {
+                let source = if projection.is_empty() {
+                    parent.clone()
+                } else {
+                    format!("{parent}.{projection}")
+                };
+                env.begin_loan(loan, &source, *mutable)?;
+                Ok(None)
+            }
+            Instruction::ReadLoan { target, loan } => {
+                let value = env.read_place(loan)?;
+                env.write_place(target, value)?;
+                Ok(None)
+            }
+            Instruction::WriteLoan { loan, value } => {
+                let target_ty = self.resolve_place_type(loan, env);
+                let evaluated =
+                    match self.evaluate_rvalue_for_target(value, env, target_ty.as_ref())? {
+                        RvalueOutcome::Value(value) => value,
+                        RvalueOutcome::SharedModuleConstant(value) => {
+                            try_clone_mir_value(value.as_ref())?
+                        }
+                        RvalueOutcome::Return(value) => return Ok(Some(value)),
+                    };
+                let evaluated = if let Some(target_ty) = target_ty {
+                    self.coerce_value_to_type(evaluated, &target_ty, None)?
+                } else {
+                    evaluated
+                };
+                env.write_place(loan, evaluated)?;
+                Ok(None)
+            }
+            Instruction::EndLoan { loan } => {
+                env.end_loan(loan)?;
+                Ok(None)
+            }
+            Instruction::ReturnLoan { loan, origin } => {
+                self.pending_returned_view_projection =
+                    Some(env.returned_view_projection(loan, origin)?);
+                Ok(None)
+            }
             Instruction::Assign { target, value } => {
                 let target_ty = self.resolve_place_type(target, env);
                 match self.evaluate_rvalue_for_target(value, env, target_ty.as_ref())? {
@@ -2946,6 +3204,8 @@ impl MirRuntime {
                         name: capture.name.clone(),
                         ty: capture.ty.clone(),
                         value: self.evaluate_owned_operand(&capture.value, env)?,
+                        source_place: capture.source_place.clone(),
+                        mutable: capture.passing == MirReceiverKind::BorrowMut,
                     });
                 }
                 let metadata = self.functions.get(function);
@@ -4564,12 +4824,18 @@ impl MirRuntime {
         if let Some(closure) = &function_value.closure_environment {
             let captures = closure.arguments(&function_value.name)?;
             let mut combined = Vec::with_capacity(captures.len() + evaluated_args.len());
-            combined.extend(captures.into_iter().map(|capture| EvaluatedMirArg {
-                name: None,
-                value: capture.value,
-                ty: Some(capture.ty),
-                writeback_place: None,
-            }));
+            for capture in captures {
+                let value = match &capture.source_place {
+                    Some(source) => env.read_place(source)?,
+                    None => capture.value,
+                };
+                combined.push(EvaluatedMirArg {
+                    name: None,
+                    value,
+                    ty: Some(capture.ty),
+                    writeback_place: capture.mutable.then_some(capture.source_place).flatten(),
+                });
+            }
             combined.append(&mut evaluated_args);
             let writeback_places = bind_function_writeback_places(&function.params, &combined)?;
             let outcome =

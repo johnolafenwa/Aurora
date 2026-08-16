@@ -80,6 +80,34 @@ fn p64_extern_c_functions_and_opaque_classes_are_bodyless_items() {
 }
 
 #[test]
+fn adr0038_parser_rejects_invalid_view_returns_and_capture_lists() {
+    let extern_view = parse("extern \"C\" def borrowed(value: int64) -> view int64 from value\n")
+        .expect_err("FFI declarations cannot expose Aura view returns");
+    assert_eq!(
+        extern_view.message,
+        "`extern` functions cannot return Aura views"
+    );
+
+    let missing_origin = parse("def borrowed(value: int64) -> view int64:\n    pass\n")
+        .expect_err("view return annotations require an origin");
+    assert_eq!(
+        missing_origin.message,
+        "a view return type requires `from` and one receiver or parameter origin"
+    );
+
+    let duplicate =
+        parse_expression("lambda [value, value]: value").expect_err("capture names must be unique");
+    assert_eq!(duplicate.message, "duplicate lambda capture `value`");
+
+    let trailing = parse_expression("lambda [value,]: value")
+        .expect_err("capture lists reject a trailing comma");
+    assert_eq!(
+        trailing.message,
+        "expected a capture name after `,` in lambda capture list"
+    );
+}
+
+#[test]
 fn p64_extern_declarations_reject_unsupported_abis_bodies_and_defaults() {
     let abi = parse("extern \"Rust\" def local() -> int32\n")
         .expect_err("FFI v0 supports only the C ABI");
@@ -159,7 +187,7 @@ fn p64_extern_declarations_reserve_variadics_callbacks_and_raw_pointers() {
 fn p63_lambda_parameters_are_contextual_and_the_body_is_an_expression() {
     let lambda = parse_expression("lambda value, own text, mut output: output")
         .expect("lambda with all supported parameter modes should parse");
-    let ExprKind::Lambda { params, body } = lambda.kind else {
+    let ExprKind::Lambda { params, body, .. } = lambda.kind else {
         panic!("expected lambda expression");
     };
     assert!(matches!(
@@ -187,7 +215,7 @@ fn p63_lambda_parameters_are_contextual_and_the_body_is_an_expression() {
     let no_params = parse_expression("lambda: 42").expect("zero-parameter lambda should parse");
     assert!(matches!(
         no_params.kind,
-        ExprKind::Lambda { ref params, ref body }
+        ExprKind::Lambda { ref params, ref body, .. }
             if params.is_empty() && matches!(body.kind, ExprKind::Int(42))
     ));
 
@@ -195,7 +223,7 @@ fn p63_lambda_parameters_are_contextual_and_the_body_is_an_expression() {
         .expect("contextual identifier parameter should parse");
     assert!(matches!(
         contextual_name.kind,
-        ExprKind::Lambda { ref params, ref body }
+        ExprKind::Lambda { ref params, ref body, .. }
             if params[0].name == "from"
                 && matches!(body.kind, ExprKind::Name(ref name) if name == "from")
     ));
@@ -998,7 +1026,7 @@ fn comprehension_iterables_and_filters_preserve_unparenthesized_lambda_ast() {
         [ComprehensionClause {
             iterable:
                 Expr {
-                    kind: ExprKind::Lambda { params, body },
+                    kind: ExprKind::Lambda { params, body, .. },
                     ..
                 },
             ..
@@ -1017,7 +1045,7 @@ fn comprehension_iterables_and_filters_preserve_unparenthesized_lambda_ast() {
             if matches!(
                 filters.as_slice(),
                 [Expr {
-                    kind: ExprKind::Lambda { params, body },
+                    kind: ExprKind::Lambda { params, body, .. },
                     ..
                 }] if matches!(
                     params.as_slice(),
@@ -3261,6 +3289,7 @@ fn fstring_map_comprehension_preserves_exact_nested_source_spans() {
     let ExprKind::Lambda {
         params: lambda_params,
         body,
+        ..
     } = &args[0].value.kind
     else {
         panic!("expected the specialized call argument to be a lambda");

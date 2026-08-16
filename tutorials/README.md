@@ -54,10 +54,12 @@ The current tutorial set covers:
   types, copy and `Transfer` semantics, indirect calls, storage, and task
   targets
 - contextually typed expression lambdas with by-value Copy/non-Copy capture,
-  repeatable reads, consuming single-use calls, and structural Transfer
+  exhaustive shared/mutable/owned capture lists, repeatable shared/mutable
+  calls, consuming single-use calls, and structural Transfer
 - classes with fields, default values, receiver forms, mutating methods, and `public` field syntax
 - ownership, declaration-stable parameter defaults, explicit `own`, move
-  semantics, copy types, and the exclusivity rule for mutable borrows
+  semantics, copy types, place-based shared/mutable views, returned views,
+  reborrowing, inferred loan lifetimes, and exclusivity
 - owned `list[T]`, `dict[K, V]`, and `set[T]` collections with literals,
   storing APIs, bare-shared/`own` iteration, mutable list iteration, stable
   sorting, eager callback-powered `map`/`filter`, and eager owned list/set/dictionary

@@ -191,6 +191,11 @@ pub const DIAGNOSTIC_CODE_REGISTRY: &[DiagnosticCodeInfo] = &[
         title: "single-consumer task-result duplication",
     },
     DiagnosticCodeInfo {
+        code: "AU3010",
+        band: "ownership",
+        title: "view escape or returned-origin violation",
+    },
+    DiagnosticCodeInfo {
         code: "AU4001",
         band: "runtime",
         title: "runtime trap",
