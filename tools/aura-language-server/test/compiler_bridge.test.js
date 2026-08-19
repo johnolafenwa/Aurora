@@ -5407,16 +5407,236 @@ test("compiler bridge exposes ADR-0038 view provenance and returned-view contrac
       "returned-view function hover should retain its origin contract"
     );
     const display = analysis.occurrences.find((occurrence) =>
-      occurrence.hover.includes("view display: str from <place>")
+      occurrence.hover.includes("view display: str from user")
     );
     assert.ok(display, "local view hover should expose kind, pointee type, and provenance");
     assert.ok(display.definition, "a view use should navigate to its source place");
+    assert.deepEqual(display.definition, {
+      line: 7,
+      start_character: 4,
+      end_character: 8,
+      file_path: path.join(fs.realpathSync(tempRoot), "main.au")
+    });
     assert.ok(
       analysis.symbols.some(
         (symbol) => symbol.name === "name" && symbol.detail === "view str from user"
       ),
       "document symbols should expose returned-view metadata"
     );
+
+    const captureLines = [
+      "def main():",
+      "    mut values = [1]",
+      "    mut update: def(int64) -> None = lambda [mut values] item: values.append(item)",
+      "    update(2)",
+      ""
+    ];
+    const captureAnalysis = await analyzeWithCompiler(mainUri, captureLines.join("\n"));
+    assert.ok(captureAnalysis);
+    assert.deepEqual(captureAnalysis.diagnostics, []);
+    const captureStart = captureLines[2].indexOf("values");
+    const capture = captureAnalysis.occurrences.find(
+      (occurrence) => occurrence.line === 2 && occurrence.start_character === captureStart
+    );
+    assert.equal(capture?.hover, "```aura\nbinding values: list[int64]\n```");
+    assert.deepEqual(capture?.definition, {
+      line: 1,
+      start_character: 8,
+      end_character: 14,
+      file_path: path.join(fs.realpathSync(tempRoot), "main.au")
+    });
+
+    const partialCapture = captureLines
+      .join("\n")
+      .replace("[mut values]", "[mut val]");
+    const captureCursor = captureLines[2].indexOf("values") + "val".length;
+    const captureCompletions = await completeWithCompiler(
+      mainUri,
+      partialCapture,
+      2,
+      captureCursor,
+      null
+    );
+    assert.ok(captureCompletions.some((item) => item.name === "values"));
+
+    const multilineCapture = [
+      "def main():",
+      "    values = [1]",
+      "    callback: def() -> int64 = lambda [",
+      "        val",
+      "    ]: values.len()",
+      ""
+    ].join("\n");
+    const multilineCompletions = await completeWithCompiler(
+      mainUri,
+      multilineCapture,
+      3,
+      11,
+      null
+    );
+    assert.ok(
+      multilineCompletions.some((item) => item.name === "values"),
+      "multiline capture completion should retain the enclosing scope"
+    );
+
+    const forwardingSource = [
+      "class User:",
+      "    name: str",
+      "",
+      "def name(user: User) -> view str from user:",
+      "    return view user.name",
+      "",
+      "def identity(user: User) -> view str from user:",
+      "    return view name(user)",
+      "",
+      "def main():",
+      "    user = User(name=\"Ada\")",
+      "    view grouped = (name(user))",
+      "    view forwarded = identity(user)",
+      "    print(grouped)",
+      "    print(forwarded)",
+      ""
+    ].join("\n");
+    const forwardingAnalysis = await analyzeWithCompiler(mainUri, forwardingSource);
+    assert.ok(forwardingAnalysis);
+    assert.deepEqual(forwardingAnalysis.diagnostics, []);
+    for (const binding of ["grouped", "forwarded"]) {
+      const occurrence = forwardingAnalysis.occurrences.find((candidate) =>
+        candidate.hover.includes(`view ${binding}: str from user`)
+      );
+      assert.ok(occurrence, `${binding} should expose transitive view provenance`);
+      assert.equal(occurrence.definition?.line, 10);
+      assert.equal(occurrence.definition?.start_character, 4);
+    }
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("compiler bridge completes capture boundaries and resolves bounded returned-view methods", async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "aura-lsp-adr0038-analysis-"));
+
+  try {
+    setWorkspaceRoots([repoRoot, tempRoot]);
+    const mainPath = path.join(tempRoot, "main.au");
+    const mainUri = `file://${mainPath}`;
+
+    const captureLines = [
+      "def main():",
+      "    values = [1]",
+      "    callback: def() -> int64 = lambda [",
+      "    ]: values.len()",
+      ""
+    ];
+    const captureSource = captureLines.join("\n");
+    for (const [line, character, boundary] of [
+      [2, captureLines[2].length, "after the capture opener"],
+      [3, captureLines[3].indexOf("]"), "before the capture closer"]
+    ]) {
+      const completions = await completeWithCompiler(
+        mainUri,
+        captureSource,
+        line,
+        character,
+        null
+      );
+      assert.ok(
+        completions.some((item) => item.name === "values"),
+        `missing enclosing capture completion ${boundary}`
+      );
+    }
+
+    const traitLines = [
+      "trait Project:",
+      "    def get(self) -> view int64 from self",
+      "",
+      "def borrow[T: Project](value: T) -> view int64 from value:",
+      "    return view value.get()",
+      ""
+    ];
+    const traitSource = traitLines.join("\n");
+    const analysis = await analyzeWithCompiler(mainUri, traitSource);
+    assert.ok(analysis);
+    assert.deepEqual(analysis.diagnostics, []);
+
+    const methodUse = traitLines[4].lastIndexOf("get");
+    assert.deepEqual(compilerHoverAtPosition(analysis, 4, methodUse + 1), {
+      value: "```aura\nmethod get(self) -> view int64 from self\n```",
+      range: {
+        start: { line: 4, character: methodUse },
+        end: { line: 4, character: methodUse + "get".length }
+      }
+    });
+    const definition = compilerDefinitionAtPosition(mainUri, analysis, 4, methodUse + 1);
+    assert.deepEqual(definition, {
+      uri: `file://${path.join(fs.realpathSync(tempRoot), "main.au")}`,
+      range: {
+        start: { line: 1, character: traitLines[1].indexOf("def") },
+        end: {
+          line: 1,
+          character: traitLines[1].indexOf("def") + "get".length
+        }
+      }
+    });
+
+    const genericMethodLines = [
+      "class Picker:",
+      "    marker: int64",
+      "",
+      "    def borrow[T](self, value: T) -> view T from value:",
+      "        return view value",
+      "",
+      "def main():",
+      "    picker = Picker(marker=0)",
+      "    inferred_source = 1",
+      "    explicit_source = 2",
+      "    grouped_source = 3",
+      "    view inferred = picker.borrow(inferred_source)",
+      "    view explicit = picker.borrow[int64](explicit_source)",
+      "    view grouped = (picker.borrow[int64])(grouped_source)",
+      "    print(inferred)",
+      "    print(explicit)",
+      "    print(grouped)",
+      ""
+    ];
+    const genericMethodSource = genericMethodLines.join("\n");
+    const genericAnalysis = await analyzeWithCompiler(mainUri, genericMethodSource);
+    assert.ok(genericAnalysis);
+    assert.deepEqual(genericAnalysis.diagnostics, []);
+
+    for (const [binding, origin, originLine] of [
+      ["inferred", "inferred_source", 8],
+      ["explicit", "explicit_source", 9],
+      ["grouped", "grouped_source", 10]
+    ]) {
+      const occurrence = genericAnalysis.occurrences.find((candidate) =>
+        candidate.hover.includes(`view ${binding}:`)
+      );
+      assert.equal(
+        occurrence?.hover,
+        `\`\`\`aura\nview ${binding}: int64 from ${origin}\n\`\`\``
+      );
+      assert.deepEqual(occurrence?.definition, {
+        line: originLine,
+        start_character: genericMethodLines[originLine].indexOf(origin),
+        end_character: genericMethodLines[originLine].indexOf(origin) + origin.length,
+        file_path: path.join(fs.realpathSync(tempRoot), "main.au")
+      });
+
+      const completionLine = genericMethodLines.length - 1;
+      const completionSource = `${genericMethodSource}    ${binding}.`;
+      const completions = await completeWithCompiler(
+        mainUri,
+        completionSource,
+        completionLine,
+        `    ${binding}.`.length,
+        "."
+      );
+      assert.ok(
+        completions.some((item) => item.name === "to_float"),
+        `${binding} should retain int64 member completion after method substitution`
+      );
+    }
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }

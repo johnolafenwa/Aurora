@@ -104,6 +104,106 @@ def main():
     )
     .expect("view source should lower for direct codegen");
     emit_host_object(&module).expect("direct codegen should preserve view place identity");
+
+    let generic_trait = lower_source_to_mir(
+        r#"
+trait Project:
+    def get(self) -> view int64 from self
+
+class Box:
+    value: int64
+
+impl Project for Box:
+    def get(self) -> view int64 from self:
+        return view self.value
+
+def read[T: Project](item: T) -> int64:
+    view alias = item.get()
+    return alias + 0
+
+def main():
+    print(read(Box(value=7)))
+"#,
+    )
+    .expect("generic returned-view trait call should lower");
+    emit_host_object(&generic_trait)
+        .expect("generic returned-view trait calls should compile through the direct backend");
+
+    let reviewed_edges = lower_source_to_mir(
+        r#"
+class Pair:
+    left: int64
+
+def inner(value: int64) -> view int64 from value:
+    return view value
+
+def outer(value: int64) -> view int64 from value:
+    view alias = inner(value)
+    return view alias
+
+def field(pair: Pair) -> view int64 from pair:
+    view parent = pair
+    view child = parent.left
+    return view child
+
+def cleanup(value: int64) -> view int64 from value:
+    with TaskGroup() as group:
+        return view value
+
+def main():
+    mut value = 1
+    view alias = value
+    if true:
+        print(alias)
+        value = 2
+    view current = outer(value)
+    get: def() -> int64 = lambda [current]: current
+    print(get())
+    pair = ("Ada", "Grace")
+    view first = pair[0]
+    print(first)
+    item = Pair(left=7)
+    view selected = field(item)
+    print(selected)
+    view cleaned = cleanup(value)
+    print(cleaned)
+"#,
+    )
+    .expect("reviewed nested lifetime and returned-view edges should lower");
+    emit_host_object(&reviewed_edges)
+        .expect("reviewed nested lifetime and returned-view edges should compile directly");
+}
+
+#[test]
+fn adr0038_loop_local_mutable_closure_writeback_compiles_directly() {
+    let module = lower_source_to_mir(
+        r#"
+def add(total: mut int64, item: int64):
+    total = total + item
+
+def main():
+    mut total = 0
+    for item in [1, 2]:
+        mut bump = lambda [mut total, item]: add(total, item)
+        bump()
+    print(total)
+"#,
+    )
+    .expect("loop-local mutable closure source should lower");
+
+    emit_host_object(&module)
+        .expect("ended loop-local closure metadata must not poison the loop backedge");
+
+    let mut reversed = module;
+    reversed
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .expect("loop source should contain main")
+        .blocks
+        .reverse();
+    emit_host_object(&reversed)
+        .expect("loop closure liveness must not depend on MIR block storage order");
 }
 
 #[test]
@@ -183,7 +283,7 @@ def invalid(pair: mut Pair, other: mut Pair) -> view mut int64 from pair:
     let error = emit_host_object(&escaped)
         .expect_err("direct returned loans must remain within their declared origin");
     assert!(
-        error.contains("has no projection within origin `other`"),
+        error.contains("resolves outside origin `other`"),
         "unexpected error: {error}"
     );
 }
@@ -1426,6 +1526,83 @@ fn handbuilt_mir_safepoint_validates_and_emits_for_a_sequential_module() {
             .iter()
             .any(|symbol| symbol.contains("aura_direct_yield_now")),
         "hand-built sequential MIR must receive the same static elision: {referenced:?}"
+    );
+}
+
+#[test]
+fn dead_task_starts_do_not_enable_reachable_native_safepoints() {
+    let worker = MirFunction {
+        name: "worker".to_string(),
+        module_name: "<test>".to_string(),
+        source_path: None,
+        span: Span::new(1, 1),
+        receiver: None,
+        params: Vec::new(),
+        local_types: Vec::new(),
+        return_type: Type::Unit,
+        entry: "entry".to_string(),
+        blocks: vec![BasicBlock {
+            label: "entry".to_string(),
+            instructions: Vec::new(),
+            terminator: Terminator::Return(Operand::Unit),
+        }],
+    };
+    let main = MirFunction {
+        name: "main".to_string(),
+        module_name: "<test>".to_string(),
+        source_path: None,
+        span: Span::new(1, 1),
+        receiver: None,
+        params: Vec::new(),
+        local_types: Vec::new(),
+        return_type: Type::named("int32"),
+        entry: "entry".to_string(),
+        blocks: vec![
+            BasicBlock {
+                label: "entry".to_string(),
+                instructions: vec![Instruction::Safepoint],
+                terminator: Terminator::Return(Operand::Int(0)),
+            },
+            BasicBlock {
+                label: "dead".to_string(),
+                instructions: vec![Instruction::Assign {
+                    target: "dead_task".to_string(),
+                    value: Rvalue::StartTask {
+                        returns_handle: false,
+                        result_is_copy: true,
+                        stack_size: None,
+                        task_group: Operand::Unit,
+                        function: Operand::Function {
+                            name: "worker".to_string(),
+                            signature: Box::new(Type::Function {
+                                params: Vec::new(),
+                                return_type: Box::new(Type::Unit),
+                            }),
+                        },
+                        args: Vec::new(),
+                        span: Span::new(1, 1),
+                    },
+                }],
+                terminator: Terminator::Return(Operand::Int(0)),
+            },
+        ],
+    };
+    let module = crate::mir::MirModule {
+        constants: Vec::new(),
+        functions: vec![main, worker],
+        classes: Vec::new(),
+        trait_impls: Vec::new(),
+        top_level: None,
+    };
+
+    let object = emit_host_object(&module)
+        .expect("a dead task start must not contaminate reachable safepoint lowering");
+    let referenced = object_referenced_symbols(&object);
+    assert!(
+        !referenced
+            .iter()
+            .any(|symbol| symbol.contains("aura_direct_yield_now")),
+        "unreachable task metadata must not enable scheduler calls: {referenced:?}"
     );
 }
 
@@ -2953,35 +3130,35 @@ fn direct_backend_scalar_bool_range_and_coercion_paths_compile() {
             params: Vec::new(),
             local_types: vec![
                 MirLocalType {
-                    name: "%left".to_string(),
+                    name: "test_left".to_string(),
                     ty: Type::named("bool"),
                 },
                 MirLocalType {
-                    name: "%right".to_string(),
+                    name: "test_right".to_string(),
                     ty: Type::named("bool"),
                 },
                 MirLocalType {
-                    name: "%and".to_string(),
+                    name: "test_and".to_string(),
                     ty: Type::named("bool"),
                 },
                 MirLocalType {
-                    name: "%or".to_string(),
+                    name: "test_or".to_string(),
                     ty: Type::named("bool"),
                 },
                 MirLocalType {
-                    name: "%range".to_string(),
+                    name: "test_range".to_string(),
                     ty: Type::named("Range"),
                 },
                 MirLocalType {
-                    name: "%int_as_bool".to_string(),
+                    name: "test_int_as_bool".to_string(),
                     ty: Type::named("bool"),
                 },
                 MirLocalType {
-                    name: "%int32_value".to_string(),
+                    name: "test_int32_value".to_string(),
                     ty: Type::named("int32"),
                 },
                 MirLocalType {
-                    name: "%unit_as_int".to_string(),
+                    name: "test_unit_as_int".to_string(),
                     ty: Type::named("int32"),
                 },
             ],
@@ -2991,33 +3168,33 @@ fn direct_backend_scalar_bool_range_and_coercion_paths_compile() {
                 label: "entry".to_string(),
                 instructions: vec![
                     Instruction::Assign {
-                        target: "%left".to_string(),
+                        target: "test_left".to_string(),
                         value: Rvalue::Use(Operand::Bool(true)),
                     },
                     Instruction::Assign {
-                        target: "%right".to_string(),
+                        target: "test_right".to_string(),
                         value: Rvalue::Use(Operand::Bool(false)),
                     },
                     Instruction::Assign {
-                        target: "%and".to_string(),
+                        target: "test_and".to_string(),
                         value: Rvalue::Binary {
                             op: BinaryOp::And,
-                            left: Operand::Place("%left".to_string()),
-                            right: Operand::Place("%right".to_string()),
+                            left: Operand::Place("test_left".to_string()),
+                            right: Operand::Place("test_right".to_string()),
                             span: Span::new(1, 1),
                         },
                     },
                     Instruction::Assign {
-                        target: "%or".to_string(),
+                        target: "test_or".to_string(),
                         value: Rvalue::Binary {
                             op: BinaryOp::Or,
-                            left: Operand::Place("%left".to_string()),
-                            right: Operand::Place("%right".to_string()),
+                            left: Operand::Place("test_left".to_string()),
+                            right: Operand::Place("test_right".to_string()),
                             span: Span::new(1, 1),
                         },
                     },
                     Instruction::Assign {
-                        target: "%range".to_string(),
+                        target: "test_range".to_string(),
                         value: Rvalue::Call {
                             callee: CallTarget::Name("range".to_string()),
                             args: vec![
@@ -3040,15 +3217,15 @@ fn direct_backend_scalar_bool_range_and_coercion_paths_compile() {
                         },
                     },
                     Instruction::Assign {
-                        target: "%int32_value".to_string(),
+                        target: "test_int32_value".to_string(),
                         value: Rvalue::Use(Operand::Int(1)),
                     },
                     Instruction::Assign {
-                        target: "%int_as_bool".to_string(),
-                        value: Rvalue::Use(Operand::Place("%int32_value".to_string())),
+                        target: "test_int_as_bool".to_string(),
+                        value: Rvalue::Use(Operand::Place("test_int32_value".to_string())),
                     },
                     Instruction::Assign {
-                        target: "%unit_as_int".to_string(),
+                        target: "test_unit_as_int".to_string(),
                         value: Rvalue::Use(Operand::Unit),
                     },
                 ],
@@ -3148,6 +3325,47 @@ fn direct_backend_internal_collection_member_errors_are_reported() {
             "expected `{expected}` in `{error}`"
         );
     }
+}
+
+#[test]
+fn malformed_uncalled_array_slice_reports_a_direct_diagnostic_without_panicking() {
+    let mut module = module_with_main_member_call_result_type(
+        "values",
+        Type::Named("Array".to_string(), vec![Type::named("int32")]),
+        Rvalue::Use(Operand::String("opaque-array".to_string())),
+        Type::Named("Array".to_string(), vec![Type::named("int32")]),
+        "__slice",
+        Vec::new(),
+    );
+    module.functions[0].name = "unused_slice".to_string();
+    module.functions.push(MirFunction {
+        name: "main".to_string(),
+        module_name: "<test>".to_string(),
+        source_path: None,
+        span: Span::new(1, 1),
+        receiver: None,
+        params: Vec::new(),
+        local_types: Vec::new(),
+        return_type: Type::named("int32"),
+        entry: "entry".to_string(),
+        blocks: vec![BasicBlock {
+            label: "entry".to_string(),
+            instructions: Vec::new(),
+            terminator: Terminator::Return(Operand::Int(0)),
+        }],
+    });
+
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| emit_host_object(&module)));
+    let error = result
+        .expect("malformed public Array slicing MIR must never panic")
+        .expect_err("malformed public Array slicing MIR must be rejected before codegen");
+    assert!(
+        error.contains("internal slicing")
+            && error.contains("start presence")
+            && error.contains("end presence"),
+        "unexpected Array slicing diagnostic: {error}"
+    );
 }
 
 #[test]
@@ -6037,7 +6255,7 @@ fn direct_backend_wait_helpers_cover_unknown_task_payload_fallback() {
                     ty: string_vec.clone(),
                 },
                 MirLocalType {
-                    name: "%wait".to_string(),
+                    name: "wait_result".to_string(),
                     ty: Type::Named("WaitAll".to_string(), vec![Type::named("Unknown")]),
                 },
             ],
@@ -6054,7 +6272,7 @@ fn direct_backend_wait_helpers_cover_unknown_task_payload_fallback() {
                         },
                     },
                     Instruction::Assign {
-                        target: "%wait".to_string(),
+                        target: "wait_result".to_string(),
                         value: Rvalue::Call {
                             callee: CallTarget::Name("wait_all".to_string()),
                             args: vec![MirArg {
@@ -6793,24 +7011,38 @@ fn native_codegen_function_value_signature_errors_are_precise() {
                     span: Span::new(4, 1),
                     receiver: None,
                     params: Vec::new(),
-                    local_types: vec![MirLocalType {
-                        name: "%result".to_string(),
-                        ty: Type::named("int32"),
-                    }],
+                    local_types: vec![
+                        MirLocalType {
+                            name: "worker_value".to_string(),
+                            ty: signature.clone(),
+                        },
+                        MirLocalType {
+                            name: "call_result".to_string(),
+                            ty: Type::named("int32"),
+                        },
+                    ],
                     return_type: Type::named("int32"),
                     entry: "entry".to_string(),
                     blocks: vec![BasicBlock {
                         label: "entry".to_string(),
-                        instructions: vec![Instruction::Assign {
-                            target: "%result".to_string(),
-                            value: Rvalue::Call {
-                                callee: CallTarget::Value(Operand::Function {
+                        instructions: vec![
+                            Instruction::Assign {
+                                target: "worker_value".to_string(),
+                                value: Rvalue::Use(Operand::Function {
                                     name: "worker".to_string(),
                                     signature: Box::new(signature),
                                 }),
-                                args,
                             },
-                        }],
+                            Instruction::Assign {
+                                target: "call_result".to_string(),
+                                value: Rvalue::Call {
+                                    callee: CallTarget::Value(Operand::Place(
+                                        "worker_value".to_string(),
+                                    )),
+                                    args,
+                                },
+                            },
+                        ],
                         terminator: Terminator::Return(Operand::Int(0)),
                     }],
                 },
@@ -7466,7 +7698,7 @@ fn direct_backend_match_and_branch_terminator_edges_cover_enum_and_opaque_paths(
             receiver: None,
             params: Vec::new(),
             local_types: vec![MirLocalType {
-                name: "%maybe".to_string(),
+                name: "maybe".to_string(),
                 ty: Type::Named("Option".to_string(), vec![Type::named("int32")]),
             }],
             return_type: Type::named("int32"),
@@ -7475,7 +7707,7 @@ fn direct_backend_match_and_branch_terminator_edges_cover_enum_and_opaque_paths(
                 BasicBlock {
                     label: "entry".to_string(),
                     instructions: vec![Instruction::Assign {
-                        target: "%maybe".to_string(),
+                        target: "maybe".to_string(),
                         value: Rvalue::EnumVariant {
                             enum_name: "Option".to_string(),
                             variant_name: "Some".to_string(),
@@ -7483,7 +7715,7 @@ fn direct_backend_match_and_branch_terminator_edges_cover_enum_and_opaque_paths(
                         },
                     }],
                     terminator: Terminator::Match {
-                        scrutinee: Operand::Place("%maybe".to_string()),
+                        scrutinee: Operand::Place("maybe".to_string()),
                         arms: vec![MirMatchArm {
                             enum_name: None,
                             variant_name: None,
@@ -7602,7 +7834,7 @@ fn direct_backend_match_and_branch_terminator_edges_cover_enum_and_opaque_paths(
             receiver: None,
             params: Vec::new(),
             local_types: vec![MirLocalType {
-                name: "%module".to_string(),
+                name: "module_value".to_string(),
                 ty: Type::Module("pkg.tools".to_string()),
             }],
             return_type: Type::named("int32"),
@@ -7611,11 +7843,11 @@ fn direct_backend_match_and_branch_terminator_edges_cover_enum_and_opaque_paths(
                 BasicBlock {
                     label: "entry".to_string(),
                     instructions: vec![Instruction::Assign {
-                        target: "%module".to_string(),
+                        target: "module_value".to_string(),
                         value: Rvalue::Use(Operand::Unit),
                     }],
                     terminator: Terminator::Match {
-                        scrutinee: Operand::Place("%module".to_string()),
+                        scrutinee: Operand::Place("module_value".to_string()),
                         arms: Vec::new(),
                         otherwise: "other".to_string(),
                     },
@@ -7709,26 +7941,26 @@ def main() -> int32:
         .find(|function| function.name == "main")
         .expect("main function should exist");
     main.local_types.push(MirLocalType {
-        name: "%group".to_string(),
+        name: "test_group".to_string(),
         ty: Type::named("TaskGroup"),
     });
     main.blocks = vec![BasicBlock {
         label: "entry".to_string(),
         instructions: vec![
             Instruction::Assign {
-                target: "%group".to_string(),
+                target: "test_group".to_string(),
                 value: Rvalue::Call {
                     callee: CallTarget::Name("TaskGroup".to_string()),
                     args: vec![],
                 },
             },
             Instruction::Assign {
-                target: "%task".to_string(),
+                target: "test_task".to_string(),
                 value: Rvalue::StartTask {
                     returns_handle: true,
                     result_is_copy: true,
                     stack_size: None,
-                    task_group: Operand::Place("%group".to_string()),
+                    task_group: Operand::Place("test_group".to_string()),
                     function: test_function_operand(
                         "worker",
                         vec![Type::named("int32")],
@@ -7746,7 +7978,7 @@ def main() -> int32:
         terminator: Terminator::Return(Operand::Int(0)),
     }];
     main.local_types.push(MirLocalType {
-        name: "%task".to_string(),
+        name: "test_task".to_string(),
         ty: Type::Named("Task".to_string(), vec![Type::named("int32")]),
     });
 
@@ -7806,12 +8038,12 @@ def main() -> int32:
         .find(|function| function.name == "main")
         .expect("main function should exist");
     borrowed_main_mut.blocks[0].instructions[1] = Instruction::Assign {
-        target: "%task".to_string(),
+        target: "test_task".to_string(),
         value: Rvalue::StartTask {
             returns_handle: true,
             result_is_copy: true,
             stack_size: None,
-            task_group: Operand::Place("%group".to_string()),
+            task_group: Operand::Place("test_group".to_string()),
             function: test_function_operand(
                 "worker",
                 vec![Type::named("int32")],
@@ -7888,12 +8120,12 @@ def main() -> int32:
             .find(|function| function.name == "main")
             .expect("main function should exist");
         invalid_main.blocks[0].instructions[1] = Instruction::Assign {
-            target: "%task".to_string(),
+            target: "test_task".to_string(),
             value: Rvalue::StartTask {
                 returns_handle: true,
                 result_is_copy: true,
                 stack_size: None,
-                task_group: Operand::Place("%group".to_string()),
+                task_group: Operand::Place("test_group".to_string()),
                 function: named_worker.clone(),
                 args,
                 span: Span::new(1, 1),
@@ -8768,7 +9000,10 @@ fn direct_backend_operand_and_construct_error_surface_reports_expected_diagnosti
     let empty_place_module = module_with_main_call(Rvalue::Use(Operand::Place(String::new())));
     let empty_place_error =
         emit_host_object(&empty_place_module).expect_err("empty places should be rejected");
-    assert!(empty_place_error.contains("does not know local"));
+    assert!(
+        empty_place_error.contains("empty MIR place"),
+        "unexpected empty-place diagnostic: {empty_place_error}"
+    );
 
     let stray_pop_cleanup_module = crate::mir::MirModule {
         constants: Vec::new(),
@@ -9095,7 +9330,7 @@ fn native_codegen_reports_invalid_non_boolean_branch_conditions() {
             receiver: None,
             params: Vec::new(),
             local_types: vec![MirLocalType {
-                name: "%cond".to_string(),
+                name: "condition".to_string(),
                 ty: Type::named("float64"),
             }],
             return_type: Type::named("int32"),
@@ -9104,11 +9339,11 @@ fn native_codegen_reports_invalid_non_boolean_branch_conditions() {
                 BasicBlock {
                     label: "entry".to_string(),
                     instructions: vec![Instruction::Assign {
-                        target: "%cond".to_string(),
+                        target: "condition".to_string(),
                         value: Rvalue::Use(Operand::Float(1.25)),
                     }],
                     terminator: Terminator::Branch {
-                        condition: Operand::Place("%cond".to_string()),
+                        condition: Operand::Place("condition".to_string()),
                         then_label: "then".to_string(),
                         else_label: "else".to_string(),
                     },
@@ -9148,11 +9383,11 @@ fn native_codegen_rejects_try_between_non_result_types() {
             params: Vec::new(),
             local_types: vec![
                 MirLocalType {
-                    name: "%source".to_string(),
+                    name: "source".to_string(),
                     ty: Type::named("int32"),
                 },
                 MirLocalType {
-                    name: "%target".to_string(),
+                    name: "target".to_string(),
                     ty: Type::named("int32"),
                 },
             ],
@@ -9162,13 +9397,13 @@ fn native_codegen_rejects_try_between_non_result_types() {
                 label: "entry".to_string(),
                 instructions: vec![
                     Instruction::Assign {
-                        target: "%source".to_string(),
+                        target: "source".to_string(),
                         value: Rvalue::Use(Operand::Int(1)),
                     },
                     Instruction::Assign {
-                        target: "%target".to_string(),
+                        target: "target".to_string(),
                         value: Rvalue::Try {
-                            value: Operand::Place("%source".to_string()),
+                            value: Operand::Place("source".to_string()),
                         },
                     },
                 ],
@@ -13082,6 +13317,57 @@ fn validate_function_rejects_unreachable_terminators_for_direct_backend() {
 }
 
 #[test]
+fn direct_codegen_ignores_dead_cleanup_and_terminator_metadata_but_checks_cfg_structure() {
+    let function = MirFunction {
+        name: "main".to_string(),
+        module_name: "<test>".to_string(),
+        source_path: None,
+        span: Span::new(1, 1),
+        receiver: None,
+        params: Vec::new(),
+        local_types: Vec::new(),
+        return_type: Type::named("int32"),
+        entry: "entry".to_string(),
+        blocks: vec![
+            BasicBlock {
+                label: "entry".to_string(),
+                instructions: Vec::new(),
+                terminator: Terminator::Return(Operand::Int(0)),
+            },
+            BasicBlock {
+                label: "dead".to_string(),
+                instructions: vec![Instruction::PushCleanup {
+                    place: "missing".to_string(),
+                }],
+                terminator: Terminator::Unreachable,
+            },
+        ],
+    };
+    let module = crate::mir::MirModule {
+        constants: Vec::new(),
+        functions: vec![function.clone()],
+        classes: Vec::new(),
+        trait_impls: Vec::new(),
+        top_level: None,
+    };
+
+    validate_function(&function, &HashMap::new())
+        .expect("unreachable backend-only metadata must not be validated as executable MIR");
+    emit_host_object(&module)
+        .expect("dead cleanup discovery must not declare or define an unreachable cleanup thunk");
+
+    let mut malformed = module;
+    malformed.functions[0].blocks[1].terminator = Terminator::Goto("missing".to_string());
+    let error = emit_host_object(&malformed)
+        .expect_err("structural validation must still inspect successors on dead blocks");
+    assert!(
+        error.contains("targets unknown block `missing`")
+            || error.contains("branches to unknown block `missing`"),
+        "unexpected structural CFG diagnostic: {error}"
+    );
+}
+
+#[test]
 fn native_codegen_constructor_initializes_runtime_function_surface() {
     let module = crate::mir::MirModule {
         constants: Vec::new(),
@@ -13249,6 +13535,78 @@ fn close_function(class_name: &str) -> MirFunction {
             terminator: Terminator::Return(Operand::Unit),
         }],
     }
+}
+
+#[test]
+fn dead_assignments_do_not_poison_reachable_cleanup_type_inference() {
+    let main = MirFunction {
+        name: "main".to_string(),
+        module_name: "<test>".to_string(),
+        source_path: None,
+        span: Span::new(1, 1),
+        receiver: None,
+        params: Vec::new(),
+        local_types: Vec::new(),
+        return_type: Type::named("int32"),
+        entry: "entry".to_string(),
+        blocks: vec![
+            BasicBlock {
+                label: "dead".to_string(),
+                instructions: vec![Instruction::Assign {
+                    target: "resource".to_string(),
+                    value: Rvalue::Use(Operand::Int(0)),
+                }],
+                terminator: Terminator::Return(Operand::Int(0)),
+            },
+            BasicBlock {
+                label: "entry".to_string(),
+                instructions: vec![
+                    Instruction::Assign {
+                        target: "resource".to_string(),
+                        value: Rvalue::Construct {
+                            class_name: "Resource".to_string(),
+                            fields: vec![crate::mir::MirFieldInit {
+                                name: "value".to_string(),
+                                value: Operand::Int(1),
+                            }],
+                        },
+                    },
+                    Instruction::PushCleanup {
+                        place: "resource".to_string(),
+                    },
+                ],
+                terminator: Terminator::AssertFail {
+                    message: Some(Operand::String("boom".to_string())),
+                    captures: Vec::new(),
+                    span: Span::new(1, 1),
+                },
+            },
+        ],
+    };
+    let close = close_function("Resource");
+    let module = crate::mir::MirModule {
+        constants: Vec::new(),
+        functions: vec![main, close],
+        classes: vec![crate::mir::MirClass {
+            name: "Resource".to_string(),
+            type_params: Vec::new(),
+            fields: vec![class_field("value", Type::named("int64"))],
+            methods: vec![close_method("Resource.close")],
+        }],
+        trait_impls: Vec::new(),
+        top_level: None,
+    };
+
+    let object = emit_host_object(&module)
+        .expect("dead scalar assignments must not erase reachable resource cleanup metadata");
+    let referenced = object_referenced_symbols(&object);
+    let close_symbol = mangle_symbol("Resource.close");
+    assert!(
+        referenced
+            .iter()
+            .any(|symbol| symbol.trim_start_matches('_') == close_symbol),
+        "reachable cleanup thunk must still call `{close_symbol}`: {referenced:?}"
+    );
 }
 
 #[test]
@@ -13581,80 +13939,24 @@ fn direct_validation_accepts_assert_fail_operands_and_rejects_unknown_places() {
 
 #[test]
 fn adr0038_direct_return_projection_selection_and_tuple_errors_are_codegen_checked() {
-    let pair_type = Type::named("Pair");
-    let returned_module = crate::mir::MirModule {
-        constants: Vec::new(),
-        functions: vec![
-            MirFunction {
-                name: "dynamic_return".to_string(),
-                module_name: "<test>".to_string(),
-                source_path: None,
-                span: Span::new(1, 1),
-                receiver: None,
-                params: vec![MirParam {
-                    name: "origin".to_string(),
-                    passing: MirReceiverKind::BorrowMut,
-                    ty: pair_type.clone(),
-                    default_function: None,
-                }],
-                local_types: vec![MirLocalType {
-                    name: "selected".to_string(),
-                    ty: Type::named("int64"),
-                }],
-                return_type: Type::named("int32"),
-                entry: "entry".to_string(),
-                blocks: vec![BasicBlock {
-                    label: "entry".to_string(),
-                    instructions: vec![
-                        Instruction::BeginReturnedLoan {
-                            loan: "selected".to_string(),
-                            origin: "origin".to_string(),
-                            projections: vec!["left".to_string(), "left".to_string()],
-                            mutable: true,
-                        },
-                        Instruction::ReturnLoan {
-                            loan: "selected".to_string(),
-                            origin: "selected".to_string(),
-                        },
-                    ],
-                    terminator: Terminator::Return(Operand::Int(0)),
-                }],
-            },
-            MirFunction {
-                name: "main".to_string(),
-                module_name: "<test>".to_string(),
-                source_path: None,
-                span: Span::new(1, 1),
-                receiver: None,
-                params: Vec::new(),
-                local_types: Vec::new(),
-                return_type: Type::named("int32"),
-                entry: "entry".to_string(),
-                blocks: vec![BasicBlock {
-                    label: "entry".to_string(),
-                    instructions: Vec::new(),
-                    terminator: Terminator::Return(Operand::Int(0)),
-                }],
-            },
-        ],
-        classes: vec![crate::mir::MirClass {
-            name: "Pair".to_string(),
-            type_params: Vec::new(),
-            fields: vec![
-                crate::mir::MirClassField {
-                    name: "left".to_string(),
-                    ty: Type::named("int64"),
-                },
-                crate::mir::MirClassField {
-                    name: "right".to_string(),
-                    ty: Type::named("int64"),
-                },
-            ],
-            methods: Vec::new(),
-        }],
-        trait_impls: Vec::new(),
-        top_level: None,
-    };
+    let returned_module = lower_source_to_mir(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def choose(pair: mut Pair, left: bool) -> view mut int64 from pair:
+    if left:
+        return view mut pair.left
+    return view mut pair.right
+
+def main():
+    mut pair = Pair(left=1, right=2)
+    view mut selected = choose(pair, false)
+    selected = 9
+"#,
+    )
+    .expect("dynamic returned-view source should lower before direct codegen");
     emit_host_object(&returned_module)
         .expect("dynamic returned-view projection selection should compile");
 
@@ -13690,6 +13992,9 @@ fn adr0038_direct_return_projection_selection_and_tuple_errors_are_codegen_check
                         target: "target".to_string(),
                         loan: "selected".to_string(),
                     },
+                    Instruction::EndLoan {
+                        loan: "selected".to_string(),
+                    },
                 ],
                 terminator: Terminator::Return(Operand::Int(0)),
             }],
@@ -13704,7 +14009,8 @@ fn adr0038_direct_return_projection_selection_and_tuple_errors_are_codegen_check
     let out_of_bounds = emit_host_object(&malformed_tuple_module("4"))
         .expect_err("tuple view projections must remain in bounds");
     assert!(
-        out_of_bounds.contains("has no element at index 4"),
+        out_of_bounds.contains("tuple projection `4`")
+            && out_of_bounds.contains("is out of bounds"),
         "{out_of_bounds}"
     );
 }

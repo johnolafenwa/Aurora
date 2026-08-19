@@ -15,7 +15,13 @@
       "include": "#numbers"
     },
     {
+      "include": "#returnedViewFunctions"
+    },
+    {
       "include": "#declarations"
+    },
+    {
+      "include": "#contextualSyntax"
     },
     {
       "include": "#builtins"
@@ -314,6 +320,98 @@
         }
       ]
     },
+    "returnedViewFunctions": {
+      "patterns": [
+        {
+          "name": "meta.definition.function.returned-view.aura",
+          "begin": "^([\\t ]*)(def)\\s+([A-Za-z_][A-Za-z0-9_]*)\\b(?=[^\\n]*\\)\\s*->\\s*view\\b\\s+(?:mut\\s+)?(?:[A-Za-z_][A-Za-z0-9_.]*|\\())",
+          "beginCaptures": {
+            "2": {
+              "name": "keyword.declaration.function.aura"
+            },
+            "3": {
+              "name": "entity.name.function.aura"
+            }
+          },
+          "end": "^(?!\\1[\\t ]+)(?=[\\t ]*\\S)",
+          "patterns": [
+            {
+              "match": "\\b(return)(\\s+)(view)\\b(?=\\s+(?:mut\\s+)?(?!(?:and|or|not|is|in|if|else)\\b)(?:[A-Za-z_][A-Za-z0-9_]*|\\())",
+              "captures": {
+                "1": {
+                  "name": "keyword.control.aura"
+                },
+                "3": {
+                  "name": "keyword.declaration.view.aura"
+                }
+              }
+            },
+            {
+              "include": "$self"
+            }
+          ]
+        }
+      ]
+    },
+    "contextualSyntax": {
+      "patterns": [
+        {
+          "name": "meta.return-type.view.aura",
+          "begin": "(->)(?=\\s*view\\b\\s+(?:mut\\s+)?(?:[A-Za-z_][A-Za-z0-9_.]*(?:\\s*\\[|\\s+from\\b)|\\())",
+          "beginCaptures": {
+            "1": {
+              "name": "keyword.operator.aura"
+            }
+          },
+          "end": "\\b(from)(\\s+)([A-Za-z_][A-Za-z0-9_]*)(?=\\s*(?::|$))",
+          "endCaptures": {
+            "1": {
+              "name": "keyword.declaration.view.aura"
+            }
+          },
+          "patterns": [
+            {
+              "name": "keyword.declaration.view.aura",
+              "match": "\\bview\\b"
+            },
+            {
+              "name": "storage.modifier.aura",
+              "match": "\\bmut\\b"
+            },
+            {
+              "include": "#types"
+            },
+            {
+              "include": "#operators"
+            }
+          ]
+        },
+        {
+          "name": "meta.definition.view.aura",
+          "begin": "^\\s*(view)\\b(?=\\s+(?:mut\\s+)?[A-Za-z_][A-Za-z0-9_]*\\s*=)",
+          "beginCaptures": {
+            "1": {
+              "name": "keyword.declaration.view.aura"
+            }
+          },
+          "end": "(?==)",
+          "patterns": [
+            {
+              "name": "storage.modifier.aura",
+              "match": "\\bmut\\b"
+            }
+          ]
+        },
+        {
+          "match": "^\\s*(from)\\b(?=\\s+(?:[A-Za-z_][A-Za-z0-9_]*\\.)*[A-Za-z_][A-Za-z0-9_]*\\s+import\\b)",
+          "captures": {
+            "1": {
+              "name": "keyword.control.aura"
+            }
+          }
+        }
+      ]
+    },
     "keywords": {
       "patterns": [
         {
@@ -327,10 +425,6 @@
         {
           "name": "storage.modifier.aura",
           "match": "\\b(public|mut|own|indirect|copy)\\b"
-        },
-        {
-          "name": "keyword.declaration.view.aura",
-          "match": "\\b(view|from)\\b"
         },
         {
           "name": "constant.language.aura",

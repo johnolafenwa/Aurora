@@ -23,17 +23,18 @@ place without a clone or delayed-writeback approximation.
 This ADR supersedes ADR-0009's deferred live-alias reservation at the design
 level and is the designed-from-scratch successor to borrowed returns. It does
 not restore `borrow`, return labels, or `-> mut T`. ADR-0009's implemented
-containment rule remains binding until a later implementation of this ADR
-lands. ADR-0016's retained-expression sequencing remains binding and becomes
-an input to the broader loan analysis rather than being silently replaced.
+containment rule remains binding for ordinary stored access; this
+implementation adds only the explicit view forms defined here. ADR-0016's
+retained-expression sequencing remains binding and becomes an input to the
+broader loan analysis rather than being silently replaced.
 
 This decision amends ADR-0013 and ADR-0037 for explicitly requested in-loan
 closure captures. A lambda without a capture list retains ADR-0037 by-value
 capture behavior.
 
-ADR-0040's Aurora 0.2 Vec and String slices are deliberately not an
+ADR-0040's owned `list` and `str` slices are deliberately not an
 implementation of this design. `value[start:end]` produces a fresh owned
-collection or String and is never a place or view. It has no PlaceId, source
+`list` or `str` value and is never a place or view. It has no PlaceId, source
 generation, lifetime, reborrow, write-through behavior, or returned-view
 provenance. A future indexed-view amendment must use an explicit view form and
 must not reinterpret the owned slice syntax as an alias.
@@ -75,7 +76,7 @@ optimization as the language contract.
 - interpreting an ordinary `-> T` result as anything except an owned result
 - user-written lifetime parameters
 - arbitrary view-bearing aggregate or structural callable types
-- views into Vec or Map elements, Set elements, Queue receives, Range values,
+- views into `list` or `dict` elements, `set` elements, Queue receives, Range values,
   or arbitrary temporaries in the first implementation
 - loans across task, Queue, supervisor, detached, or FFI-retention boundaries
 - FFI callbacks or foreign functions returning Aurora views
@@ -144,10 +145,10 @@ an ordinary owned value.
 A view-returning declaration names one origin:
 
 ```aurora
-def name(user: User) -> view String from user:
+def name(user: User) -> view str from user:
     return view user.name
 
-def name_mut(user: mut User) -> view mut String from user:
+def name_mut(user: mut User) -> view mut str from user:
     return view mut user.name
 
 class Account:
@@ -224,8 +225,8 @@ paths differ.
 
 The first implementation rejects:
 
-- Vec indexes and Map keys, including constant indexes
-- Set elements
+- `list` indexes and `dict` keys, including constant indexes
+- `set` elements
 - Queue-received and Range-produced values without another owned local root
 - arbitrary computed projections
 - a temporary that would need hidden stable storage
@@ -412,7 +413,7 @@ complete live region.
 Loan closures are non-Copy and non-Transfer. The first implementation permits
 them only for immediate invocation, matching inferred locals, nested contained
 reborrows, and compiler-known synchronous non-retaining callback sites whose
-required call capability matches. Current `Vec.map`, `filter`, `sort_by`, and
+required call capability matches. Current `list.map`, `filter`, `sort_by`, and
 `control.retry` take shared-repeatable callbacks, so they may admit shared-loan
 closures but not mutable-repeatable ones.
 
@@ -449,9 +450,9 @@ FFI v0 never accepts or returns an Aurora loan descriptor.
 Within one synchronous foreign call, an Aurora view may supply the ordinary
 declared FFI value:
 
-- shared `String` or `Vec[uint8]` access produces the existing const
+- shared `str` or `list[uint8]` access produces the existing const
   pointer/length call-duration view
-- mutable `Vec[uint8]` access uses the existing fixed-length scratch
+- mutable `list[uint8]` access uses the existing fixed-length scratch
   copy-in/out and writes through the active mutable loan after native return
 - scalar access supplies the declared fixed-width bits
 - shared opaque-handle access supplies the handle without transferring it

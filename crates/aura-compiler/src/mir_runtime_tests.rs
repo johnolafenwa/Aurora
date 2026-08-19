@@ -80,6 +80,624 @@ def main():
     )
     .expect("fixed tuple-position views must write through their stable place");
     assert_eq!(tuple_output.stdout, "(1, 7)\n");
+
+    let nested_tuple_class = crate::run_source(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def main():
+    mut wrapper = (Pair(left=1, right=2), 3)
+    view mut field = wrapper[0].right
+    field = 9
+    print(wrapper[0].right)
+"#,
+    )
+    .expect("nested tuple-to-class views must lower to a canonical physical place");
+    assert_eq!(nested_tuple_class.stdout, "9\n");
+}
+
+#[test]
+fn borrow_mut_operator_writebacks_preserve_projected_places() {
+    let output = crate::run_source(
+        r#"
+trait Add[Rhs, Out]:
+    def add(mut self, rhs: mut Rhs) -> Out
+
+copy class Counter:
+    value: int32
+
+class Holder:
+    counter: Counter
+
+impl Add[Counter, Counter] for Counter:
+    def add(mut self, rhs: mut Counter) -> Counter:
+        self.value += rhs.value
+        rhs.value += 1
+        return self
+
+def main():
+    mut holder = Holder(counter=Counter(value=10))
+    mut member_rhs = Counter(value=3)
+    holder.counter += member_rhs
+    print(holder.counter.value)
+    print(member_rhs.value)
+
+    mut pair = (Counter(value=20),)
+    mut tuple_rhs = Counter(value=4)
+    view mut tuple_counter = pair[0]
+    tuple_counter += tuple_rhs
+    print(tuple_counter.value)
+    print(tuple_rhs.value)
+
+    mut values = [Counter(value=30)]
+    mut list_rhs = Counter(value=5)
+    values[0] += list_rhs
+    print(values[0].value)
+    print(list_rhs.value)
+"#,
+    )
+    .expect("BorrowMut operators should write through supported projected targets");
+    assert_eq!(output.stdout, "13\n4\n24\n5\n35\n6\n");
+}
+
+#[test]
+fn adr0038_shared_reborrows_do_not_suspend_their_shared_parent() {
+    let output = crate::run_source(
+        r#"
+def main():
+    value = "Ada"
+    view first = value
+    view second = first
+    print(first)
+    print(second)
+"#,
+    )
+    .expect("overlapping shared parent and child views remain readable");
+    assert_eq!(output.stdout, "Ada\nAda\n");
+}
+
+#[test]
+fn adr0038_condition_edges_and_branch_local_views_balance_the_runtime_ledger() {
+    let branch = crate::run_source(
+        r#"
+def main():
+    mut left = 1
+    mut right = 2
+    if true:
+        view mut selected = left
+        if false:
+            pass
+        selected = 10
+    else:
+        view mut selected = right
+        selected = 20
+    print(left)
+    print(right)
+"#,
+    )
+    .expect("branch-local view identities should join with an empty loan ledger");
+    assert_eq!(branch.stdout, "10\n2\n");
+
+    let condition = crate::run_source(
+        r#"
+def main():
+    mut value = 1
+    view alias = value
+    if alias == 1:
+        value = 2
+    print(value)
+"#,
+    )
+    .expect("a condition-only last use should end on both outgoing edges exactly once");
+    assert_eq!(condition.stdout, "2\n");
+
+    let generic_mutation = crate::run_source(
+        r#"
+trait Project:
+    def get(mut self) -> view mut int64 from self
+
+class Box:
+    value: int64
+
+impl Project for Box:
+    def get(mut self) -> view mut int64 from self:
+        return view mut self.value
+
+def update[T: Project](item: mut T):
+    view mut alias = item.get()
+    alias = 9
+
+def main():
+    mut box = Box(value=7)
+    update(box)
+    print(box.value)
+"#,
+    )
+    .expect("generic trait returned views should preserve mutable write-through");
+    assert_eq!(generic_mutation.stdout, "9\n");
+}
+
+#[test]
+fn adr0038_nested_last_uses_end_in_the_selected_control_flow_path() {
+    for source in [
+        r#"
+def main():
+    mut value = 1
+    view alias = value
+    if true:
+        print(alias)
+        value = 2
+    print(value)
+"#,
+        r#"
+def main():
+    mut value = 1
+    view alias = value
+    match true:
+        case true:
+            print(alias)
+            value = 2
+        case false:
+            pass
+    print(value)
+"#,
+        r#"
+def main():
+    mut value = 1
+    view alias = value
+    with TaskGroup() as group:
+        print(alias)
+        value = 2
+    print(value)
+"#,
+    ] {
+        let output = crate::run_source(source)
+            .expect("an inherited loan must end immediately after its nested last use");
+        assert_eq!(output.stdout, "1\n2\n");
+    }
+}
+
+#[test]
+fn adr0038_return_cleanup_alias_forwarding_and_view_capture_remain_live() {
+    let returned_child = crate::run_source(
+        r#"
+class Pair:
+    left: int64
+
+def left(pair: Pair) -> view int64 from pair:
+    view parent = pair
+    view child = parent.left
+    return view child
+
+def main():
+    pair = Pair(left=7)
+    view result = left(pair)
+    print(result)
+"#,
+    )
+    .expect("non-returned ancestors must clean up before the returned-loan handoff");
+    assert_eq!(returned_child.stdout, "7\n");
+
+    let captured_view = crate::run_source(
+        r#"
+def main():
+    value = 1
+    view alias = value
+    get: def() -> int64 = lambda [alias]: alias
+    print(get())
+"#,
+    )
+    .expect("a closure capture of an existing view must keep a stable source alive");
+    assert_eq!(captured_view.stdout, "1\n");
+
+    let captured_mut_view = crate::run_source(
+        r#"
+def main():
+    mut values = [1]
+    view mut alias = values
+    mut push: def(int64) -> None = lambda [mut alias] next: alias.append(next)
+    push(4)
+    print(values)
+"#,
+    )
+    .expect("a mutable closure capture of an existing view must write through its stable source");
+    assert_eq!(captured_mut_view.stdout, "[1, 4]\n");
+
+    let forwarded_alias = crate::run_source(
+        r#"
+def inner(value: int64) -> view int64 from value:
+    return view value
+
+def outer(value: int64) -> view int64 from value:
+    view alias = inner(value)
+    return view alias
+
+def main():
+    value = 1
+    view result = outer(value)
+    print(result)
+"#,
+    )
+    .expect("a local alias must preserve a forwarded returned-view projection");
+    assert_eq!(forwarded_alias.stdout, "1\n");
+
+    let cleanup_region = crate::run_source(
+        r#"
+def borrow(value: int64) -> view int64 from value:
+    with TaskGroup() as group:
+        return view value
+
+def main():
+    value = 4
+    view result = borrow(value)
+    print(result)
+"#,
+    )
+    .expect("managed cleanup may run after handoff while preserving the returned projection");
+    assert_eq!(cleanup_region.stdout, "4\n");
+}
+
+#[test]
+fn adr0038_returned_view_handoffs_survive_reentrant_cleanup_calls() {
+    let output = crate::run_source(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def choose(pair: mut Pair, left: bool) -> view mut int64 from pair:
+    if left:
+        return view mut pair.left
+    return view mut pair.right
+
+class Resource:
+    def close(mut self):
+        mut local = Pair(left=101, right=102)
+        view mut selected = choose(local, true)
+        print(selected)
+
+def clean_return(pair: mut Pair, left: bool) -> view mut int64 from pair:
+    with Resource() as resource:
+        return view mut choose(pair, left)
+
+def main():
+    mut pair = Pair(left=1, right=2)
+    view mut selected = clean_return(pair, false)
+    selected = 9
+    print(pair)
+"#,
+    )
+    .expect("cleanup calls must not replace the enclosing returned-view handoff");
+    assert_eq!(output.stdout, "101\nPair(left=1, right=9)\n");
+}
+
+#[test]
+fn adr0038_dynamic_returned_view_closure_captures_keep_the_selected_descriptor() {
+    let output = crate::run_source(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def choose(pair: mut Pair, left: bool) -> view mut int64 from pair:
+    if left:
+        return view mut pair.left
+    return view mut pair.right
+
+def forward(pair: mut Pair, left: bool) -> view mut int64 from pair:
+    return view mut choose(pair, left)
+
+def choose_shared(pair: Pair, left: bool) -> view int64 from pair:
+    if left:
+        return view pair.left
+    return view pair.right
+
+def assign(value: mut int64, next: int64):
+    value = next
+
+def main():
+    mut pair = Pair(left=1, right=2)
+    view mut captured = forward(pair, false)
+    mut update: def(int64) -> None = lambda [mut captured] next: assign(captured, next)
+    update(41)
+    print(pair)
+    view chosen = choose_shared(pair, true)
+    read: def() -> int64 = lambda [chosen]: chosen
+    print(read())
+"#,
+    )
+    .expect("a closure must capture the selected returned-view descriptor, not its broad origin");
+    assert_eq!(output.stdout, "Pair(left=1, right=41)\n1\n");
+}
+
+#[test]
+fn adr0038_returned_view_descendants_compose_through_captures_and_forwarding() {
+    let output = crate::run_source(
+        r#"
+class ScalarPair:
+    left: int64
+    right: int64
+
+def choose_mut(pair: mut ScalarPair, left: bool) -> view mut int64 from pair:
+    if left:
+        return view mut pair.left
+    return view mut pair.right
+
+def choose_shared(pair: ScalarPair, left: bool) -> view int64 from pair:
+    if left:
+        return view pair.left
+    return view pair.right
+
+def assign(value: mut int64, next: int64):
+    value = next
+
+class Cell:
+    value: int64
+
+class CellPair:
+    left: Cell
+    right: Cell
+
+class TuplePair:
+    left: (int64, int64)
+    right: (int64, int64)
+
+def left_cell(pair: mut CellPair) -> view mut Cell from pair:
+    return view mut pair.left
+
+def choose_cell(pair: mut CellPair, left: bool) -> view mut Cell from pair:
+    if left:
+        return view mut pair.left
+    return view mut pair.right
+
+def cell_value(cell: mut Cell) -> view mut int64 from cell:
+    return view mut cell.value
+
+def static_forward(pair: mut CellPair) -> view mut int64 from pair:
+    return view mut left_cell(pair).value
+
+def dynamic_forward(pair: mut CellPair, left: bool) -> view mut int64 from pair:
+    return view mut choose_cell(pair, left).value
+
+def nested_forward(pair: mut CellPair, left: bool) -> view mut int64 from pair:
+    return view mut cell_value(choose_cell(pair, left))
+
+def local_class_forward(pair: mut CellPair, left: bool) -> view mut int64 from pair:
+    view mut selected = choose_cell(pair, left)
+    return view mut selected.value
+
+def choose_tuple(pair: mut TuplePair, left: bool) -> view mut (int64, int64) from pair:
+    if left:
+        return view mut pair.left
+    return view mut pair.right
+
+def local_tuple_forward(pair: mut TuplePair, left: bool) -> view mut int64 from pair:
+    view mut selected = choose_tuple(pair, left)
+    return view mut selected[1]
+
+def main():
+    mut mutable_pair = ScalarPair(left=1, right=2)
+    view mut selected_mut = choose_mut(mutable_pair, false)
+    view mut child_mut = selected_mut
+    mut update: def(int64) -> None = lambda [mut child_mut] next: assign(child_mut, next)
+    update(9)
+    print(mutable_pair)
+
+    shared_pair = ScalarPair(left=3, right=4)
+    view selected_shared = choose_shared(shared_pair, true)
+    view child_shared = selected_shared
+    read: def() -> int64 = lambda [child_shared]: child_shared
+    print(read())
+
+    mut cells = CellPair(left=Cell(value=10), right=Cell(value=20))
+    view mut static_value = static_forward(cells)
+    static_value = 11
+    view mut dynamic_value = dynamic_forward(cells, false)
+    dynamic_value = 21
+    view mut nested_value = nested_forward(cells, true)
+    nested_value = 12
+    print(cells)
+
+    view mut local_class_value = local_class_forward(cells, false)
+    local_class_value = 22
+    print(cells)
+
+    mut tuples = TuplePair(left=(30, 40), right=(50, 60))
+    view mut local_tuple_value = local_tuple_forward(tuples, true)
+    local_tuple_value = 41
+    print(tuples)
+"#,
+    )
+    .expect("returned-view descendants must compose in the MIR backend");
+    assert_eq!(
+        output.stdout,
+        "ScalarPair(left=1, right=9)\n3\nCellPair(left=Cell(value=12), right=Cell(value=21))\nCellPair(left=Cell(value=12), right=Cell(value=22))\nTuplePair(left=(30, 41), right=(50, 60))\n"
+    );
+}
+
+#[test]
+fn adr0038_generic_returned_view_forwarding_uses_declaration_context() {
+    let output = crate::run_source(
+        r#"
+trait Project:
+    def get(self) -> view int64 from self
+
+class Box:
+    value: int64
+
+impl Project for Box:
+    def get(self) -> view int64 from self:
+        return view self.value
+
+def forward[T: Project](item: T) -> view int64 from item:
+    return view item.get()
+
+def main():
+    box = Box(value=7)
+    view alias = forward(box)
+    print(alias)
+"#,
+    )
+    .expect("generic trait returned-view forwarding must lower in the declaration context");
+    assert_eq!(output.stdout, "7\n");
+
+    let same_module = crate::run_source(
+        r#"
+class Box[T]:
+    value: T
+
+def inner[T](box: Box[T]) -> view T from box:
+    return view box.value
+
+def outer[T](box: Box[T]) -> view T from box:
+    return view inner(box)
+
+def main():
+    box = Box(value=11)
+    view alias = outer(box)
+    print(alias)
+"#,
+    )
+    .expect("same-module generic returned-view forwarding must not panic after checking");
+    assert_eq!(same_module.stdout, "11\n");
+
+    let distinct_impls = crate::run_source(
+        r#"
+trait Project:
+    def get(self) -> view int64 from self
+
+class LeftBox:
+    left: int64
+
+class RightBox:
+    right: int64
+
+impl Project for LeftBox:
+    def get(self) -> view int64 from self:
+        return view self.left
+
+impl Project for RightBox:
+    def get(self) -> view int64 from self:
+        return view self.right
+
+def forward[T: Project](item: T) -> view int64 from item:
+    return view item.get()
+
+def main():
+    left = LeftBox(left=7)
+    right = RightBox(right=8)
+    view left_value = forward(left)
+    view right_value = forward(right)
+    print(left_value)
+    print(right_value)
+"#,
+    )
+    .expect("generic returned-view projections must use the concrete trait implementation");
+    assert_eq!(distinct_impls.stdout, "7\n8\n");
+}
+
+#[test]
+fn adr0038_nested_and_projected_returned_calls_compose_descriptors() {
+    let output = crate::run_source(
+        r#"
+class Cell:
+    value: int64
+
+class Pair:
+    left: Cell
+    right: Cell
+
+def choose(pair: mut Pair, left: bool) -> view mut Cell from pair:
+    if left:
+        return view mut pair.left
+    return view mut pair.right
+
+def left_cell(pair: mut Pair) -> view mut Cell from pair:
+    return view mut pair.left
+
+def cell_value(cell: mut Cell) -> view mut int64 from cell:
+    return view mut cell.value
+
+def bump(value: mut int64):
+    value += 1
+
+def main():
+    mut pair = Pair(left=Cell(value=1), right=Cell(value=2))
+    view mut nested = cell_value(choose(pair, false))
+    nested = 9
+    view mut child = left_cell(pair).value
+    child = 8
+    bump(cell_value(choose(pair, false)))
+    print(pair)
+"#,
+    )
+    .expect("nested returned origins and call-rooted child reborrows should compose");
+    assert_eq!(
+        output.stdout,
+        "Pair(left=Cell(value=8), right=Cell(value=10))\n"
+    );
+}
+
+#[test]
+fn adr0038_grouped_specialized_forwarding_retains_its_projection() {
+    let output = crate::run_source(
+        r#"
+class Box[T]:
+    value: T
+
+def inner[T](box: Box[T]) -> view T from box:
+    return view box.value
+
+def outer[T](box: Box[T]) -> view T from box:
+    return view (inner[T](box))
+
+def main():
+    box = Box(value=11)
+    view alias = (outer[int64])(box)
+    print(alias)
+"#,
+    )
+    .expect("groups around specialized forwarded calls must be transparent");
+    assert_eq!(output.stdout, "11\n");
+}
+
+#[test]
+fn adr0038_parameterized_trait_forwarding_narrows_the_caller_descriptor() {
+    let output = crate::run_source(
+        r#"
+trait Project[Item]:
+    def get(self) -> view Item from self
+
+class LeftBox:
+    left: int64
+
+class RightBox:
+    right: int64
+
+impl Project[int64] for LeftBox:
+    def get(self) -> view int64 from self:
+        return view self.left
+
+impl Project[int64] for RightBox:
+    def get(self) -> view int64 from self:
+        return view self.right
+
+def forward[Item, T: Project[Item]](item: T) -> view Item from item:
+    return view item.get()
+
+def main():
+    left = LeftBox(left=7)
+    right = RightBox(right=8)
+    view left_value = forward[int64, LeftBox](left)
+    view right_value = forward[int64, RightBox](right)
+    print(left_value)
+    print(right_value)
+"#,
+    )
+    .expect("caller specialization may narrow a generic trait projection contract");
+    assert_eq!(output.stdout, "7\n8\n");
 }
 
 #[test]
@@ -142,6 +760,136 @@ def main():
 }
 
 #[test]
+fn adr0038_trapping_mutable_calls_publish_writebacks_before_cleanup() {
+    let cases = [
+        r#"
+class Resource:
+    value: int64
+
+    def close(mut self):
+        print(self.value)
+
+def mutate_then_trap(resource: mut Resource):
+    resource.value = 9
+    print(1 // 0)
+
+def main():
+    with resource = Resource(value=1):
+        mut action: def() -> None = lambda [mut resource]: mutate_then_trap(resource)
+        action()
+"#,
+        r#"
+class Resource:
+    value: int64
+
+    def close(mut self):
+        print(self.value)
+
+def mutate_then_trap(resource: mut Resource):
+    resource.value = 9
+    print(1 // 0)
+
+def main():
+    with resource = Resource(value=1):
+        view mut alias = resource
+        mutate_then_trap(alias)
+"#,
+        r#"
+class Resource:
+    value: int64
+
+    def close(mut self):
+        print(self.value)
+
+def borrow_mut(resource: mut Resource) -> view mut Resource from resource:
+    return view mut resource
+
+def mutate_then_trap(resource: mut Resource):
+    resource.value = 9
+    print(1 // 0)
+
+def main():
+    with resource = Resource(value=1):
+        mutate_then_trap(borrow_mut(resource))
+"#,
+    ];
+
+    for source in cases {
+        let module = crate::lower_source_to_mir(source)
+            .expect("trap-time mutable write-through source should lower");
+        let stdout = Arc::new(Mutex::new(String::new()));
+        let mut runtime = MirRuntime::new(module, stdout.clone(), CancellationContext::default());
+        let error = runtime
+            .run_main()
+            .expect_err("the mutation witness should trap after writing");
+        assert_eq!(error.code, "AU4004");
+        assert_eq!(error.message, "division by zero");
+        assert_eq!(
+            stdout
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_str(),
+            "9\n",
+            "cleanup must observe the successful mutation before the trap"
+        );
+    }
+}
+
+#[test]
+fn adr0038_forwarded_returned_views_preserve_the_transferred_projection() {
+    let output = crate::run_source(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def inner(pair: Pair) -> view int64 from pair:
+    return view pair.left
+
+def outer(pair: Pair) -> view int64 from pair:
+    return view inner(pair)
+
+def main():
+    pair = Pair(left=7, right=8)
+    view result = outer(pair)
+    print(result)
+"#,
+    )
+    .expect("returned views may be forwarded without a lowering panic");
+    assert_eq!(output.stdout, "7\n");
+}
+
+#[test]
+fn adr0038_public_mir_runtime_validates_loan_authority_before_execution() {
+    let mut module = crate::lower_source_to_mir(
+        r#"
+def main():
+    value = 1
+    view parent = value
+    view child = parent
+    print(child)
+"#,
+    )
+    .expect("valid shared reborrow source should lower");
+    let reborrow = module
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match instruction {
+            Instruction::Reborrow { mutable, .. } => Some(mutable),
+            _ => None,
+        })
+        .expect("the child view should lower as a reborrow");
+    *reborrow = true;
+
+    let error = crate::mir_runtime::run(&module)
+        .expect_err("public MIR execution must reject forged mutable authority");
+    assert_eq!(error.code, "AU4001");
+    assert!(error.message.contains("escalates shared parent"));
+}
+
+#[test]
 fn adr0038_mutable_closure_capture_writes_back_to_its_live_source() {
     let output = crate::run_source(
         r#"
@@ -199,13 +947,11 @@ fn adr0038_mir_loan_environment_covers_alias_resolution_and_nested_place_errors(
         "pair.nested.0"
     );
     assert!(env.loans.get("root").expect("loan should exist").mutable);
-    env.begin_loan("shared", "pair", false)
-        .expect("shared loan should begin");
     assert!(env
-        .write_place("shared", pair_value())
-        .expect_err("writes through shared loans must fail")
+        .begin_loan("shared", "pair", false)
+        .expect_err("a shared loan must not overlap an active mutable loan")
         .message
-        .contains("cannot write through shared MIR loan"));
+        .contains("overlaps active mutable loan"));
     assert_eq!(
         env.returned_view_projection("root", "pair")
             .expect("root projection should be empty"),
@@ -238,6 +984,7 @@ fn adr0038_mir_loan_environment_covers_alias_resolution_and_nested_place_errors(
         super::RuntimeLoan {
             source: "cycle_b".to_string(),
             mutable: false,
+            parent: None,
         },
     );
     env.loans.insert(
@@ -245,6 +992,7 @@ fn adr0038_mir_loan_environment_covers_alias_resolution_and_nested_place_errors(
         super::RuntimeLoan {
             source: "cycle_a".to_string(),
             mutable: false,
+            parent: None,
         },
     );
     assert!(env
@@ -436,6 +1184,8 @@ fn adr0038_mir_returned_loan_instruction_reports_handoff_errors_and_root_project
         )
         .expect("an empty reborrow projection aliases its parent");
     assert_eq!(env.resolve_loan_place("same").unwrap(), "pair");
+    env.end_loan("same")
+        .expect("the first child must end before creating an overlapping sibling");
     runtime
         .execute_instruction(
             &Instruction::Reborrow {
@@ -1554,6 +2304,27 @@ fn public_mir_execution_rejects_caller_supplied_ffi_metadata() {
             .expect_err("safe serialized-MIR execution must reject forged FFI metadata");
     assert_eq!(deserialized.code, "AU4001");
     assert_eq!(Some(deserialized.message), rejection_message);
+
+    let mut write_forged = forged.clone();
+    let Instruction::Assign { value, .. } = &write_forged.functions[0].blocks[0].instructions[0]
+    else {
+        panic!("fixture must begin with the forged extern assignment");
+    };
+    write_forged.functions[0].blocks[0].instructions[0] = Instruction::WriteLoan {
+        loan: "forged_alias".to_string(),
+        value: value.clone(),
+    };
+    let nested = crate::run_mir(&write_forged)
+        .expect_err("safe public MIR execution must inspect WriteLoan rvalues for extern calls");
+    assert_eq!(nested.code, "AU4001");
+    assert!(nested.message.contains("getpid"));
+
+    let serialized = serde_json::to_vec(&write_forged).expect("forged MIR should serialize");
+    let nested_serialized =
+        crate::run_serialized_mir(&serialized, "/tmp/forged.au", "def main():\n    pass\n")
+            .expect_err("serialized MIR must inspect WriteLoan rvalues for extern calls");
+    assert_eq!(nested_serialized.code, "AU4001");
+    assert!(nested_serialized.message.contains("getpid"));
 }
 
 #[test]
@@ -8148,6 +8919,82 @@ fn mir_runtime_complexity_guard_rejects_excessive_instruction_counts() {
     )]);
     super::validate_runtime_module_complexity(&match_module)
         .expect("small match terminator modules should be accepted");
+
+    let amplified_origin = "o".repeat(300_000);
+    let amplified = module_with_blocks(vec![BasicBlock {
+        label: "entry".to_string(),
+        instructions: vec![Instruction::BeginReturnedLoan {
+            loan: "returned".to_string(),
+            origin: amplified_origin,
+            projections: (0..16).map(|index| index.to_string()).collect(),
+            mutable: false,
+        }],
+        terminator: Terminator::Return(Operand::Int(0)),
+    }]);
+    let expansion_error = super::validate_runtime_module_complexity(&amplified)
+        .expect_err("small serialized inputs must not amplify into multi-megabyte loan paths");
+    assert!(
+        expansion_error
+            .message
+            .contains("expanded loan-path byte limit"),
+        "unexpected diagnostic: {}",
+        expansion_error.message
+    );
+
+    let reborrow_amplification = module_with_blocks(vec![BasicBlock {
+        label: "entry".to_string(),
+        instructions: vec![
+            Instruction::BeginReturnedLoan {
+                loan: "parent".to_string(),
+                origin: "origin".to_string(),
+                projections: (0..4_096).map(|index| index.to_string()).collect(),
+                mutable: false,
+            },
+            Instruction::Reborrow {
+                loan: "first".to_string(),
+                parent: "parent".to_string(),
+                projection: "field".repeat(104),
+                mutable: false,
+            },
+            Instruction::Reborrow {
+                loan: "second".to_string(),
+                parent: "parent".to_string(),
+                projection: "field".repeat(104),
+                mutable: false,
+            },
+        ],
+        terminator: Terminator::Return(Operand::Int(0)),
+    }]);
+    let reborrow_error = super::validate_runtime_module_complexity(&reborrow_amplification)
+        .expect_err("serialized reborrows must be budgeted before loan paths are expanded");
+    assert!(
+        reborrow_error
+            .message
+            .contains("expanded loan-path byte limit"),
+        "unexpected diagnostic: {}",
+        reborrow_error.message
+    );
+    let serialized = serde_json::to_vec(&reborrow_amplification)
+        .expect("the amplification probe should serialize");
+    assert!(
+        serialized.len() < 64 * 1024,
+        "the regression should remain a low-resource amplification probe"
+    );
+    let serialized_error = super::run_serialized_mir(&serialized, "<amplified>", "")
+        .expect_err("the serialized runtime boundary must reject before loan expansion");
+    assert!(
+        serialized_error
+            .message
+            .contains("expanded loan-path byte limit"),
+        "unexpected serialized diagnostic: {}",
+        serialized_error.message
+    );
+
+    let control = module_with_blocks(vec![block("entry", Terminator::Return(Operand::Int(0)))]);
+    let serialized_control =
+        serde_json::to_vec(&control).expect("the ordinary control should serialize");
+    super::run_serialized_mir(&serialized_control, "<control>", "")
+        .expect("ordinary serialized MIR must remain executable");
 }
 
 #[test]
@@ -16566,6 +17413,24 @@ fn mir_runtime_entrypoint_call_and_type_helpers_cover_remaining_edges() {
         Type::named("int32"),
         Value::Int(IntegerValue::from_signed(2)),
     );
+    let pair_type = Type::Named(
+        "Pair".to_string(),
+        vec![Type::named("int32"), Type::named("bool")],
+    );
+    env.define_typed(
+        "wrapped",
+        Type::Tuple(vec![pair_type.clone()]),
+        Value::Tuple(TupleValue {
+            element_types: vec![pair_type],
+            elements: vec![Value::Instance(InstanceValue {
+                class_name: "Pair".to_string(),
+                fields: BTreeMap::from([(
+                    "left".to_string(),
+                    Value::Int(IntegerValue::from_signed(3)),
+                )]),
+            })],
+        }),
+    );
     assert_eq!(
         runtime.resolve_place_type("pair", &mut env),
         Some(Type::Named(
@@ -16575,6 +17440,10 @@ fn mir_runtime_entrypoint_call_and_type_helpers_cover_remaining_edges() {
     );
     assert_eq!(
         runtime.resolve_place_type("pair.left", &mut env),
+        Some(Type::named("int32"))
+    );
+    assert_eq!(
+        runtime.resolve_place_type("wrapped.0.left", &mut env),
         Some(Type::named("int32"))
     );
     assert_eq!(runtime.resolve_place_type("number.value", &mut env), None);
@@ -18548,6 +19417,7 @@ fn mir_runtime_closure_environment_is_by_value_repeatable_and_one_shot_when_cons
                     ty: int_type.clone(),
                     passing: MirReceiverKind::Value,
                     source_place: None,
+                    resolve_source_at_capture: false,
                 }],
                 consuming: false,
             },
@@ -18601,6 +19471,7 @@ fn mir_runtime_closure_environment_is_by_value_repeatable_and_one_shot_when_cons
                     ty: Type::named("str"),
                     passing: MirReceiverKind::Value,
                     source_place: None,
+                    resolve_source_at_capture: false,
                 }],
                 consuming: true,
             },

@@ -6,6 +6,15 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use aura_compiler::ast::BinaryOp;
+use aura_compiler::mir::{
+    BasicBlock, CallTarget, Instruction, MirArg, MirClass, MirClassField, MirClosureCapture,
+    MirFieldInit, MirFunction, MirLocalType, MirModule, MirParam, MirReceiverKind, Operand, Rvalue,
+    Terminator,
+};
+use aura_compiler::sema::{ClosureCallKind, ClosureCapture, ClosureCaptureMode, Type};
+use aura_compiler::Span;
+
 #[cfg(unix)]
 use rcgen::generate_simple_self_signed;
 
@@ -536,6 +545,1217 @@ fn assert_run_and_direct_source_stdout(prefix: &str, source: &str, expected_stdo
         String::from_utf8_lossy(&direct.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&direct.stdout), expected_stdout);
+}
+
+#[cfg(unix)]
+fn adr0038_cfg_view_module(reverse_branch_storage: bool, include_dead_loan: bool) -> MirModule {
+    let pair_type = Type::named("Pair");
+    let mut update_blocks = vec![BasicBlock {
+        label: "entry".to_string(),
+        instructions: Vec::new(),
+        terminator: Terminator::Branch {
+            condition: Operand::Place("choose_left".to_string()),
+            then_label: "left_begin".to_string(),
+            else_label: "right_begin".to_string(),
+        },
+    }];
+    let left_begin = BasicBlock {
+        label: "left_begin".to_string(),
+        instructions: vec![Instruction::BeginLoan {
+            loan: "selected".to_string(),
+            source: "pair.left".to_string(),
+            mutable: true,
+        }],
+        terminator: Terminator::Goto("left_write".to_string()),
+    };
+    let right_begin = BasicBlock {
+        label: "right_begin".to_string(),
+        instructions: vec![Instruction::BeginLoan {
+            loan: "selected".to_string(),
+            source: "pair.right".to_string(),
+            mutable: true,
+        }],
+        terminator: Terminator::Goto("right_write".to_string()),
+    };
+    let left_write = BasicBlock {
+        label: "left_write".to_string(),
+        instructions: vec![
+            Instruction::WriteLoan {
+                loan: "selected".to_string(),
+                value: Rvalue::Use(Operand::Int(11)),
+            },
+            Instruction::EndLoan {
+                loan: "selected".to_string(),
+            },
+        ],
+        terminator: Terminator::Goto("exit".to_string()),
+    };
+    let right_write = BasicBlock {
+        label: "right_write".to_string(),
+        instructions: vec![
+            Instruction::WriteLoan {
+                loan: "selected".to_string(),
+                value: Rvalue::Use(Operand::Int(22)),
+            },
+            Instruction::EndLoan {
+                loan: "selected".to_string(),
+            },
+        ],
+        terminator: Terminator::Goto("exit".to_string()),
+    };
+    if reverse_branch_storage {
+        update_blocks.extend([right_begin, left_begin, right_write, left_write]);
+    } else {
+        update_blocks.extend([left_begin, right_begin, left_write, right_write]);
+    }
+    if include_dead_loan {
+        update_blocks.insert(
+            3,
+            BasicBlock {
+                label: "dead_loan_metadata".to_string(),
+                instructions: vec![Instruction::BeginLoan {
+                    loan: "selected".to_string(),
+                    source: "pair.right".to_string(),
+                    mutable: true,
+                }],
+                terminator: Terminator::Return(Operand::Unit),
+            },
+        );
+    }
+    update_blocks.push(BasicBlock {
+        label: "exit".to_string(),
+        instructions: Vec::new(),
+        terminator: Terminator::Return(Operand::Unit),
+    });
+
+    let update = MirFunction {
+        name: "update".to_string(),
+        module_name: "<cfg-view-test>".to_string(),
+        source_path: None,
+        span: Span::new(1, 1),
+        receiver: None,
+        params: vec![
+            MirParam {
+                name: "pair".to_string(),
+                passing: MirReceiverKind::BorrowMut,
+                ty: pair_type.clone(),
+                default_function: None,
+            },
+            MirParam {
+                name: "choose_left".to_string(),
+                passing: MirReceiverKind::Borrow,
+                ty: Type::named("bool"),
+                default_function: None,
+            },
+        ],
+        local_types: vec![
+            MirLocalType {
+                name: "pair".to_string(),
+                ty: pair_type.clone(),
+            },
+            MirLocalType {
+                name: "choose_left".to_string(),
+                ty: Type::named("bool"),
+            },
+            MirLocalType {
+                name: "selected".to_string(),
+                ty: Type::named("int64"),
+            },
+        ],
+        return_type: Type::Unit,
+        entry: "entry".to_string(),
+        blocks: update_blocks,
+    };
+
+    let call_update = |target: &str, choose_left| Instruction::Assign {
+        target: target.to_string(),
+        value: Rvalue::Call {
+            callee: CallTarget::Name("update".to_string()),
+            args: vec![
+                MirArg {
+                    name: None,
+                    value: Operand::Place("pair".to_string()),
+                    writeback_place: Some("pair".to_string()),
+                },
+                MirArg {
+                    name: None,
+                    value: Operand::Bool(choose_left),
+                    writeback_place: None,
+                },
+            ],
+        },
+    };
+    let main = MirFunction {
+        name: "main".to_string(),
+        module_name: "<cfg-view-test>".to_string(),
+        source_path: None,
+        span: Span::new(1, 1),
+        receiver: None,
+        params: Vec::new(),
+        local_types: vec![
+            MirLocalType {
+                name: "pair".to_string(),
+                ty: pair_type.clone(),
+            },
+            MirLocalType {
+                name: "left".to_string(),
+                ty: Type::named("int64"),
+            },
+            MirLocalType {
+                name: "right".to_string(),
+                ty: Type::named("int64"),
+            },
+            MirLocalType {
+                name: "call_left".to_string(),
+                ty: Type::Unit,
+            },
+            MirLocalType {
+                name: "call_right".to_string(),
+                ty: Type::Unit,
+            },
+            MirLocalType {
+                name: "print_left".to_string(),
+                ty: Type::Unit,
+            },
+            MirLocalType {
+                name: "print_right".to_string(),
+                ty: Type::Unit,
+            },
+            MirLocalType {
+                name: "sum".to_string(),
+                ty: Type::named("int64"),
+            },
+        ],
+        return_type: Type::named("int32"),
+        entry: "entry".to_string(),
+        blocks: vec![BasicBlock {
+            label: "entry".to_string(),
+            instructions: vec![
+                Instruction::Assign {
+                    target: "pair".to_string(),
+                    value: Rvalue::Construct {
+                        class_name: "Pair".to_string(),
+                        fields: vec![
+                            MirFieldInit {
+                                name: "left".to_string(),
+                                value: Operand::Int(1),
+                            },
+                            MirFieldInit {
+                                name: "right".to_string(),
+                                value: Operand::Int(2),
+                            },
+                        ],
+                    },
+                },
+                call_update("call_left", true),
+                call_update("call_right", false),
+                Instruction::Assign {
+                    target: "left".to_string(),
+                    value: Rvalue::Member {
+                        object: Operand::Place("pair".to_string()),
+                        field: "left".to_string(),
+                    },
+                },
+                Instruction::Assign {
+                    target: "print_left".to_string(),
+                    value: Rvalue::Call {
+                        callee: CallTarget::Name("print".to_string()),
+                        args: vec![MirArg {
+                            name: None,
+                            value: Operand::Place("left".to_string()),
+                            writeback_place: None,
+                        }],
+                    },
+                },
+                Instruction::Assign {
+                    target: "right".to_string(),
+                    value: Rvalue::Member {
+                        object: Operand::Place("pair".to_string()),
+                        field: "right".to_string(),
+                    },
+                },
+                Instruction::Assign {
+                    target: "print_right".to_string(),
+                    value: Rvalue::Call {
+                        callee: CallTarget::Name("print".to_string()),
+                        args: vec![MirArg {
+                            name: None,
+                            value: Operand::Place("right".to_string()),
+                            writeback_place: None,
+                        }],
+                    },
+                },
+                Instruction::Assign {
+                    target: "sum".to_string(),
+                    value: Rvalue::Binary {
+                        op: BinaryOp::Add,
+                        left: Operand::Place("left".to_string()),
+                        right: Operand::Place("right".to_string()),
+                        span: Span::new(1, 1),
+                    },
+                },
+            ],
+            terminator: Terminator::Return(Operand::Int(0)),
+        }],
+    };
+
+    MirModule {
+        functions: vec![main, update],
+        classes: vec![MirClass {
+            name: "Pair".to_string(),
+            type_params: Vec::new(),
+            fields: vec![
+                MirClassField {
+                    name: "left".to_string(),
+                    ty: Type::named("int64"),
+                },
+                MirClassField {
+                    name: "right".to_string(),
+                    ty: Type::named("int64"),
+                },
+            ],
+            methods: Vec::new(),
+        }],
+        trait_impls: Vec::new(),
+        constants: Vec::new(),
+        top_level: None,
+    }
+}
+
+#[cfg(unix)]
+fn adr0038_mutable_closure_type() -> Type {
+    Type::Closure {
+        params: Box::new(Vec::new()),
+        return_type: Box::new(Type::Unit),
+        captures: Box::new(vec![ClosureCapture {
+            name: "captured".to_string(),
+            ty: Type::named("int64"),
+            mode: ClosureCaptureMode::MutableView,
+            span: Span::new(1, 1),
+        }]),
+        call_kind: ClosureCallKind::MutableRepeatable,
+    }
+}
+
+#[cfg(unix)]
+fn adr0038_set_capture_function() -> MirFunction {
+    MirFunction {
+        name: "set_capture".to_string(),
+        module_name: "<cfg-closure-test>".to_string(),
+        source_path: None,
+        span: Span::new(1, 1),
+        receiver: None,
+        params: vec![MirParam {
+            name: "captured".to_string(),
+            passing: MirReceiverKind::BorrowMut,
+            ty: Type::named("int64"),
+            default_function: None,
+        }],
+        local_types: vec![MirLocalType {
+            name: "captured".to_string(),
+            ty: Type::named("int64"),
+        }],
+        return_type: Type::Unit,
+        entry: "entry".to_string(),
+        blocks: vec![BasicBlock {
+            label: "entry".to_string(),
+            instructions: vec![Instruction::Assign {
+                target: "captured".to_string(),
+                value: Rvalue::Use(Operand::Int(9)),
+            }],
+            terminator: Terminator::Return(Operand::Unit),
+        }],
+    }
+}
+
+#[cfg(unix)]
+fn adr0038_closure_main(blocks: Vec<BasicBlock>, local_types: Vec<MirLocalType>) -> MirFunction {
+    MirFunction {
+        name: "main".to_string(),
+        module_name: "<cfg-closure-test>".to_string(),
+        source_path: None,
+        span: Span::new(1, 1),
+        receiver: None,
+        params: Vec::new(),
+        local_types,
+        return_type: Type::named("int32"),
+        entry: "entry".to_string(),
+        blocks,
+    }
+}
+
+#[cfg(unix)]
+fn adr0038_pair_class() -> MirClass {
+    MirClass {
+        name: "Pair".to_string(),
+        type_params: Vec::new(),
+        fields: vec![
+            MirClassField {
+                name: "left".to_string(),
+                ty: Type::named("int64"),
+            },
+            MirClassField {
+                name: "right".to_string(),
+                ty: Type::named("int64"),
+            },
+        ],
+        methods: Vec::new(),
+    }
+}
+
+#[cfg(unix)]
+fn adr0038_closure_branch_module(flag: bool, reverse_branch_storage: bool) -> MirModule {
+    let closure_type = adr0038_mutable_closure_type();
+    let branch_block = |label: &str, source: &str| BasicBlock {
+        label: label.to_string(),
+        instructions: vec![
+            Instruction::BeginLoan {
+                loan: "captured".to_string(),
+                source: source.to_string(),
+                mutable: true,
+            },
+            Instruction::Assign {
+                target: "callback".to_string(),
+                value: Rvalue::Closure {
+                    function: "set_capture".to_string(),
+                    signature: closure_type.clone(),
+                    captures: vec![MirClosureCapture {
+                        name: "captured".to_string(),
+                        value: Operand::Place("captured".to_string()),
+                        ty: Type::named("int64"),
+                        passing: MirReceiverKind::BorrowMut,
+                        source_place: Some(source.to_string()),
+                        resolve_source_at_capture: false,
+                    }],
+                    consuming: false,
+                },
+            },
+            Instruction::EndLoan {
+                loan: "captured".to_string(),
+            },
+        ],
+        terminator: Terminator::Goto("join".to_string()),
+    };
+    let locals = [
+        ("left", Type::named("int64")),
+        ("right", Type::named("int64")),
+        ("callback", closure_type.clone()),
+        ("called", Type::Unit),
+        ("printed_left", Type::Unit),
+        ("printed_right", Type::Unit),
+    ]
+    .into_iter()
+    .map(|(name, ty)| MirLocalType {
+        name: name.to_string(),
+        ty,
+    })
+    .collect();
+    let mut blocks = vec![BasicBlock {
+        label: "entry".to_string(),
+        instructions: vec![
+            Instruction::Assign {
+                target: "left".to_string(),
+                value: Rvalue::Use(Operand::Int(1)),
+            },
+            Instruction::Assign {
+                target: "right".to_string(),
+                value: Rvalue::Use(Operand::Int(2)),
+            },
+        ],
+        terminator: Terminator::Branch {
+            condition: Operand::Bool(flag),
+            then_label: "left_branch".to_string(),
+            else_label: "right_branch".to_string(),
+        },
+    }];
+    if reverse_branch_storage {
+        blocks.extend([
+            branch_block("right_branch", "right"),
+            branch_block("left_branch", "left"),
+        ]);
+    } else {
+        blocks.extend([
+            branch_block("left_branch", "left"),
+            branch_block("right_branch", "right"),
+        ]);
+    }
+    blocks.push(BasicBlock {
+        label: "join".to_string(),
+        instructions: vec![
+            Instruction::Assign {
+                target: "called".to_string(),
+                value: Rvalue::Call {
+                    callee: CallTarget::Value(Operand::Place("callback".to_string())),
+                    args: Vec::new(),
+                },
+            },
+            Instruction::Assign {
+                target: "printed_left".to_string(),
+                value: Rvalue::Call {
+                    callee: CallTarget::Name("print".to_string()),
+                    args: vec![MirArg {
+                        name: None,
+                        value: Operand::Place("left".to_string()),
+                        writeback_place: None,
+                    }],
+                },
+            },
+            Instruction::Assign {
+                target: "printed_right".to_string(),
+                value: Rvalue::Call {
+                    callee: CallTarget::Name("print".to_string()),
+                    args: vec![MirArg {
+                        name: None,
+                        value: Operand::Place("right".to_string()),
+                        writeback_place: None,
+                    }],
+                },
+            },
+        ],
+        terminator: Terminator::Return(Operand::Int(0)),
+    });
+    let main = adr0038_closure_main(blocks, locals);
+    MirModule {
+        functions: vec![main, adr0038_set_capture_function()],
+        classes: Vec::new(),
+        trait_impls: Vec::new(),
+        constants: Vec::new(),
+        top_level: None,
+    }
+}
+
+#[cfg(unix)]
+fn adr0038_choose_pair_field_function() -> MirFunction {
+    MirFunction {
+        name: "choose_pair_field".to_string(),
+        module_name: "<cfg-closure-test>".to_string(),
+        source_path: None,
+        span: Span::new(1, 1),
+        receiver: None,
+        params: vec![
+            MirParam {
+                name: "pair".to_string(),
+                passing: MirReceiverKind::BorrowMut,
+                ty: Type::named("Pair"),
+                default_function: None,
+            },
+            MirParam {
+                name: "left".to_string(),
+                passing: MirReceiverKind::Borrow,
+                ty: Type::named("bool"),
+                default_function: None,
+            },
+        ],
+        local_types: vec![
+            MirLocalType {
+                name: "pair".to_string(),
+                ty: Type::named("Pair"),
+            },
+            MirLocalType {
+                name: "left".to_string(),
+                ty: Type::named("bool"),
+            },
+        ],
+        return_type: Type::named("int64"),
+        entry: "entry".to_string(),
+        blocks: vec![
+            BasicBlock {
+                label: "entry".to_string(),
+                instructions: Vec::new(),
+                terminator: Terminator::Branch {
+                    condition: Operand::Place("left".to_string()),
+                    then_label: "left".to_string(),
+                    else_label: "right".to_string(),
+                },
+            },
+            BasicBlock {
+                label: "left".to_string(),
+                instructions: vec![Instruction::ReturnLoan {
+                    loan: "pair.left".to_string(),
+                    origin: "pair".to_string(),
+                }],
+                terminator: Terminator::Return(Operand::Place("pair.left".to_string())),
+            },
+            BasicBlock {
+                label: "right".to_string(),
+                instructions: vec![Instruction::ReturnLoan {
+                    loan: "pair.right".to_string(),
+                    origin: "pair".to_string(),
+                }],
+                terminator: Terminator::Return(Operand::Place("pair.right".to_string())),
+            },
+        ],
+    }
+}
+
+#[cfg(unix)]
+fn adr0038_call_choose_pair_field(left: bool) -> Vec<Instruction> {
+    vec![
+        Instruction::Assign {
+            target: "call_result".to_string(),
+            value: Rvalue::Call {
+                callee: CallTarget::Name("choose_pair_field".to_string()),
+                args: vec![
+                    MirArg {
+                        name: None,
+                        value: Operand::Place("pair".to_string()),
+                        writeback_place: Some("pair".to_string()),
+                    },
+                    MirArg {
+                        name: None,
+                        value: Operand::Bool(left),
+                        writeback_place: None,
+                    },
+                ],
+            },
+        },
+        Instruction::BeginReturnedLoan {
+            loan: "selected".to_string(),
+            origin: "pair".to_string(),
+            projections: vec!["left".to_string(), "right".to_string()],
+            mutable: true,
+        },
+    ]
+}
+
+#[cfg(unix)]
+fn adr0038_selector_reuse_module() -> MirModule {
+    let closure_type = adr0038_mutable_closure_type();
+    let mut instructions = vec![Instruction::Assign {
+        target: "pair".to_string(),
+        value: Rvalue::Construct {
+            class_name: "Pair".to_string(),
+            fields: vec![
+                MirFieldInit {
+                    name: "left".to_string(),
+                    value: Operand::Int(1),
+                },
+                MirFieldInit {
+                    name: "right".to_string(),
+                    value: Operand::Int(2),
+                },
+            ],
+        },
+    }];
+    instructions.extend(adr0038_call_choose_pair_field(true));
+    instructions.extend([
+        Instruction::Assign {
+            target: "callback".to_string(),
+            value: Rvalue::Closure {
+                function: "set_capture".to_string(),
+                signature: closure_type.clone(),
+                captures: vec![MirClosureCapture {
+                    name: "captured".to_string(),
+                    value: Operand::Place("selected".to_string()),
+                    ty: Type::named("int64"),
+                    passing: MirReceiverKind::BorrowMut,
+                    source_place: Some("selected".to_string()),
+                    resolve_source_at_capture: true,
+                }],
+                consuming: false,
+            },
+        },
+        Instruction::EndLoan {
+            loan: "selected".to_string(),
+        },
+    ]);
+    instructions.extend(adr0038_call_choose_pair_field(false));
+    instructions.extend([
+        Instruction::EndLoan {
+            loan: "selected".to_string(),
+        },
+        Instruction::Assign {
+            target: "called".to_string(),
+            value: Rvalue::Call {
+                callee: CallTarget::Value(Operand::Place("callback".to_string())),
+                args: Vec::new(),
+            },
+        },
+        Instruction::Assign {
+            target: "printed_left".to_string(),
+            value: Rvalue::Call {
+                callee: CallTarget::Name("print".to_string()),
+                args: vec![MirArg {
+                    name: None,
+                    value: Operand::Place("pair.left".to_string()),
+                    writeback_place: None,
+                }],
+            },
+        },
+        Instruction::Assign {
+            target: "printed_right".to_string(),
+            value: Rvalue::Call {
+                callee: CallTarget::Name("print".to_string()),
+                args: vec![MirArg {
+                    name: None,
+                    value: Operand::Place("pair.right".to_string()),
+                    writeback_place: None,
+                }],
+            },
+        },
+    ]);
+    let locals = [
+        ("pair", Type::named("Pair")),
+        ("call_result", Type::named("int64")),
+        ("selected", Type::named("int64")),
+        ("callback", closure_type),
+        ("called", Type::Unit),
+        ("printed_left", Type::Unit),
+        ("printed_right", Type::Unit),
+    ]
+    .into_iter()
+    .map(|(name, ty)| MirLocalType {
+        name: name.to_string(),
+        ty,
+    })
+    .collect();
+    let main = adr0038_closure_main(
+        vec![BasicBlock {
+            label: "entry".to_string(),
+            instructions,
+            terminator: Terminator::Return(Operand::Int(0)),
+        }],
+        locals,
+    );
+    MirModule {
+        functions: vec![
+            main,
+            adr0038_choose_pair_field_function(),
+            adr0038_set_capture_function(),
+        ],
+        classes: vec![adr0038_pair_class()],
+        trait_impls: Vec::new(),
+        constants: Vec::new(),
+        top_level: None,
+    }
+}
+
+#[cfg(unix)]
+fn direct_runtime_link_args_for_test(prefix: &str) -> Vec<String> {
+    let archive = native_runtime_archive();
+    let runtime_identity = archive
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("native runtime archive should live below the target root")
+        .join("runtime-identity");
+    if !archive.is_file() || !runtime_identity.is_file() {
+        let bootstrap_cache = TempDir::new(&format!("{prefix}-bootstrap-cache"));
+        let (_bootstrap_source, bootstrap_path) = write_temp_source(
+            &format!("{prefix}-bootstrap-source"),
+            "def main() -> int32:\n    return 0\n",
+        );
+        let bootstrap = Command::new(aura_bin())
+            .env("AURA_CACHE_DIR", bootstrap_cache.path())
+            .args(["run", "--backend", "direct"])
+            .arg(&bootstrap_path)
+            .output()
+            .expect("failed to bootstrap direct runtime link metadata");
+        assert!(
+            bootstrap.status.success(),
+            "direct runtime bootstrap failed, stderr was:\n{}",
+            String::from_utf8_lossy(&bootstrap.stderr)
+        );
+    }
+    let runtime_identity = fs::read_to_string(runtime_identity)
+        .expect("direct runtime identity should be readable after bootstrap");
+    serde_json::from_str(
+        runtime_identity
+            .lines()
+            .nth(2)
+            .expect("runtime identity should contain native link arguments"),
+    )
+    .expect("native link arguments should be valid JSON")
+}
+
+#[cfg(unix)]
+fn run_linked_direct_mir(
+    module: &MirModule,
+    prefix: &str,
+    link_args: &[String],
+) -> std::process::Output {
+    let output_dir = TempDir::new(prefix);
+    let object_path = output_dir.path().join("program.o");
+    let binary_path = output_dir.path().join("program");
+    let object =
+        aura_compiler::emit_host_native_object_with_metadata(module, "/virtual/cfg_view.au", "")
+            .expect("manual CFG MIR should compile through the direct backend");
+    fs::write(&object_path, object).expect("direct object should be writable");
+    let mut linker = Command::new(std::env::var_os("CC").unwrap_or_else(|| "cc".into()));
+    linker
+        .arg(&object_path)
+        .arg(native_runtime_archive())
+        .arg("-o")
+        .arg(&binary_path);
+    linker.args(link_args);
+    let linked = linker.output().expect("failed to run direct object linker");
+    assert!(
+        linked.status.success(),
+        "direct object link failed, stderr was:\n{}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+    generated_binary(&binary_path)
+        .output()
+        .expect("failed to run linked direct CFG-view object")
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_cfg_view_identity_is_independent_of_block_storage_and_unreachable_metadata() {
+    let link_args = direct_runtime_link_args_for_test("aura-direct-cfg-view");
+    for (label, module) in [
+        ("forward", adr0038_cfg_view_module(false, false)),
+        ("reversed", adr0038_cfg_view_module(true, false)),
+        ("unreachable", adr0038_cfg_view_module(false, true)),
+    ] {
+        let mir = aura_compiler::run_mir(&module)
+            .unwrap_or_else(|error| panic!("{label} MIR execution failed: {error}"));
+        assert_eq!(mir.stdout, "11\n22\n", "{label} MIR output drifted");
+
+        let direct = run_linked_direct_mir(
+            &module,
+            &format!("aura-direct-cfg-view-{label}"),
+            &link_args,
+        );
+        assert!(
+            direct.status.success(),
+            "{label} direct binary failed, stderr was:\n{}",
+            String::from_utf8_lossy(&direct.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&direct.stdout),
+            mir.stdout,
+            "{label} direct output must match MIR regardless of block storage"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_closure_writebacks_follow_cfg_and_snapshot_returned_view_selectors() {
+    let link_args = direct_runtime_link_args_for_test("aura-direct-cfg-closure");
+    for (label, module, expected) in [
+        (
+            "branch-left",
+            adr0038_closure_branch_module(true, false),
+            "9\n2\n",
+        ),
+        (
+            "branch-right",
+            adr0038_closure_branch_module(false, false),
+            "1\n9\n",
+        ),
+        (
+            "branch-left-reversed",
+            adr0038_closure_branch_module(true, true),
+            "9\n2\n",
+        ),
+        (
+            "branch-right-reversed",
+            adr0038_closure_branch_module(false, true),
+            "1\n9\n",
+        ),
+        ("selector-reuse", adr0038_selector_reuse_module(), "9\n2\n"),
+    ] {
+        let mir = aura_compiler::run_mir(&module)
+            .unwrap_or_else(|error| panic!("{label} MIR execution failed: {error}"));
+        assert_eq!(mir.stdout, expected, "{label} MIR output drifted");
+
+        let direct = run_linked_direct_mir(
+            &module,
+            &format!("aura-direct-cfg-closure-{label}"),
+            &link_args,
+        );
+        assert!(
+            direct.status.success(),
+            "{label} direct binary failed, stderr was:\n{}",
+            String::from_utf8_lossy(&direct.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&direct.stdout),
+            expected,
+            "{label} direct writeback must follow the closure created on the executed CFG path"
+        );
+    }
+}
+
+#[test]
+fn run_and_direct_backends_support_loop_local_mutable_closures() {
+    let source = r#"
+def add(total: mut int64, item: int64):
+    total = total + item
+
+def main():
+    mut total = 0
+    for item in [1, 2]:
+        mut bump = lambda [mut total, item]: add(total, item)
+        bump()
+    print(total)
+"#;
+    assert_run_and_direct_source_stdout("aura-loop-local-mutable-closure-writeback", source, "3\n");
+}
+
+#[test]
+fn run_and_direct_backends_preserve_dynamic_returned_view_closure_writeback() {
+    let source = r#"
+class Pair:
+    left: int64
+    right: int64
+
+def choose(pair: mut Pair, left: bool) -> view mut int64 from pair:
+    if left:
+        return view mut pair.left
+    return view mut pair.right
+
+def forward(pair: mut Pair, left: bool) -> view mut int64 from pair:
+    return view mut choose(pair, left)
+
+def assign(value: mut int64, next: int64):
+    value = next
+
+def main():
+    mut pair = Pair(left=1, right=2)
+    view mut captured = forward(pair, false)
+    mut update: def(int64) -> None = lambda [mut captured] next: assign(captured, next)
+    update(41)
+    print(pair)
+"#;
+    assert_run_and_direct_source_stdout(
+        "aura-dynamic-returned-view-closure-writeback",
+        source,
+        "Pair(left=1, right=41)\n",
+    );
+}
+
+#[test]
+fn run_and_direct_backends_preserve_bounded_trait_dispatch_identity() {
+    let source = r#"
+trait Other:
+    def get(self) -> view int64 from self
+
+trait Project:
+    def get(self) -> view int64 from self
+
+trait OtherMut:
+    def get_mut(mut self) -> view mut int64 from self
+
+trait ProjectMut:
+    def get_mut(mut self) -> view mut int64 from self
+
+class Box:
+    left: int64
+    right: int64
+
+impl Other for Box:
+    def get(self) -> view int64 from self:
+        return view self.right
+
+impl Project for Box:
+    def get(self) -> view int64 from self:
+        return view self.left
+
+impl OtherMut for Box:
+    def get_mut(mut self) -> view mut int64 from self:
+        return view mut self.right
+
+impl ProjectMut for Box:
+    def get_mut(mut self) -> view mut int64 from self:
+        return view mut self.left
+
+def forward[T: Project](value: T) -> view int64 from value:
+    return view value.get()
+
+def update[T: ProjectMut](value: mut T):
+    view mut selected = value.get_mut()
+    selected = 9
+
+def main():
+    box = Box(left=1, right=2)
+    view selected = forward(box)
+    print(selected)
+    mut mutable_box = Box(left=3, right=4)
+    update(mutable_box)
+    print(mutable_box.left)
+    print(mutable_box.right)
+"#;
+    assert_run_and_direct_source_stdout(
+        "aura-bounded-trait-dispatch-identity",
+        source,
+        "1\n9\n4\n",
+    );
+}
+
+#[test]
+fn run_and_direct_backends_preserve_specialized_returned_view_trait_identity_in_both_impl_orders() {
+    let declarations = r#"
+trait Project:
+    def get(self) -> view int64 from self
+
+trait Other:
+    def get(self) -> view int64 from self
+
+class Box:
+    left: int64
+    right: int64
+"#;
+    let project_impl = r#"
+impl Project for Box:
+    def get(self) -> view int64 from self:
+        return view self.left
+"#;
+    let other_impl = r#"
+impl Other for Box:
+    def get(self) -> view int64 from self:
+        return view self.right
+"#;
+    let program = r#"
+def forward[T: Project](item: T) -> view int64 from item:
+    return view item.get()
+
+def main():
+    box = Box(left=1, right=2)
+    view selected = forward[Box](box)
+    print(selected)
+"#;
+
+    for (order, first_impl, second_impl) in [
+        ("project-first", project_impl, other_impl),
+        ("other-first", other_impl, project_impl),
+    ] {
+        let source = format!("{declarations}{first_impl}{second_impl}{program}");
+        assert_run_and_direct_source_stdout(
+            &format!("aura-specialized-returned-view-trait-{order}"),
+            &source,
+            "1\n",
+        );
+    }
+}
+
+#[test]
+fn run_and_direct_backends_compose_returned_view_descendants() {
+    let source = r#"
+class ScalarPair:
+    left: int64
+    right: int64
+
+def choose_mut(pair: mut ScalarPair, left: bool) -> view mut int64 from pair:
+    if left:
+        return view mut pair.left
+    return view mut pair.right
+
+def choose_shared(pair: ScalarPair, left: bool) -> view int64 from pair:
+    if left:
+        return view pair.left
+    return view pair.right
+
+def assign(value: mut int64, next: int64):
+    value = next
+
+class Cell:
+    value: int64
+
+class CellPair:
+    left: Cell
+    right: Cell
+
+class TuplePair:
+    left: (int64, int64)
+    right: (int64, int64)
+
+def left_cell(pair: mut CellPair) -> view mut Cell from pair:
+    return view mut pair.left
+
+def choose_cell(pair: mut CellPair, left: bool) -> view mut Cell from pair:
+    if left:
+        return view mut pair.left
+    return view mut pair.right
+
+def cell_value(cell: mut Cell) -> view mut int64 from cell:
+    return view mut cell.value
+
+def static_forward(pair: mut CellPair) -> view mut int64 from pair:
+    return view mut left_cell(pair).value
+
+def dynamic_forward(pair: mut CellPair, left: bool) -> view mut int64 from pair:
+    return view mut choose_cell(pair, left).value
+
+def nested_forward(pair: mut CellPair, left: bool) -> view mut int64 from pair:
+    return view mut cell_value(choose_cell(pair, left))
+
+def local_class_forward(pair: mut CellPair, left: bool) -> view mut int64 from pair:
+    view mut selected = choose_cell(pair, left)
+    return view mut selected.value
+
+def choose_tuple(pair: mut TuplePair, left: bool) -> view mut (int64, int64) from pair:
+    if left:
+        return view mut pair.left
+    return view mut pair.right
+
+def local_tuple_forward(pair: mut TuplePair, left: bool) -> view mut int64 from pair:
+    view mut selected = choose_tuple(pair, left)
+    return view mut selected[1]
+
+def main():
+    mut mutable_pair = ScalarPair(left=1, right=2)
+    view mut selected_mut = choose_mut(mutable_pair, false)
+    view mut child_mut = selected_mut
+    mut update: def(int64) -> None = lambda [mut child_mut] next: assign(child_mut, next)
+    update(9)
+    print(mutable_pair)
+
+    shared_pair = ScalarPair(left=3, right=4)
+    view selected_shared = choose_shared(shared_pair, true)
+    view child_shared = selected_shared
+    read: def() -> int64 = lambda [child_shared]: child_shared
+    print(read())
+
+    mut cells = CellPair(left=Cell(value=10), right=Cell(value=20))
+    view mut static_value = static_forward(cells)
+    static_value = 11
+    view mut dynamic_value = dynamic_forward(cells, false)
+    dynamic_value = 21
+    view mut nested_value = nested_forward(cells, true)
+    nested_value = 12
+    print(cells)
+
+    view mut local_class_value = local_class_forward(cells, false)
+    local_class_value = 22
+    print(cells)
+
+    mut tuples = TuplePair(left=(30, 40), right=(50, 60))
+    view mut local_tuple_value = local_tuple_forward(tuples, true)
+    local_tuple_value = 41
+    print(tuples)
+"#;
+    assert_run_and_direct_source_stdout(
+        "aura-returned-view-descendant-composition",
+        source,
+        "ScalarPair(left=1, right=9)\n3\nCellPair(left=Cell(value=12), right=Cell(value=21))\nCellPair(left=Cell(value=12), right=Cell(value=22))\nTuplePair(left=(30, 41), right=(50, 60))\n",
+    );
+}
+
+#[test]
+fn run_and_direct_backends_publish_mutable_call_writebacks_before_trap_cleanup() {
+    let cases = [
+        (
+            "closure-capture",
+            r#"
+class Resource:
+    value: int64
+
+    def close(mut self):
+        print(self.value)
+
+def mutate_then_trap(resource: mut Resource):
+    resource.value = 9
+    print(1 // 0)
+
+def main():
+    with resource = Resource(value=1):
+        mut action: def() -> None = lambda [mut resource]: mutate_then_trap(resource)
+        action()
+"#,
+        ),
+        (
+            "named-view",
+            r#"
+class Resource:
+    value: int64
+
+    def close(mut self):
+        print(self.value)
+
+def mutate_then_trap(resource: mut Resource):
+    resource.value = 9
+    print(1 // 0)
+
+def main():
+    with resource = Resource(value=1):
+        view mut alias = resource
+        mutate_then_trap(alias)
+"#,
+        ),
+        (
+            "immediate-returned-view",
+            r#"
+class Resource:
+    value: int64
+
+    def close(mut self):
+        print(self.value)
+
+def borrow_mut(resource: mut Resource) -> view mut Resource from resource:
+    return view mut resource
+
+def mutate_then_trap(resource: mut Resource):
+    resource.value = 9
+    print(1 // 0)
+
+def main():
+    with resource = Resource(value=1):
+        mutate_then_trap(borrow_mut(resource))
+"#,
+        ),
+    ];
+
+    for (label, source) in cases {
+        for output in run_and_direct_failure_outputs(
+            &format!("aura-adr0038-trap-write-through-{label}"),
+            source,
+        ) {
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                "9\n",
+                "{label} cleanup must observe every successful pre-trap mutation"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("error[AU4004]: division by zero"),
+                "{label} must preserve the body trap as primary, stderr was:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+#[test]
+fn run_and_direct_backends_support_immediate_mutable_returned_view_receivers() {
+    let source = r#"
+class Box:
+    value: int64
+
+    def set(mut self, next: int64):
+        self.value = next
+
+class Wrapper:
+    box: Box
+
+def borrow_box(box: mut Box) -> view mut Box from box:
+    return view mut box
+
+def borrow_wrapper(wrapper: mut Wrapper) -> view mut Wrapper from wrapper:
+    return view mut wrapper
+
+def borrow_values(values: mut list[int64]) -> view mut list[int64] from values:
+    return view mut values
+
+def main():
+    mut box = Box(value=1)
+    borrow_box(box).set(9)
+    print(box.value)
+
+    mut wrapper = Wrapper(box=Box(value=2))
+    borrow_wrapper(wrapper).box.set(10)
+    print(wrapper.box.value)
+
+    mut values = [1, 2]
+    borrow_values(values).append(3)
+    print(values)
+"#;
+
+    assert_run_and_direct_source_stdout(
+        "aura-adr0038-immediate-mutable-returned-view-receiver",
+        source,
+        "9\n10\n[1, 2, 3]\n",
+    );
 }
 
 fn assert_run_and_direct_source_stdout_with_timeout(
@@ -8058,6 +9278,43 @@ fn run_and_direct_backends_preserve_generic_numeric_receiver_dispatch() {
         "../../aura-compiler/tests/fixtures/run-pass/generic_numeric_receiver_dispatch.stdout"
     );
     assert_run_and_direct_source_stdout("generic-numeric-receiver-dispatch", source, expected);
+}
+
+#[test]
+fn direct_backend_releases_owned_projected_receivers_on_every_dynamic_dispatch_path() {
+    let source = r#"trait Label:
+    def label(self) -> str
+
+impl Label for int32:
+    def label(self) -> str:
+        return "first"
+
+impl Label for int64:
+    def label(self) -> str:
+        return "later"
+
+class Box[T: Label]:
+    value: T
+
+    def render(self) -> str:
+        return self.value.label()
+
+def main() -> int32:
+    first: Box[int32] = Box[int32](value=1)
+    later: Box[int64] = Box[int64](value=2)
+    print(first.render())
+    print(later.render())
+    return 0
+"#;
+
+    let (_, run) =
+        build_and_run_direct_source("aura-direct-owned-projected-dynamic-dispatch", source);
+    assert!(
+        run.status.success(),
+        "direct-backend binary should release the projected receiver on every dispatch path, stderr was:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "first\nlater\n");
 }
 
 #[test]

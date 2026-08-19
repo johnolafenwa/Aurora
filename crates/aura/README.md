@@ -159,7 +159,7 @@ aura deps update util
   - a file declaring none keeps the file-level model and reports one result for the path
 - `aura lsp`
   - run the persistent JSON-lines compiler service for editor tooling
-  - every request and response carries compiler-owned semantic-interface version `5`; a schema mismatch closes the connection before analysis
+  - every request and response carries compiler-owned semantic-interface version `6`; a schema mismatch closes the connection before analysis
 - `aura run [--backend mir|direct|auto] <file.au> [-- <program-args>...]`
   - `mir` executes the lowered MIR and is the default
   - `direct` builds a native binary and runs it, reporting build or launch failures rather than degrading
@@ -169,7 +169,7 @@ aura deps update util
   - human output flushes `aura: waiting for a concurrent build...` before blocking and `aura: building native program...` before building a native program artifact; JSON mode currently buffers these notices so stderr remains exactly one JSON document, reporting them through `progress` on success or diagnostic `notes` on failure, while an `auto` fallback also records its direct-to-MIR transition and reason in `fallback`
   - malformed entries and executable-format/architecture failures are discarded and rebuilt; temporary-directory, process-resource, and other environmental launch failures preserve the verified entry and follow the selected backend's ordinary error/fallback policy
   - the cache directory is a trust boundary: use only a location private to the current OS account; on the maintained Unix hosts, Aura rejects roots owned by another user or writable by group/other
-  - cache keys independently include native cache format `v5`, semantic-interface schema `v5`, the exact linked runtime archive, and ordered native link arguments; inherited launch leases and owner-aware staging cleanup prevent interrupted-run cleanup from deleting a live native child
+  - cache keys independently include native cache format `v5`, semantic-interface schema `v6`, the exact linked runtime archive, and ordered native link arguments; inherited launch leases and owner-aware staging cleanup prevent interrupted-run cleanup from deleting a live native child
   - caching is optional for an installed immutable runtime layout: an empty or unavailable cache does not prevent an otherwise valid direct build, but that build is not retained for a later hit
 - `aura build -o <output> <file.au>`
   - compile a standalone native binary for a program

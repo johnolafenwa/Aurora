@@ -226,6 +226,8 @@ The current compiler supports these statement forms:
 - assignment and compound assignment through `+=`, `-=`, `*=`, `**=`, `/=`,
   `%=`, `//=`, `&=`, `|=`, `^=`, `<<=`, and `>>=`
 - recursive tuple unpack assignment such as `name, count = record`
+- local shared and mutable view bindings, `view name = place` and
+  `view mut name = place`
 - `return`
 - `if` / `elif` / `else`
 - `while`
@@ -293,10 +295,9 @@ The current compiler supports these expression forms:
   `expr[start:]`, and `expr[:]`
 - owned first-axis Array slicing with the same one-colon forms; the result is
   a fresh Array, and indexed Array views remain unavailable
-- place-based `view name = place` and `view mut name = place`, including fixed
-  field/tuple projections, inferred final-use lifetimes, reborrowing, and
-  `-> view [mut] T from origin` returned access
-- function and method calls
+- function and method calls, including `-> view [mut] T from origin` returned
+  access through a local view-binding statement, a direct shared-expression
+  read, or an immediate mutable reborrow
 - explicit type arguments on call targets such as `Box[int32](...)` and `Result[int32, str].Ok(...)`
 - enum and built-in enum variant construction
 - `try expr`
@@ -991,8 +992,9 @@ The current compiler does not support:
 
 - non-numeric casts
 - direct recursive fields without `indirect`
-- method values, statement-bodied closures, shared parameter captures, or
-  mutable captured state
+- method values, statement-bodied closures, or implicit shared parameter
+  captures; mutable captured state is supported through an explicit
+  `lambda [mut place] ...` loan capture stored in a mutable local
 
 Current module/import limitations:
 
@@ -1034,6 +1036,10 @@ Current expression/ergonomics limitations:
   a blocking host thread
 - Unix domain sockets require a Unix host at runtime
 - subprocess APIs are shell-free and use explicit argv vectors; process groups and restart supervision are implemented, while PTY support is not
-- every function return is owned: copy results are ordinary copies, while a
-  non-copy result must be constructed, cloned, moved from owned input, or
-  obtained through an owner operation
+- ordinary function returns are owned: copy results are ordinary copies, while
+  a non-copy result must be constructed, cloned, moved from owned input, or
+  obtained through an owner operation. A function declared with
+  `-> view [mut] T from origin` instead returns non-owning shared or mutable
+  access to that receiver or parameter. The caller may use a matching view
+  binding; a shared result may also be read directly in one expression, and a
+  mutable result may be immediately reborrowed into a `mut` call.

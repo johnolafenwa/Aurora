@@ -2601,9 +2601,11 @@ class Counter:
         return self.value
 ```
 
-Returning a non-copy field requires ownership: clone it when clone-safe, or
-consume the owner with `own self`. Return annotations do not carry a source
-label or reserve an aliasing contract. See [Functions](/manual/functions#owned-returns).
+Returning a non-copy field through an ordinary `-> T` result requires
+ownership: clone it when clone-safe, or consume the owner with `own self`. A
+method may instead declare `-> view [mut] T from self` and return non-owning
+access to the receiver or one of its supported fixed projections. See
+[Functions](/manual/functions#owned-returns).
 
 ## `copy class`
 
@@ -2745,9 +2747,10 @@ implementation-defined.
 Ordinary and copy classes, generic classes, construction, defaults,
 visibility, inherent and associated methods, all maintained receiver modes,
 partial-field moves, recursive `indirect` fields, and non-generic user-resource
-classes are implemented for the post-Phase 1.5 surface. First-class field loans
-or views would require a new design; current return syntax reserves no such
-contract. Inheritance, properties,
+classes are implemented for the post-Phase 1.5 surface. ADR-0038 adds local
+shared or mutable views of fixed class fields and returned-view contracts tied
+to one receiver or parameter; views still cannot be stored in class fields or
+other owned aggregates. Inheritance, properties,
 custom constructor/destructor hooks, and generic `with` resources are
 unavailable and MUST NOT be inferred from accepted class syntax. The
 constructor evaluation rule is implemented under
@@ -3132,7 +3135,7 @@ The parser, checker, package resolver, diagnostic model, analysis engine, and MI
 
 `aura run --backend auto` prefers the direct backend and degrades to the MIR runtime only when direct building or launching is unavailable. Once a direct child runs, an Aura trap, signal termination, wait failure, or diagnostic-protocol failure is a final program/execution outcome and never triggers MIR fallback. Human mode prints an actual fallback reason on standard error before the MIR program runs; JSON mode includes it in the final structured report after execution. A forced `direct` run never degrades, so a parity or benchmark caller cannot silently measure the other backend. Every backend observes the same program arguments, standard output, exit code, and complete runtime diagnostic, including typed call frames and task ancestry.
 
-The native path is content-addressed. A successful direct build atomically publishes its binary, that artifact's SHA-256, and a key-bound unique entry identity into a cache keyed by native cache format `v5`, compiler-owned semantic-interface schema version `5`, this compiler's version, the host target, the backend, the exact linked runtime archive content, its ordered native link arguments, and the complete lowered program, which already incorporates the entry source and every resolved dependency source. The format and semantic identities are independent key fields: changing compiler-owned type or ownership metadata invalidates artifacts even if the native container format remains readable. Cache artifacts above 512 MiB are simply not retained; the just-built program still runs. A later run with the same inputs requires a regular directory and bounded regular sidecars, verifies the entry identity, digest, artifact size, execute permission, and platform-native executable shape, and only then uses the entry. It launches a private copy of exactly those verified bytes through a no-shell-fallback native execution path, so replacement of the shared cache pathname after verification cannot substitute different bytes. Missing or mismatched metadata, truncation, a non-regular member, a lost execute permission, or an executable-format/architecture rejection makes the entry a cache miss: Aura quarantines and removes that exact entry, then rebuilds before running. A temporary-directory failure, process-resource failure, `noexec` mount, or other environmental launch failure is not evidence that verified cache bytes are corrupt; Aura preserves the entry and reports or falls back according to the selected backend.
+The native path is content-addressed. A successful direct build atomically publishes its binary, that artifact's SHA-256, and a key-bound unique entry identity into a cache keyed by native cache format `v5`, compiler-owned semantic-interface schema version `6`, this compiler's version, the host target, the backend, the exact linked runtime archive content, its ordered native link arguments, and the complete lowered program, which already incorporates the entry source and every resolved dependency source. The format and semantic identities are independent key fields: changing compiler-owned type or ownership metadata invalidates artifacts even if the native container format remains readable. Cache artifacts above 512 MiB are simply not retained; the just-built program still runs. A later run with the same inputs requires a regular directory and bounded regular sidecars, verifies the entry identity, digest, artifact size, execute permission, and platform-native executable shape, and only then uses the entry. It launches a private copy of exactly those verified bytes through a no-shell-fallback native execution path, so replacement of the shared cache pathname after verification cannot substitute different bytes. Missing or mismatched metadata, truncation, a non-regular member, a lost execute permission, or an executable-format/architecture rejection makes the entry a cache miss: Aura quarantines and removes that exact entry, then rebuilds before running. A temporary-directory failure, process-resource failure, `noexec` mount, or other environmental launch failure is not evidence that verified cache bytes are corrupt; Aura preserves the entry and reports or falls back according to the selected backend.
 
 On maintained Unix hosts, cache establishment is coordinated across processes. A short runtime-identity lock protects source-checkout runtime discovery, and a separate writer lock for each content key protects the miss/recheck/build/publish sequence. Therefore, N concurrent cold runs of the same program perform one build; after that publication, the other N-1 processes recheck and consume the verified entry. Existing verified hits take the optimistic read path and do not wait for a writer holding that key. Locks are released before linking output is executed, while atomic publication and invalidation continue to ensure that readers never observe a partial entry and a stale invalidator cannot delete a replacement published for the same key.
 
@@ -3155,7 +3158,7 @@ streaming contract is ratified.
 
 `AURA_CACHE_DIR` selects the cache directory; the default is `~/.cache/aura/native`. The directory is a trust boundary. Its colocated SHA-256 detects corruption but does not authenticate bytes written by a hostile account, so the root must be private to the current OS user and every writer with access to it must be trusted. On the maintained Unix hosts, Aura rejects a root that is owned by another user or writable by group/other and creates or tightens accepted cache directories to mode `0700`. Private launch copies are removed after the child exits. Each launch carries an inherited exclusive lease, so later cleanup preserves the directory while either the `aura` parent or native child is still using it. Interrupted cache-publication, memo, and quarantine stages are collected only after their encoded 24-hour grace period and confirmation that their owner process is gone. An installed immutable runtime can still perform a direct build when caching is disabled or unavailable; no cache lock is required merely to build, and the uncached artifact is not retained.
 
-ADR-0031 ratifies the command split: `aura run` defaults to `mir` for the interactive edit-run path, while `aura build` defaults to `auto` for artifact production. Maintained measurements put a cold miss at about 1.3 seconds; a direct hello-world executable is roughly 57 MB of statically linked runtime. Each cache hit reads, hashes, and privately materializes the artifact, and workloads dominated by programs seen once, including CI, still pay the cold path on every program. `aura build --backend direct` uses native direct emission, and `--backend auto` may select the checked MIR-launcher fallback. The language server delegates semantic analysis and completion to the persistent compiler service; every JSON-lines request and response identifies semantic-interface schema version `5`. A missing or different identity closes the incompatible service and invalidates all document analysis before the lexical recovery path is used, so cached function-type or ownership metadata cannot cross compiler versions. The lexical fallback is recovery-only and is not a second language implementation.
+ADR-0031 ratifies the command split: `aura run` defaults to `mir` for the interactive edit-run path, while `aura build` defaults to `auto` for artifact production. Maintained measurements put a cold miss at about 1.3 seconds; a direct hello-world executable is roughly 57 MB of statically linked runtime. Each cache hit reads, hashes, and privately materializes the artifact, and workloads dominated by programs seen once, including CI, still pay the cold path on every program. `aura build --backend direct` uses native direct emission, and `--backend auto` may select the checked MIR-launcher fallback. The language server delegates semantic analysis and completion to the persistent compiler service; every JSON-lines request and response identifies semantic-interface schema version `6`. A missing or different identity closes the incompatible service and invalidates all document analysis before the lexical recovery path is used, so cached function-type or ownership metadata cannot cross compiler versions. The lexical fallback is recovery-only and is not a second language implementation.
 
 Backend parity is a release gate. A construct accepted by one maintained
 execution backend must have the same observable result or complete diagnostic
@@ -5628,7 +5631,7 @@ imported module is never mislabeled with the entry module's path.
 
 The arrays are an additive schema-version-1 extension. Schema-version-1
 readers MUST ignore unrecognized object members while continuing to validate
-the fields they use. The compiler-service semantic-interface version is `5`.
+the fields they use. The compiler-service semantic-interface version is `6`.
 
 The process exits unsuccessfully after emitting a JSON error report. Tools MUST
 parse standard error as one JSON document in JSON mode and MUST NOT scrape the
@@ -8631,11 +8634,17 @@ parameter origin:
     class User:
         name: str
 
+    class Counter:
+        value: int64
+
     def name(user: User) -> view str from user:
         return view user.name
 
-    def name_mut(user: mut User) -> view mut str from user:
-        return view mut user.name
+    def value_mut(counter: mut Counter) -> view mut int64 from counter:
+        return view mut counter.value
+
+    def bump(value: mut int64):
+        value += 1
 
 The `from` origin is mandatory and belongs to the signature. It is encoded by
 receiver/parameter slot across modules and trait conformance, so an
@@ -8646,14 +8655,23 @@ shared result may use a bare or `mut` origin. A mutable result requires a
 Every reachable `return view` must trace to the origin or one of its supported
 fixed field or tuple projections. Locals, temporaries, enum arm payloads, and
 newly allocated values cannot escape. At a call, the origin argument must be
-an addressable place and the result must initialize a matching local view:
+an addressable place. A returned view may initialize a matching local `view`
+or `view mut` binding. A shared result may instead be read directly within one
+containing expression, and a mutable result may be immediately reborrowed into
+a `mut` call. A returned view cannot initialize an ordinary owned binding or
+be stored inside an aggregate.
 
-    mut user = User(name="Ada")
+    user = User(name="Ada")
     view current = name(user)
     print(current)
+    print(name(user))
 
-    view mut editable = name_mut(user)
-    editable = "Grace"
+    mut counter = Counter(value=0)
+    view mut editable = value_mut(counter)
+    editable += 1
+    print(counter.value)
+    bump(value_mut(counter))
+    print(counter.value)
 
 Return paths may select different fixed projections of the one declared
 origin. The caller locks that origin conservatively and execution retains the
@@ -8868,15 +8886,16 @@ implementation-defined.
 ## Status
 
 The function, method, generic, capture-free function-value, default-argument,
-named-argument, owned-return, inferred clone-safety, task-target, and
-entrypoint contracts described above are implemented. Supplied/default
+named-argument, ordinary owned-return, returned-view, inferred clone-safety,
+task-target, and entrypoint contracts described above are implemented. Supplied/default
 evaluation and argument capture follow
 `architecture_docs/decisions/0015-explicit-and-default-argument-order.md`,
 which is **Accepted**. The rules are pinned
 by
 `crates/aura-compiler/tests/fixtures/run-pass/explicit_and_default_argument_order.au`
-on both backends. Return values are owned. By-value expression closures are
-implemented under Accepted ADR-0037. FFI v0 adds bodyless direct-call-only
+on both backends. Ordinary `-> T` return values are owned; only an explicit
+`-> view [mut] T from origin` contract returns non-owning access. By-value
+expression closures are implemented under Accepted ADR-0037. FFI v0 adds bodyless direct-call-only
 `extern "C" def` declarations; they are not function values and their
 restricted signatures are specified by [FFI v0](/manual/ffi).
 
@@ -9342,7 +9361,10 @@ Invariant generics, local/contextual inference, explicit specialization,
 nominal traits and bounds, supertraits, default methods, generic and specialized
 implementations, unique-most-specific dispatch, operator traits, `Self`, and
 `From`-based `try` conversion plus inferred clone-safety contracts are implemented for the post-Phase 1.5 surface.
-Return values are owned. Trait objects, dynamic dispatch, associated types,
+Ordinary `-> T` return values are owned. Generic functions and methods may
+instead declare `-> view [mut] T from origin`; trait implementations preserve
+the trait declaration's origin slot as well as its specialized pointee type.
+Trait objects, dynamic dispatch, associated types,
 higher-kinded types, general
 subtyping, and arbitrary blanket implementation targets are unavailable.
 
@@ -12808,7 +12830,7 @@ Block-local bindings do not escape their branch, arm, loop, or `with` body. See 
 
 ## Owned Returns
 
-Every function return transfers an owned value to its caller. Copy values are
+Every ordinary `-> T` function return transfers an owned value to its caller. Copy values are
 ordinary independent copies. A non-copy return must come from an owned source:
 
 ```aura
@@ -12843,19 +12865,41 @@ ordinary parameter:
     class User:
         name: str
 
+    class Counter:
+        value: int64
+
     def name(user: User) -> view str from user:
         return view user.name
 
-    def name_mut(user: mut User) -> view mut str from user:
-        return view mut user.name
+    def value_mut(counter: mut Counter) -> view mut int64 from counter:
+        return view mut counter.value
+
+    def bump(value: mut int64):
+        value += 1
+
+    def main():
+        user = User(name="Ada")
+        view current = name(user)
+        print(current)
+        print(name(user))
+
+        mut counter = Counter(value=0)
+        view mut editable = value_mut(counter)
+        editable += 1
+        print(counter.value)
+        bump(value_mut(counter))
+        print(counter.value)
 
 The origin is part of the callable contract. A shared result may originate
 from bare or mutable access; a mutable result requires a `mut` origin. An
 `own` or defaulted parameter, callee local, temporary, or newly allocated
-value cannot be an origin. A caller must supply an addressable origin and bind
-the result with a matching `view` form. Trait implementations must use the
-same receiver or parameter slot as the trait declaration even if parameter
-names differ.
+value cannot be an origin. A caller must supply an addressable origin. The
+result may initialize a matching `view` or `view mut` binding; alternatively,
+a shared result may be read directly within one containing expression and a
+mutable result may be immediately reborrowed into a `mut` call. Ordinary owned
+bindings and aggregate storage cannot receive a returned view. Trait
+implementations must use the same receiver or parameter slot as the trait
+declaration even if parameter names differ.
 
 Different return paths may select different fixed projections of the declared
 origin; the caller locks that origin conservatively while execution retains the
@@ -15626,7 +15670,7 @@ youngest-first task ancestry. Each public schema-version-1 frame span has its
 own required source `path`; the analysis/LSP editor shape permits an optional
 `file_path` for source-only analysis. The public diagnostic schema remains
 version `1` because the always-present arrays are an additive extension;
-compiler-service/editor transport uses semantic schema version `5`. This
+compiler-service/editor transport uses semantic schema version `6`. This
 version includes structural function values, import aliases, and the expanded
 numeric expression surface, and forwards the same diagnostic records.
 
@@ -16385,9 +16429,11 @@ declarations rather than `def(...) -> ...` values.
 
 The scalar, collection, enum, class, trait-bound, resource, optional, result,
 and indirect types described by this Manual are implemented for the post-Phase
-1.5 surface. Return values are owned, and current syntax reserves no future
-loan or view contract. Capture-free function types and by-value expression
-closures are implemented. FFI v0 fixed-width declarations, byte/string views,
+1.5 surface. Ordinary `-> T` return values are owned. An explicit
+`-> view [mut] T from origin` declaration instead returns non-owning access,
+but a view descriptor is not an owned or structural `def(...) -> R` type and
+cannot be stored in fields or collections. Capture-free function types and
+by-value expression closures are implemented. FFI v0 fixed-width declarations, byte/string views,
 and opaque handle types are implemented; extern functions do not become
 first-class function values. Method-value types are unavailable.
 Structural tuple types
@@ -20420,10 +20466,11 @@ See [examples/basics/named_builtin_arguments.au](../examples/basics/named_builti
 Functions may return any concrete type accepted in a return annotation,
 including scalars, tuples, strings, collections, numeric arrays, classes,
 enums, generic specializations, function values, `Result[T, E]`, `Option[T]`,
-`Task[T]`, and `None`. Every result is owned; return types never describe a
-borrow into an argument or local value.
+`Task[T]`, and `None`. An ordinary `-> T` result is owned. A separate
+`-> view T from source` or `-> view mut T from source` contract returns a
+non-owning view tied to one receiver or parameter.
 
-Every function return is an owned value. Returning a copy type produces an
+Every ordinary return is an owned value. Returning a copy type produces an
 ordinary independent copy:
 
 ```aura check-pass
@@ -20452,10 +20499,46 @@ type is clone-safe, accept an `own` parameter and move from it, or provide an
 owner operation such as an `own self` method. A shared parameter cannot expose
 one of its non-copy fields as a return value.
 
-Every function result is an owned value. Returning a Copy value copies it;
-returning a non-Copy value requires constructing, cloning, or moving a value
-the function owns. Return annotations contain only the result type and never
-name an argument, field, or lifetime source.
+An ordinary result never names an argument, field, or lifetime source.
+Returning a Copy value copies it; returning a non-Copy value requires
+constructing, cloning, or moving a value the function owns.
+
+Use an explicit returned-view contract when the result must keep borrowing one
+caller-owned place:
+
+```aura check-pass
+class User:
+    name: str
+
+class Counter:
+    value: int64
+
+def name(user: User) -> view str from user:
+    return view user.name
+
+def value_mut(counter: mut Counter) -> view mut int64 from counter:
+    return view mut counter.value
+
+def bump(value: mut int64):
+    value += 1
+
+def main():
+    user = User(name="Ada")
+    view display = name(user)
+    print(display)
+    print(name(user))
+
+    mut counter = Counter(value=0)
+    bump(value_mut(counter))
+    print(counter.value)
+```
+
+The origin after `from` is part of the function type. The caller must supply
+an addressable place. Binding the result with matching `view` or `view mut`
+syntax is one option. A shared result may also be read directly within one
+containing expression, and a mutable result may be immediately reborrowed into
+a `mut` call. A returned view cannot be stored as an ordinary owned value or
+inside an aggregate.
 
 ## Generic Functions
 
@@ -24068,6 +24151,8 @@ The current compiler supports these statement forms:
 - assignment and compound assignment through `+=`, `-=`, `*=`, `**=`, `/=`,
   `%=`, `//=`, `&=`, `|=`, `^=`, `<<=`, and `>>=`
 - recursive tuple unpack assignment such as `name, count = record`
+- local shared and mutable view bindings, `view name = place` and
+  `view mut name = place`
 - `return`
 - `if` / `elif` / `else`
 - `while`
@@ -24135,10 +24220,9 @@ The current compiler supports these expression forms:
   `expr[start:]`, and `expr[:]`
 - owned first-axis Array slicing with the same one-colon forms; the result is
   a fresh Array, and indexed Array views remain unavailable
-- place-based `view name = place` and `view mut name = place`, including fixed
-  field/tuple projections, inferred final-use lifetimes, reborrowing, and
-  `-> view [mut] T from origin` returned access
-- function and method calls
+- function and method calls, including `-> view [mut] T from origin` returned
+  access through a local view-binding statement, a direct shared-expression
+  read, or an immediate mutable reborrow
 - explicit type arguments on call targets such as `Box[int32](...)` and `Result[int32, str].Ok(...)`
 - enum and built-in enum variant construction
 - `try expr`
@@ -24833,8 +24917,9 @@ The current compiler does not support:
 
 - non-numeric casts
 - direct recursive fields without `indirect`
-- method values, statement-bodied closures, shared parameter captures, or
-  mutable captured state
+- method values, statement-bodied closures, or implicit shared parameter
+  captures; mutable captured state is supported through an explicit
+  `lambda [mut place] ...` loan capture stored in a mutable local
 
 Current module/import limitations:
 
@@ -24876,9 +24961,13 @@ Current expression/ergonomics limitations:
   a blocking host thread
 - Unix domain sockets require a Unix host at runtime
 - subprocess APIs are shell-free and use explicit argv vectors; process groups and restart supervision are implemented, while PTY support is not
-- every function return is owned: copy results are ordinary copies, while a
-  non-copy result must be constructed, cloned, moved from owned input, or
-  obtained through an owner operation
+- ordinary function returns are owned: copy results are ordinary copies, while
+  a non-copy result must be constructed, cloned, moved from owned input, or
+  obtained through an owner operation. A function declared with
+  `-> view [mut] T from origin` instead returns non-owning shared or mutable
+  access to that receiver or parameter. The caller may use a matching view
+  binding; a shared result may also be read directly in one expression, and a
+  mutable result may be immediately reborrowed into a `mut` call.
 
 ## Source: tutorials/15-generics.md
 

@@ -125,9 +125,15 @@ rejected. Bare matching is shared, `match own` consumes, and `match mut`
 requires mutable access with writeback. Local assignment retains its ordinary
 copy-or-move behavior.
 
-Every return is owned. Copy results are ordinary copies. A non-copy result must
-be constructed, cloned when clone-safe, moved from an owned input, or produced
-through an owner operation.
+Ordinary returns are owned. Copy results are ordinary copies. A non-copy result
+must be constructed, cloned when clone-safe, moved from an owned input, or
+produced through an owner operation. A declaration with
+`-> view [mut] T from origin` is the explicit exception: it returns a
+non-owning view whose origin is one receiver or parameter. The result may
+initialize a matching `view` or `view mut` binding. A shared result may instead
+be read directly within one containing expression, while a mutable result may
+be immediately reborrowed into a `mut` call. It cannot enter an ordinary owned
+binding or aggregate storage.
 
 Aura's `FunctionChecker` tracks local bindings with information such as:
 

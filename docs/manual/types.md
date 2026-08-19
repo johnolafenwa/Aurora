@@ -497,9 +497,11 @@ declarations rather than `def(...) -> ...` values.
 
 The scalar, collection, enum, class, trait-bound, resource, optional, result,
 and indirect types described by this Manual are implemented for the post-Phase
-1.5 surface. Return values are owned, and current syntax reserves no future
-loan or view contract. Capture-free function types and by-value expression
-closures are implemented. FFI v0 fixed-width declarations, byte/string views,
+1.5 surface. Ordinary `-> T` return values are owned. An explicit
+`-> view [mut] T from origin` declaration instead returns non-owning access,
+but a view descriptor is not an owned or structural `def(...) -> R` type and
+cannot be stored in fields or collections. Capture-free function types and
+by-value expression closures are implemented. FFI v0 fixed-width declarations, byte/string views,
 and opaque handle types are implemented; extern functions do not become
 first-class function values. Method-value types are unavailable.
 Structural tuple types

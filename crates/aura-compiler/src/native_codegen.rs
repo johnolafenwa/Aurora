@@ -32,6 +32,8 @@ const DIRECT_TO_FLOAT_ARITY_ERROR: &str =
     "direct backend expected `to_float()` to take no arguments";
 const WIDE_INTEGER_BINARY_ERROR: &str =
     "direct backend does not support wide integer binary operation";
+const DIRECT_INTERNAL_SLICE_ARITY_ERROR: &str =
+    "direct backend expected internal slicing to receive start, start presence, end, end presence, line, and column";
 
 pub fn emit_host_object(module: &MirModule) -> std::result::Result<Vec<u8>, String> {
     emit_host_object_with_metadata(module, "<aura>", "")
@@ -372,6 +374,7 @@ fn function_value_param_types(
 
 struct NativeCodegen<'a> {
     module: &'a MirModule,
+    reachable_blocks: HashMap<String, HashSet<String>>,
     safepoints_enabled: bool,
     program_path: String,
     program_source: String,
@@ -407,6 +410,13 @@ struct NativeCodegen<'a> {
     register_cleanup: FuncId,
     unregister_cleanup: FuncId,
     refresh_cleanup: FuncId,
+    set_next_mutable_sinks: FuncId,
+    set_next_indirect_mutable_sinks: FuncId,
+    current_mutable_sink: FuncId,
+    mutable_sink_new: FuncId,
+    mutable_sink_project: FuncId,
+    mutable_sink_store_owned: FuncId,
+    mutable_sink_release: FuncId,
     close_value: FuncId,
     tag_value_type: FuncId,
     box_i32: FuncId,
@@ -850,6 +860,11 @@ fn required_named_arg<'a>(
     argument.ok_or(message.to_string())
 }
 
+fn direct_internal_slice_args(args: &[MirArg]) -> std::result::Result<&[MirArg; 6], String> {
+    args.try_into()
+        .map_err(|_| DIRECT_INTERNAL_SLICE_ARITY_ERROR.to_string())
+}
+
 fn required_direct_field_slice(
     ty: &DirectType,
     field: &str,
@@ -867,11 +882,11 @@ impl<'a> NativeCodegen<'a> {
         program_path: &str,
         program_source: &str,
     ) -> std::result::Result<Self, String> {
-        validate_module(module)?;
+        let reachable_blocks = validate_module(module)?;
         // A program with no task-start operation cannot have a runnable sibling
         // for a loop to starve. Keep explicit MIR markers for portability, but
         // elide their native fast-path cost for provably sequential programs.
-        let safepoints_enabled = !collect_task_start_targets(module).is_empty();
+        let safepoints_enabled = !collect_task_start_targets(module, &reachable_blocks).is_empty();
         let mut classes = HashMap::new();
         for class in &module.classes {
             classes.insert(class.name.clone(), class.clone());
@@ -912,6 +927,13 @@ impl<'a> NativeCodegen<'a> {
             register_cleanup => ("aura_direct_register_cleanup", [types::I64, types::I64, types::I64], Some(types::I64)),
             unregister_cleanup => ("aura_direct_unregister_cleanup", [types::I64], None),
             refresh_cleanup => ("aura_direct_refresh_cleanup", [types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+            set_next_mutable_sinks => ("aura_direct_set_next_mutable_sinks", [types::I64, types::I64], None),
+            set_next_indirect_mutable_sinks => ("aura_direct_set_next_indirect_mutable_sinks", [types::I64, types::I64, types::I64, types::I64, types::I64], None),
+            current_mutable_sink => ("aura_direct_current_mutable_sink", [types::I64], Some(types::I64)),
+            mutable_sink_new => ("aura_direct_mutable_sink_new", [types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+            mutable_sink_project => ("aura_direct_mutable_sink_project", [types::I64, types::I64, types::I64], Some(types::I64)),
+            mutable_sink_store_owned => ("aura_direct_mutable_sink_store_owned", [types::I64, types::I64], None),
+            mutable_sink_release => ("aura_direct_mutable_sink_release", [types::I64], None),
             close_value => ("aura_direct_close_value", [types::I64, types::I64], Some(types::I64)),
             tag_value_type => ("aura_direct_tag_value_type", [types::I64, types::I64, types::I64], None),
             box_i32 => ("aura_direct_box_i32", [types::I64], Some(types::I64)),
@@ -1238,6 +1260,12 @@ impl<'a> NativeCodegen<'a> {
         let mut function_param_types = HashMap::new();
         let mut function_writeback_types = HashMap::new();
         for function in module.functions.iter().chain(module.top_level.iter()) {
+            let function_reachable = reachable_blocks.get(&function.name).ok_or_else(|| {
+                format!(
+                    "direct backend is missing reachable-block metadata for `{}`",
+                    function.name
+                )
+            })?;
             let signature = signature_for(function, &classes, call_conv)?;
             let func_id = try_or_string_error!(
                 object.declare_function(&mangle_symbol(&function.name), Linkage::Local, &signature),
@@ -1267,7 +1295,10 @@ impl<'a> NativeCodegen<'a> {
                 function.name
             );
             function_default_binders.insert(function.name.clone(), binder_id);
-            for (cleanup_index, place) in collect_cleanup_places(function).into_iter().enumerate() {
+            for (cleanup_index, place) in collect_cleanup_places(function, function_reachable)
+                .into_iter()
+                .enumerate()
+            {
                 let cleanup_id = try_or_string_error!(
                     object.declare_function(
                         &mangle_cleanup_thunk_symbol(&function.name, &place, cleanup_index),
@@ -1316,6 +1347,7 @@ impl<'a> NativeCodegen<'a> {
 
         Ok(Self {
             module,
+            reachable_blocks,
             safepoints_enabled,
             program_path: program_path.to_string(),
             program_source: program_source.to_string(),
@@ -1351,6 +1383,13 @@ impl<'a> NativeCodegen<'a> {
             register_cleanup,
             unregister_cleanup,
             refresh_cleanup,
+            set_next_mutable_sinks,
+            set_next_indirect_mutable_sinks,
+            current_mutable_sink,
+            mutable_sink_new,
+            mutable_sink_project,
+            mutable_sink_store_owned,
+            mutable_sink_release,
             close_value,
             tag_value_type,
             box_i32,
@@ -1709,8 +1748,21 @@ impl<'a> NativeCodegen<'a> {
         let mut builder_ctx = FunctionBuilderContext::new();
         let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
 
+        let reachable_blocks = self
+            .reachable_blocks
+            .get(&function.name)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "direct backend is missing reachable-block metadata for `{}`",
+                    function.name
+                )
+            })?;
         let mut blocks = HashMap::new();
         for block in &function.blocks {
+            if !reachable_blocks.contains(&block.label) {
+                continue;
+            }
             blocks.insert(block.label.clone(), builder.create_block());
         }
 
@@ -1826,6 +1878,7 @@ impl<'a> NativeCodegen<'a> {
         let temporary_assignments = function
             .blocks
             .iter()
+            .filter(|block| reachable_blocks.contains(&block.label))
             .flat_map(|block| block.instructions.iter())
             .filter_map(|instruction| {
                 let Instruction::Assign { target, value } = instruction else {
@@ -1887,6 +1940,9 @@ impl<'a> NativeCodegen<'a> {
 
         let mut cleanup_places = Vec::<String>::new();
         for block in &function.blocks {
+            if !reachable_blocks.contains(&block.label) {
+                continue;
+            }
             for instruction in &block.instructions {
                 let Instruction::PushCleanup { place } = instruction else {
                     continue;
@@ -1916,10 +1972,11 @@ impl<'a> NativeCodegen<'a> {
 
         let safepoint_fuel = if self.safepoints_enabled
             && function.blocks.iter().any(|block| {
-                block
-                    .instructions
-                    .iter()
-                    .any(|instruction| matches!(instruction, Instruction::Safepoint))
+                reachable_blocks.contains(&block.label)
+                    && block
+                        .instructions
+                        .iter()
+                        .any(|instruction| matches!(instruction, Instruction::Safepoint))
             }) {
             let variable = Variable::from_u32(variable_index as u32);
             variable_index += 1;
@@ -1933,7 +1990,77 @@ impl<'a> NativeCodegen<'a> {
             None
         };
 
+        let view_selector_tags = direct_view_selector_tags(function, &reachable_blocks);
+        let mut view_selector_vars = HashMap::new();
+        let mut selector_loans = view_selector_tags.keys().cloned().collect::<Vec<_>>();
+        selector_loans.sort();
+        for loan in selector_loans {
+            let variable = Variable::from_u32(variable_index as u32);
+            variable_index += 1;
+            builder.declare_var(variable, types::I64);
+            let zero = builder.ins().iconst(types::I64, 0);
+            builder.def_var(variable, zero);
+            view_selector_vars.insert(loan, variable);
+        }
+
+        let mut closure_selector_tags = HashMap::new();
+        let mut closure_selector_counts = HashMap::<String, i64>::new();
+        for block in &function.blocks {
+            if !reachable_blocks.contains(&block.label) {
+                continue;
+            }
+            for (instruction_index, instruction) in block.instructions.iter().enumerate() {
+                let Instruction::Assign {
+                    target,
+                    value: Rvalue::Closure { captures, .. },
+                } = instruction
+                else {
+                    continue;
+                };
+                if !captures
+                    .iter()
+                    .any(|capture| capture.passing == MirReceiverKind::BorrowMut)
+                {
+                    continue;
+                }
+                let root = target.split('.').next().unwrap_or(target).to_string();
+                let next = closure_selector_counts.entry(root).or_default();
+                closure_selector_tags.insert((block.label.clone(), instruction_index), *next);
+                *next = next.checked_add(1).ok_or_else(|| {
+                    format!(
+                        "direct backend closure selector count overflows in `{}`",
+                        function.name
+                    )
+                })?;
+            }
+        }
+        let mut closure_selector_vars = HashMap::new();
+        let mut closure_roots = closure_selector_counts.into_keys().collect::<Vec<_>>();
+        closure_roots.sort();
+        for root in closure_roots {
+            let variable = Variable::from_u32(variable_index as u32);
+            variable_index += 1;
+            builder.declare_var(variable, types::I64);
+            let unset = builder.ins().iconst(types::I64, -1);
+            builder.def_var(variable, unset);
+            closure_selector_vars.insert(root, variable);
+        }
+
         let mut writeback_locals = Vec::new();
+        let mut mutable_param_indices = HashMap::new();
+        let mut call_slot = 0usize;
+        if function.receiver.is_some() {
+            if function.receiver == Some(MirReceiverKind::BorrowMut) {
+                mutable_param_indices.insert("self".to_string(), call_slot);
+            }
+            call_slot += 1;
+        }
+        for param in &function.params {
+            if param.passing == MirReceiverKind::BorrowMut {
+                mutable_param_indices.insert(param.name.clone(), call_slot);
+            }
+            call_slot += 1;
+        }
         if function.receiver == Some(MirReceiverKind::BorrowMut) {
             let receiver_ty = receiver_type(function, &self.classes)?;
             writeback_locals.push(("self".to_string(), receiver_ty));
@@ -2020,6 +2147,27 @@ impl<'a> NativeCodegen<'a> {
         let refresh_cleanup = self
             .object
             .declare_func_in_func(self.refresh_cleanup, builder.func);
+        let set_next_mutable_sinks = self
+            .object
+            .declare_func_in_func(self.set_next_mutable_sinks, builder.func);
+        let set_next_indirect_mutable_sinks = self
+            .object
+            .declare_func_in_func(self.set_next_indirect_mutable_sinks, builder.func);
+        let current_mutable_sink = self
+            .object
+            .declare_func_in_func(self.current_mutable_sink, builder.func);
+        let mutable_sink_new = self
+            .object
+            .declare_func_in_func(self.mutable_sink_new, builder.func);
+        let mutable_sink_project = self
+            .object
+            .declare_func_in_func(self.mutable_sink_project, builder.func);
+        let mutable_sink_store_owned = self
+            .object
+            .declare_func_in_func(self.mutable_sink_store_owned, builder.func);
+        let mutable_sink_release = self
+            .object
+            .declare_func_in_func(self.mutable_sink_release, builder.func);
         let tag_value_type = self
             .object
             .declare_func_in_func(self.tag_value_type, builder.func);
@@ -2982,11 +3130,16 @@ impl<'a> NativeCodegen<'a> {
             current_function_name,
             current_function_path,
             writeback_locals,
+            mutable_param_indices,
             classes: self.classes.clone(),
             trait_impls: self.trait_impls.clone(),
             return_type: function.return_type.clone(),
             owned_opaque_temporaries: HashSet::new(),
             view_places: HashMap::new(),
+            view_selector_vars,
+            view_selector_tags,
+            closure_selector_vars,
+            closure_selector_tags,
             closure_capture_writebacks: HashMap::new(),
             object: &mut self.object,
             string_data: &mut self.string_data,
@@ -3012,6 +3165,13 @@ impl<'a> NativeCodegen<'a> {
             register_cleanup,
             unregister_cleanup,
             refresh_cleanup,
+            set_next_mutable_sinks,
+            set_next_indirect_mutable_sinks,
+            current_mutable_sink,
+            mutable_sink_new,
+            mutable_sink_project,
+            mutable_sink_store_owned,
+            mutable_sink_release,
             tag_value_type,
             box_i32,
             box_i64,
@@ -3334,9 +3494,7 @@ impl<'a> NativeCodegen<'a> {
             &self.classes,
             &format!("return type of `{}`", function.name),
         )?;
-        for block in &function.blocks {
-            compiler.compile_block(block, &return_ty)?;
-        }
+        compiler.compile_reachable_blocks(function, &return_ty)?;
 
         compiler.builder.seal_all_blocks();
         compiler.builder.finalize();
@@ -3627,7 +3785,17 @@ impl<'a> NativeCodegen<'a> {
     }
 
     fn define_cleanup_thunks(&mut self, function: &MirFunction) -> std::result::Result<(), String> {
-        for place in collect_cleanup_places(function) {
+        let reachable = self
+            .reachable_blocks
+            .get(&function.name)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "direct backend is missing reachable-block metadata for `{}`",
+                    function.name
+                )
+            })?;
+        for place in collect_cleanup_places(function, &reachable) {
             self.define_cleanup_thunk(function, &place)?;
         }
         Ok(())
@@ -3647,8 +3815,18 @@ impl<'a> NativeCodegen<'a> {
                     place, function.name
                 )
             })?;
-        let place_ty =
-            cleanup_place_type(function, &self.classes, place, &self.function_return_types)?;
+        let place_ty = cleanup_place_type_in_reachable(
+            function,
+            &self.classes,
+            place,
+            &self.function_return_types,
+            self.reachable_blocks.get(&function.name).ok_or_else(|| {
+                format!(
+                    "direct backend is missing reachable-block metadata for `{}`",
+                    function.name
+                )
+            })?,
+        )?;
 
         let mut ctx = self.object.make_context();
         ctx.func.signature = thunk_signature(self.call_conv);
@@ -3834,15 +4012,22 @@ impl<'a> NativeCodegen<'a> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct DirectViewPlace {
     alternatives: Vec<DirectViewAlternative>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct DirectViewAlternative {
     place: String,
-    conditions: Vec<(Value, i64)>,
+    conditions: Vec<(Variable, i64)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DirectClosureCaptureWriteback {
+    index: usize,
+    place: DirectViewPlace,
+    ty: DirectType,
 }
 
 impl DirectViewPlace {
@@ -3864,6 +4049,322 @@ impl DirectViewPlace {
         }
         self
     }
+
+    fn conditioned(mut self, selector: Variable, expected: i64) -> Self {
+        for alternative in &mut self.alternatives {
+            let condition = (selector, expected);
+            if !alternative.conditions.contains(&condition) {
+                alternative.conditions.push(condition);
+            }
+        }
+        self
+    }
+}
+
+fn direct_terminator_successors(terminator: &Terminator) -> Vec<&str> {
+    match terminator {
+        Terminator::Goto(label) => vec![label],
+        Terminator::Branch {
+            then_label,
+            else_label,
+            ..
+        } => vec![then_label, else_label],
+        Terminator::ForRange {
+            body_label,
+            exit_label,
+            ..
+        } => vec![body_label, exit_label],
+        Terminator::Match {
+            arms, otherwise, ..
+        } => arms
+            .iter()
+            .map(|arm| arm.label.as_str())
+            .chain(std::iter::once(otherwise.as_str()))
+            .collect(),
+        Terminator::Return(_) | Terminator::AssertFail { .. } | Terminator::Unreachable => {
+            Vec::new()
+        }
+    }
+}
+
+fn reachable_direct_block_labels(
+    function: &MirFunction,
+) -> std::result::Result<HashSet<String>, String> {
+    let mut blocks = HashMap::new();
+    for block in &function.blocks {
+        if blocks.insert(block.label.as_str(), block).is_some() {
+            return Err(format!(
+                "direct backend found duplicate MIR block `{}` in `{}`",
+                block.label, function.name
+            ));
+        }
+    }
+    if !blocks.contains_key(function.entry.as_str()) {
+        return Err(format!(
+            "direct backend could not find entry block `{}` in `{}`",
+            function.entry, function.name
+        ));
+    }
+    for block in &function.blocks {
+        for successor in direct_terminator_successors(&block.terminator) {
+            if !blocks.contains_key(successor) {
+                return Err(format!(
+                    "direct backend MIR block `{}` in `{}` targets unknown block `{successor}`",
+                    block.label, function.name
+                ));
+            }
+        }
+    }
+
+    let mut reachable = HashSet::new();
+    let mut pending = vec![function.entry.as_str()];
+    while let Some(label) = pending.pop() {
+        if !reachable.insert(label.to_string()) {
+            continue;
+        }
+        let block = blocks.get(label).ok_or_else(|| {
+            format!(
+                "direct backend could not resolve MIR block `{label}` in `{}`",
+                function.name
+            )
+        })?;
+        pending.extend(direct_terminator_successors(&block.terminator));
+    }
+    Ok(reachable)
+}
+
+fn direct_view_selector_tags(
+    function: &MirFunction,
+    reachable: &HashSet<String>,
+) -> HashMap<String, HashMap<String, i64>> {
+    let mut projections = HashMap::<String, BTreeSet<String>>::new();
+    for block in &function.blocks {
+        if !reachable.contains(&block.label) {
+            continue;
+        }
+        for instruction in &block.instructions {
+            let Instruction::BeginReturnedLoan {
+                loan,
+                projections: loan_projections,
+                ..
+            } = instruction
+            else {
+                continue;
+            };
+            projections
+                .entry(loan.clone())
+                .or_default()
+                .extend(loan_projections.iter().cloned());
+        }
+    }
+    projections
+        .into_iter()
+        .map(|(loan, projections)| {
+            let tags = projections
+                .into_iter()
+                .enumerate()
+                .map(|(index, projection)| (projection, index as i64))
+                .collect();
+            (loan, tags)
+        })
+        .collect()
+}
+
+fn direct_view_maps_equivalent(
+    left: &HashMap<String, DirectViewPlace>,
+    right: &HashMap<String, DirectViewPlace>,
+) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(loan, left_place)| {
+            right.get(loan).is_some_and(|right_place| {
+                left_place.alternatives.len() == right_place.alternatives.len()
+                    && left_place.alternatives.iter().all(|left_alternative| {
+                        right_place.alternatives.iter().any(|right_alternative| {
+                            left_alternative.place == right_alternative.place
+                                && left_alternative.conditions.len()
+                                    == right_alternative.conditions.len()
+                                && left_alternative.conditions.iter().all(|condition| {
+                                    right_alternative.conditions.contains(condition)
+                                })
+                        })
+                    })
+            })
+        })
+}
+
+fn merge_direct_closure_writebacks(
+    left: &HashMap<String, Vec<DirectClosureCaptureWriteback>>,
+    right: &HashMap<String, Vec<DirectClosureCaptureWriteback>>,
+) -> HashMap<String, Vec<DirectClosureCaptureWriteback>> {
+    let mut merged = left.clone();
+    for (closure, writebacks) in right {
+        let merged_writebacks = merged.entry(closure.clone()).or_default();
+        for writeback in writebacks {
+            if let Some(existing) = merged_writebacks
+                .iter_mut()
+                .find(|existing| existing.index == writeback.index && existing.ty == writeback.ty)
+            {
+                for alternative in &writeback.place.alternatives {
+                    if !existing.place.alternatives.contains(alternative) {
+                        existing.place.alternatives.push(alternative.clone());
+                    }
+                }
+            } else {
+                merged_writebacks.push(writeback.clone());
+            }
+        }
+    }
+    merged
+}
+
+fn direct_closure_metadata_uses(value: &Rvalue) -> impl Iterator<Item = &str> {
+    let transferred = match value {
+        Rvalue::Use(Operand::Place(place) | Operand::MovePlace(place)) => Some(place.as_str()),
+        _ => None,
+    };
+    let called = match value {
+        Rvalue::Call {
+            callee: CallTarget::Value(Operand::Place(place) | Operand::MovePlace(place)),
+            ..
+        } => Some(place.as_str()),
+        _ => None,
+    };
+    transferred
+        .into_iter()
+        .chain(called)
+        .map(|place| place.split('.').next().unwrap_or(place))
+}
+
+/// Computes which closure values still need mutable-capture writeback
+/// descriptors on entry to each reachable block. The descriptors are compiler
+/// metadata, not part of the runtime closure value, and are only observed when
+/// an indirect call is compiled or when a closure value is transferred to
+/// another local. Keeping dead descriptors across a loop backedge makes a
+/// loop-local closure look like a new loop-carried identity after the header
+/// has already been compiled.
+fn direct_closure_writeback_live_ins(
+    function: &MirFunction,
+    reachable: &HashSet<String>,
+) -> HashMap<String, HashSet<String>> {
+    let closure_roots = function
+        .local_types
+        .iter()
+        .filter(|local| matches!(&local.ty, Type::Closure { .. }))
+        .map(|local| {
+            local
+                .name
+                .split('.')
+                .next()
+                .unwrap_or(&local.name)
+                .to_string()
+        })
+        .collect::<HashSet<_>>();
+    let blocks = function
+        .blocks
+        .iter()
+        .filter(|block| reachable.contains(&block.label))
+        .map(|block| (block.label.as_str(), block))
+        .collect::<HashMap<_, _>>();
+    let mut block_uses = HashMap::<String, HashSet<String>>::new();
+    let mut block_defs = HashMap::<String, HashSet<String>>::new();
+
+    for block in blocks.values() {
+        let mut uses = HashSet::new();
+        let mut defs = HashSet::new();
+        for instruction in &block.instructions {
+            let value = match instruction {
+                Instruction::Assign { value, .. } | Instruction::WriteLoan { value, .. } => {
+                    Some(value)
+                }
+                _ => None,
+            };
+            if let Some(value) = value {
+                for root in direct_closure_metadata_uses(value) {
+                    if closure_roots.contains(root) && !defs.contains(root) {
+                        uses.insert(root.to_string());
+                    }
+                }
+            }
+            if let Instruction::Assign { target, .. } = instruction {
+                let root = target.split('.').next().unwrap_or(target);
+                if closure_roots.contains(root) {
+                    defs.insert(root.to_string());
+                }
+            }
+        }
+        block_uses.insert(block.label.clone(), uses);
+        block_defs.insert(block.label.clone(), defs);
+    }
+
+    let mut live_ins = reachable
+        .iter()
+        .map(|label| (label.clone(), HashSet::new()))
+        .collect::<HashMap<_, _>>();
+    loop {
+        let mut changed = false;
+        for block in blocks.values() {
+            let mut live_out = HashSet::new();
+            for successor in direct_terminator_successors(&block.terminator) {
+                if let Some(successor_live_in) = live_ins.get(successor) {
+                    live_out.extend(successor_live_in.iter().cloned());
+                }
+            }
+            let defs = &block_defs[&block.label];
+            live_out.retain(|root| !defs.contains(root));
+            live_out.extend(block_uses[&block.label].iter().cloned());
+            let entry = live_ins
+                .get_mut(&block.label)
+                .expect("reachable block should have closure liveness state");
+            if *entry != live_out {
+                *entry = live_out;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    live_ins
+}
+
+fn direct_reverse_postorder(
+    function: &MirFunction,
+    reachable: &HashSet<String>,
+) -> std::result::Result<Vec<String>, String> {
+    let blocks = function
+        .blocks
+        .iter()
+        .map(|block| (block.label.as_str(), block))
+        .collect::<HashMap<_, _>>();
+    let mut discovered = HashSet::new();
+    let mut postorder = Vec::with_capacity(reachable.len());
+    let mut pending = vec![(function.entry.clone(), false)];
+    while let Some((label, expanded)) = pending.pop() {
+        if expanded {
+            postorder.push(label);
+            continue;
+        }
+        if !discovered.insert(label.clone()) {
+            continue;
+        }
+        let block = blocks.get(label.as_str()).ok_or_else(|| {
+            format!(
+                "direct backend could not resolve reachable block `{label}` in `{}`",
+                function.name
+            )
+        })?;
+        pending.push((label, true));
+        for successor in direct_terminator_successors(&block.terminator)
+            .into_iter()
+            .rev()
+        {
+            if reachable.contains(successor) && !discovered.contains(successor) {
+                pending.push((successor.to_string(), false));
+            }
+        }
+    }
+    postorder.reverse();
+    Ok(postorder)
 }
 
 struct FunctionCompiler<'a> {
@@ -3883,12 +4384,17 @@ struct FunctionCompiler<'a> {
     current_function_name: String,
     current_function_path: String,
     writeback_locals: Vec<(String, DirectType)>,
+    mutable_param_indices: HashMap<String, usize>,
     classes: HashMap<String, MirClass>,
     trait_impls: Vec<MirTraitImpl>,
     return_type: Type,
     owned_opaque_temporaries: HashSet<Value>,
     view_places: HashMap<String, DirectViewPlace>,
-    closure_capture_writebacks: HashMap<String, Vec<(usize, String, DirectType)>>,
+    view_selector_vars: HashMap<String, Variable>,
+    view_selector_tags: HashMap<String, HashMap<String, i64>>,
+    closure_selector_vars: HashMap<String, Variable>,
+    closure_selector_tags: HashMap<(String, usize), i64>,
+    closure_capture_writebacks: HashMap<String, Vec<DirectClosureCaptureWriteback>>,
     object: &'a mut ObjectModule,
     string_data: &'a mut HashMap<Vec<u8>, DataId>,
     cleanup_places: Vec<String>,
@@ -3913,6 +4419,13 @@ struct FunctionCompiler<'a> {
     register_cleanup: cranelift_codegen::ir::FuncRef,
     unregister_cleanup: cranelift_codegen::ir::FuncRef,
     refresh_cleanup: cranelift_codegen::ir::FuncRef,
+    set_next_mutable_sinks: cranelift_codegen::ir::FuncRef,
+    set_next_indirect_mutable_sinks: cranelift_codegen::ir::FuncRef,
+    current_mutable_sink: cranelift_codegen::ir::FuncRef,
+    mutable_sink_new: cranelift_codegen::ir::FuncRef,
+    mutable_sink_project: cranelift_codegen::ir::FuncRef,
+    mutable_sink_store_owned: cranelift_codegen::ir::FuncRef,
+    mutable_sink_release: cranelift_codegen::ir::FuncRef,
     tag_value_type: cranelift_codegen::ir::FuncRef,
     box_i32: cranelift_codegen::ir::FuncRef,
     box_i64: cranelift_codegen::ir::FuncRef,
@@ -4234,6 +4747,47 @@ struct FunctionCompiler<'a> {
 }
 
 impl<'a> FunctionCompiler<'a> {
+    fn compiled_block(
+        &self,
+        label: &str,
+    ) -> std::result::Result<cranelift_codegen::ir::Block, String> {
+        self.blocks.get(label).copied().ok_or_else(|| {
+            format!(
+                "direct backend could not find MIR block `{label}` in `{}`",
+                self.current_function_name
+            )
+        })
+    }
+
+    fn snapshot_view_place_selectors(
+        &mut self,
+        mut place: DirectViewPlace,
+    ) -> std::result::Result<DirectViewPlace, String> {
+        let mut snapshots = Vec::<(Variable, Variable)>::new();
+        for alternative in &mut place.alternatives {
+            for (selector, _) in &mut alternative.conditions {
+                let snapshot = if let Some((_, snapshot)) =
+                    snapshots.iter().find(|(original, _)| original == selector)
+                {
+                    *snapshot
+                } else {
+                    let snapshot = Variable::from_u32(self.next_variable_index as u32);
+                    self.next_variable_index =
+                        self.next_variable_index.checked_add(1).ok_or_else(|| {
+                            "direct backend exhausted selector snapshot variables".to_string()
+                        })?;
+                    self.builder.declare_var(snapshot, types::I64);
+                    let current = self.builder.use_var(*selector);
+                    self.builder.def_var(snapshot, current);
+                    snapshots.push((*selector, snapshot));
+                    snapshot
+                };
+                *selector = snapshot;
+            }
+        }
+        Ok(place)
+    }
+
     fn local_type(&self, name: &str) -> std::result::Result<DirectType, String> {
         self.variable_types.get(name).cloned().ok_or(format!(
             "direct backend does not know local type for `{}`",
@@ -4368,19 +4922,122 @@ impl<'a> FunctionCompiler<'a> {
         self.builder.inst_results(inst).to_vec()
     }
 
+    fn compile_reachable_blocks(
+        &mut self,
+        function: &MirFunction,
+        return_ty: &DirectType,
+    ) -> std::result::Result<(), String> {
+        let reachable = self.blocks.keys().cloned().collect::<HashSet<_>>();
+        let order = direct_reverse_postorder(function, &reachable)?;
+        let closure_writeback_live_ins = direct_closure_writeback_live_ins(function, &reachable);
+        let block_by_label = function
+            .blocks
+            .iter()
+            .filter(|block| self.blocks.contains_key(&block.label))
+            .map(|block| (block.label.as_str(), block))
+            .collect::<HashMap<_, _>>();
+        let mut incoming_views = HashMap::<String, HashMap<String, DirectViewPlace>>::new();
+        incoming_views.insert(function.entry.clone(), HashMap::new());
+        let mut incoming_writebacks =
+            HashMap::<String, HashMap<String, Vec<DirectClosureCaptureWriteback>>>::new();
+        incoming_writebacks.insert(function.entry.clone(), HashMap::new());
+        let mut compiled = HashSet::new();
+
+        for label in order {
+            let block = block_by_label.get(label.as_str()).ok_or_else(|| {
+                format!(
+                    "direct backend could not resolve reachable block `{label}` in `{}`",
+                    function.name
+                )
+            })?;
+            self.view_places = incoming_views.get(&label).cloned().ok_or_else(|| {
+                format!(
+                    "direct backend has no incoming view state for block `{label}` in `{}`",
+                    function.name
+                )
+            })?;
+            self.closure_capture_writebacks =
+                incoming_writebacks.get(&label).cloned().ok_or_else(|| {
+                    format!(
+                        "direct backend has no incoming closure-writeback state for block `{label}` in `{}`",
+                        function.name
+                    )
+                })?;
+            self.compile_block(block, return_ty)?;
+            compiled.insert(label.clone());
+            let outgoing_views = self.view_places.clone();
+            let outgoing_writebacks = self.closure_capture_writebacks.clone();
+
+            for successor in direct_terminator_successors(&block.terminator) {
+                match incoming_views.get(successor) {
+                    Some(existing) if !direct_view_maps_equivalent(existing, &outgoing_views) => {
+                        return Err(format!(
+                            "direct backend reaches MIR block `{successor}` in `{}` with inconsistent view identities",
+                            function.name
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        incoming_views.insert(successor.to_string(), outgoing_views.clone());
+                    }
+                }
+                let live_writebacks = closure_writeback_live_ins.get(successor).ok_or_else(|| {
+                    format!(
+                        "direct backend has no closure-writeback liveness for block `{successor}` in `{}`",
+                        function.name
+                    )
+                })?;
+                let successor_writebacks = outgoing_writebacks
+                    .iter()
+                    .filter(|(closure, _)| live_writebacks.contains(*closure))
+                    .map(|(closure, writebacks)| (closure.clone(), writebacks.clone()))
+                    .collect::<HashMap<_, _>>();
+                match incoming_writebacks.get(successor).cloned() {
+                    Some(existing) => {
+                        let merged =
+                            merge_direct_closure_writebacks(&existing, &successor_writebacks);
+                        if compiled.contains(successor) && merged != existing {
+                            return Err(format!(
+                                "direct backend reaches already-compiled MIR block `{successor}` in `{}` with new closure writeback identities",
+                                function.name
+                            ));
+                        }
+                        incoming_writebacks.insert(successor.to_string(), merged);
+                    }
+                    None => {
+                        incoming_writebacks.insert(successor.to_string(), successor_writebacks);
+                    }
+                }
+            }
+        }
+
+        if compiled.len() != self.blocks.len() {
+            return Err(format!(
+                "direct backend did not compile every reachable MIR block in `{}`",
+                function.name
+            ));
+        }
+        Ok(())
+    }
+
     fn compile_block(
         &mut self,
         block: &BasicBlock,
         return_ty: &DirectType,
     ) -> std::result::Result<(), String> {
-        let block_id = self.blocks[&block.label];
+        let block_id = *self.blocks.get(&block.label).ok_or_else(|| {
+            format!(
+                "direct backend could not find compiled block `{}`",
+                block.label
+            )
+        })?;
         if self.builder.current_block() != Some(block_id) {
             self.builder.switch_to_block(block_id);
         }
         self.owned_opaque_temporaries.clear();
 
-        for instruction in &block.instructions {
-            self.compile_instruction(instruction)?;
+        for (instruction_index, instruction) in block.instructions.iter().enumerate() {
+            self.compile_instruction(&block.label, instruction_index, instruction)?;
         }
         self.compile_terminator(&block.terminator, return_ty)?;
         Ok(())
@@ -4388,6 +5045,8 @@ impl<'a> FunctionCompiler<'a> {
 
     fn compile_instruction(
         &mut self,
+        block_label: &str,
+        instruction_index: usize,
         instruction: &Instruction,
     ) -> std::result::Result<(), String> {
         match instruction {
@@ -4439,20 +5098,60 @@ impl<'a> FunctionCompiler<'a> {
                     &[projections_ptr, projections_len],
                 );
                 let selected = self.builder.inst_results(selected)[0];
+                let selector_var = *self.view_selector_vars.get(loan).ok_or_else(|| {
+                    format!(
+                        "direct backend has no returned-view selector storage for loan `{loan}`"
+                    )
+                })?;
+                let selector_tags =
+                    self.view_selector_tags.get(loan).cloned().ok_or_else(|| {
+                        format!(
+                            "direct backend has no returned-view selector tags for loan `{loan}`"
+                        )
+                    })?;
+                let mut canonical_selector = self.builder.ins().iconst(types::I64, -1);
+                for (index, projection) in projections.iter().enumerate() {
+                    let tag = *selector_tags.get(projection).ok_or_else(|| {
+                        format!(
+                            "direct backend has no selector tag for projection `{projection}` on loan `{loan}`"
+                        )
+                    })?;
+                    let matches = self.builder.ins().icmp_imm(
+                        IntCC::Equal,
+                        selected,
+                        i64::try_from(index).map_err(|_| {
+                            format!(
+                                "direct backend returned-view projection index overflows for loan `{loan}`"
+                            )
+                        })?,
+                    );
+                    let tag = self.builder.ins().iconst(types::I64, tag);
+                    canonical_selector =
+                        self.builder.ins().select(matches, tag, canonical_selector);
+                }
+                self.builder.def_var(selector_var, canonical_selector);
                 let origin = self.resolve_view_place(origin)?;
                 let mut alternatives = Vec::new();
                 for origin in origin.alternatives {
-                    for (index, projection) in projections.iter().enumerate() {
+                    for projection in projections {
                         let mut conditions = origin.conditions.clone();
-                        conditions.push((selected, index as i64));
-                        alternatives.push(DirectViewAlternative {
+                        let tag = *selector_tags.get(projection).ok_or_else(|| {
+                            format!(
+                                "direct backend has no selector tag for projection `{projection}` on loan `{loan}`"
+                            )
+                        })?;
+                        conditions.push((selector_var, tag));
+                        let alternative = DirectViewAlternative {
                             place: if projection.is_empty() {
                                 origin.place.clone()
                             } else {
                                 format!("{}.{}", origin.place, projection)
                             },
                             conditions,
-                        });
+                        };
+                        if !alternatives.contains(&alternative) {
+                            alternatives.push(alternative);
+                        }
                     }
                 }
                 self.view_places
@@ -4484,9 +5183,33 @@ impl<'a> FunctionCompiler<'a> {
             }
             Instruction::ReturnLoan { loan, origin } => {
                 self.emit_returned_view_projection(loan, origin)?;
+                let loan_root = loan.split('.').next().unwrap_or(loan);
+                self.view_places.remove(loan_root);
             }
             Instruction::Assign { target, value } => {
                 if let Rvalue::Closure { captures, .. } = value {
+                    let root = target.split('.').next().unwrap_or(target).to_string();
+                    let selector = if captures
+                        .iter()
+                        .any(|capture| capture.passing == MirReceiverKind::BorrowMut)
+                    {
+                        let selector = *self.closure_selector_vars.get(&root).ok_or_else(|| {
+                            format!("direct backend has no closure writeback selector for `{root}`")
+                        })?;
+                        let tag = *self
+                            .closure_selector_tags
+                            .get(&(block_label.to_string(), instruction_index))
+                            .ok_or_else(|| {
+                                format!(
+                                    "direct backend has no closure writeback tag for instruction {instruction_index} in `{block_label}`"
+                                )
+                            })?;
+                        let selected = self.builder.ins().iconst(types::I64, tag);
+                        self.builder.def_var(selector, selected);
+                        Some((selector, tag))
+                    } else {
+                        None
+                    };
                     let writebacks = captures
                         .iter()
                         .enumerate()
@@ -4506,10 +5229,20 @@ impl<'a> FunctionCompiler<'a> {
                                 &self.classes,
                                 &format!("mutable closure capture `{}`", capture.name),
                             )?;
-                            Ok((index, source, ty))
+                            let place = if capture.resolve_source_at_capture {
+                                let resolved = self.resolve_view_place(&source)?;
+                                self.snapshot_view_place_selectors(resolved)?
+                            } else {
+                                DirectViewPlace::static_place(source)
+                            };
+                            let place = if let Some((selector, tag)) = selector {
+                                place.conditioned(selector, tag)
+                            } else {
+                                place
+                            };
+                            Ok(DirectClosureCaptureWriteback { index, place, ty })
                         })
                         .collect::<std::result::Result<Vec<_>, String>>()?;
-                    let root = target.split('.').next().unwrap_or(target).to_string();
                     if writebacks.is_empty() {
                         self.closure_capture_writebacks.remove(&root);
                     } else {
@@ -4579,7 +5312,7 @@ impl<'a> FunctionCompiler<'a> {
             }
             Terminator::Goto(label) => {
                 self.release_all_temporary_owned();
-                let block = self.blocks[label];
+                let block = self.compiled_block(label)?;
                 self.builder.ins().jump(block, &[]);
             }
             Terminator::Branch {
@@ -4589,8 +5322,8 @@ impl<'a> FunctionCompiler<'a> {
             } => {
                 let condition = self.load_operand(condition)?;
                 let condition = self.as_bool_value(condition)?;
-                let then_block = self.blocks[then_label];
-                let else_block = self.blocks[else_label];
+                let then_block = self.compiled_block(then_label)?;
+                let else_block = self.compiled_block(else_label)?;
                 self.release_all_temporary_owned();
                 self.builder
                     .ins()
@@ -4619,7 +5352,8 @@ impl<'a> FunctionCompiler<'a> {
                 for arm in arms {
                     if arm.wildcard {
                         self.release_all_temporary_owned();
-                        self.builder.ins().jump(self.blocks[&arm.label], &[]);
+                        let arm_block = self.compiled_block(&arm.label)?;
+                        self.builder.ins().jump(arm_block, &[]);
                         return Ok(());
                     }
                     let next_block = self.builder.create_block();
@@ -4628,14 +5362,22 @@ impl<'a> FunctionCompiler<'a> {
                         arm.enum_name.as_deref().unwrap_or(scrutinee_enum_name),
                         arm.variant_name.as_deref().unwrap_or_default(),
                     )?;
-                    let arm_block = self.blocks[&arm.label];
+                    let arm_block = self.compiled_block(&arm.label)?;
+                    let matched_cleanup = self.builder.create_block();
+                    let pending_owned = self.owned_opaque_temporaries.clone();
                     self.builder
                         .ins()
-                        .brif(matched, arm_block, &[], next_block, &[]);
+                        .brif(matched, matched_cleanup, &[], next_block, &[]);
+                    self.builder.switch_to_block(matched_cleanup);
+                    self.release_all_temporary_owned();
+                    self.builder.ins().jump(arm_block, &[]);
+                    self.builder.seal_block(matched_cleanup);
                     self.builder.switch_to_block(next_block);
+                    self.owned_opaque_temporaries = pending_owned;
                 }
                 self.release_all_temporary_owned();
-                self.builder.ins().jump(self.blocks[otherwise], &[]);
+                let otherwise = self.compiled_block(otherwise)?;
+                self.builder.ins().jump(otherwise, &[]);
             }
             Terminator::ForRange {
                 binding,
@@ -5880,6 +6622,18 @@ impl<'a> FunctionCompiler<'a> {
                 field,
                 receiver_place,
             } => self.compile_member_call(object, field, receiver_place.as_deref(), args),
+            CallTarget::TraitMember {
+                object,
+                trait_name,
+                field,
+                receiver_place,
+            } => self.compile_trait_member_call(
+                object,
+                trait_name,
+                field,
+                receiver_place.as_deref(),
+                args,
+            ),
         }
     }
 
@@ -6109,11 +6863,30 @@ impl<'a> FunctionCompiler<'a> {
                     .load(types::I64, MemFlags::new(), buffer, (index as i32) * 8);
             self.tag_raw_opaque_runtime_type(raw, &param_types[index])?;
         }
+        let mut public_sinks = Vec::new();
+        let mut capture_sinks = Vec::new();
+        if !writebacks.is_empty() || !closure_writebacks.is_empty() {
+            public_sinks = (0..params.len())
+                .map(|_| self.builder.ins().iconst(types::I64, 0))
+                .collect();
+            for (index, place, _) in &writebacks {
+                public_sinks[*index] = self.mutable_sink_for_place(place)?;
+            }
+            for writeback in &closure_writebacks {
+                capture_sinks.push((
+                    writeback.index,
+                    self.mutable_sink_for_resolved_place(writeback.place.clone())?,
+                ));
+            }
+            self.install_indirect_mutable_sinks(&public_sinks, &capture_sinks)?;
+        }
         let call = self
             .builder
             .ins()
             .call(self.function_call, &[function.values[0], buffer, count]);
         let raw_result = self.builder.inst_results(call)[0];
+        self.release_mutable_sinks(public_sinks.iter().copied());
+        self.release_mutable_sinks(capture_sinks.iter().map(|(_, sink)| *sink));
 
         for (index, place, writeback_ty) in writebacks {
             let raw =
@@ -6132,16 +6905,19 @@ impl<'a> FunctionCompiler<'a> {
             let writeback = self.coerce_value(boxed, &writeback_ty)?;
             self.store_place(&place, writeback)?;
         }
-        for (index, place, writeback_ty) in closure_writebacks {
-            let index = self.builder.ins().iconst(types::I64, index as i64);
+        for writeback in closure_writebacks {
+            let index = self
+                .builder
+                .ins()
+                .iconst(types::I64, writeback.index as i64);
             let call = self
                 .builder
                 .ins()
                 .call(self.closure_capture, &[function.values[0], index]);
             let raw = self.builder.inst_results(call)[0];
-            let boxed = self.owned_opaque_result(vec![raw], direct_type_to_type(&writeback_ty));
-            let writeback = self.coerce_value(boxed, &writeback_ty)?;
-            self.store_place(&place, writeback)?;
+            let boxed = self.owned_opaque_result(vec![raw], direct_type_to_type(&writeback.ty));
+            let value = self.coerce_value(boxed, &writeback.ty)?;
+            self.store_resolved_view_place(writeback.place, value)?;
         }
         let boxed_result =
             self.owned_opaque_result(vec![raw_result], direct_type_to_type(&return_direct));
@@ -6896,6 +7672,7 @@ impl<'a> FunctionCompiler<'a> {
             }
         }
         let mut writeback_places = Vec::new();
+        let mut mutable_sink_places = vec![None; expected.len()];
         for (index, argument) in args.iter().enumerate() {
             let semantic_expected = expected
                 .get(index)
@@ -6926,6 +7703,9 @@ impl<'a> FunctionCompiler<'a> {
             };
             if let Some(place) = &argument.writeback_place {
                 writeback_places.push(place.clone());
+                if let Some(slot) = mutable_sink_places.get_mut(index) {
+                    *slot = Some(place.clone());
+                }
             }
             if matches!(coerced.ty, DirectType::Opaque(_)) {
                 lowered_args.push(self.transfer_opaque_arg(&coerced));
@@ -6933,8 +7713,22 @@ impl<'a> FunctionCompiler<'a> {
                 lowered_args.extend(coerced.values);
             }
         }
+        let mutable_sinks = if mutable_sink_places.iter().any(Option::is_some) {
+            let mut sinks = Vec::with_capacity(mutable_sink_places.len());
+            for place in &mutable_sink_places {
+                sinks.push(match place {
+                    Some(place) => self.mutable_sink_for_place(place)?,
+                    None => self.builder.ins().iconst(types::I64, 0),
+                });
+            }
+            self.install_direct_mutable_sinks(&sinks)?;
+            sinks
+        } else {
+            Vec::new()
+        };
         let inst = self.builder.ins().call(func_ref, &lowered_args);
         let results = self.builder.inst_results(inst).to_vec();
+        self.release_mutable_sinks(mutable_sinks);
         let (result, writebacks) = self.split_call_results(name, results)?;
         self.apply_writeback_places(&writeback_places, writebacks)?;
         Ok(result)
@@ -7457,8 +8251,8 @@ impl<'a> FunctionCompiler<'a> {
         let has_next = self.builder.ins().icmp(IntCC::SignedLessThan, current, end);
 
         let next_block = self.builder.create_block();
-        let body_block = self.blocks[body_label];
-        let exit_block = self.blocks[exit_label];
+        let body_block = self.compiled_block(body_label)?;
+        let exit_block = self.compiled_block(exit_label)?;
         self.builder
             .ins()
             .brif(has_next, next_block, &[], exit_block, &[]);
@@ -7485,6 +8279,38 @@ impl<'a> FunctionCompiler<'a> {
         self.builder.seal_block(next_block);
         let _ = binding_ty;
         Ok(())
+    }
+
+    fn compile_trait_member_call(
+        &mut self,
+        object: &Operand,
+        trait_name: &str,
+        field: &str,
+        receiver_place: Option<&str>,
+        args: &[MirArg],
+    ) -> std::result::Result<ValueRef, String> {
+        let object = self.load_operand(object)?;
+        let receiver_ty = direct_type_to_type(&object.ty);
+        if let Type::Named(receiver_name, _) = &receiver_ty {
+            self.compile_class_member_call(
+                receiver_name,
+                Some(receiver_ty.clone()),
+                object,
+                field,
+                receiver_place,
+                args,
+                Some(trait_name),
+            )
+        } else {
+            self.compile_opaque_member_call(
+                &receiver_ty,
+                object,
+                field,
+                receiver_place,
+                args,
+                Some(trait_name),
+            )
+        }
     }
 
     fn compile_member_call(
@@ -7590,6 +8416,7 @@ impl<'a> FunctionCompiler<'a> {
                 field,
                 receiver_place,
                 args,
+                None,
             ),
             DirectType::Opaque(ty) => {
                 if let Type::Named(_name, _type_args) = &ty {
@@ -7599,9 +8426,10 @@ impl<'a> FunctionCompiler<'a> {
                         field,
                         receiver_place,
                         args,
+                        None,
                     );
                 }
-                self.compile_opaque_member_call(&ty, object, field, receiver_place, args)
+                self.compile_opaque_member_call(&ty, object, field, receiver_place, args, None)
             }
             DirectType::Scalar(_) => {
                 if matches!(object.ty.scalar_kind(), Some(kind) if kind.is_integer())
@@ -7704,6 +8532,7 @@ impl<'a> FunctionCompiler<'a> {
                         field,
                         receiver_place,
                         args,
+                        None,
                     );
                 }
                 Err(format!(
@@ -7779,6 +8608,22 @@ impl<'a> FunctionCompiler<'a> {
     }
 
     fn type_of_place(&self, place: &str) -> std::result::Result<DirectType, String> {
+        let (virtual_root, virtual_projection) = place.split_once('.').unwrap_or((place, ""));
+        if self.view_places.contains_key(virtual_root) {
+            if let Some(mut ty) = self.variable_types.get(virtual_root).cloned() {
+                for field in virtual_projection
+                    .split('.')
+                    .filter(|segment| !segment.is_empty())
+                {
+                    ty = direct_field_type(&ty, field, &self.classes).ok_or(format!(
+                        "direct backend does not know field `{}` on `{}`",
+                        field,
+                        render_direct_type(&ty)
+                    ))?;
+                }
+                return Ok(ty);
+            }
+        }
         let resolved = self.resolve_view_place(place)?;
         let place = resolved
             .alternatives
@@ -7984,15 +8829,17 @@ impl<'a> FunctionCompiler<'a> {
         let Some((selector, expected)) = conditions.next() else {
             return self.builder.ins().iconst(types::I64, 1);
         };
+        let selector = self.builder.use_var(*selector);
         let mut matches = self
             .builder
             .ins()
-            .icmp_imm(IntCC::Equal, *selector, *expected);
+            .icmp_imm(IntCC::Equal, selector, *expected);
         for (selector, expected) in conditions {
+            let selector = self.builder.use_var(*selector);
             let next = self
                 .builder
                 .ins()
-                .icmp_imm(IntCC::Equal, *selector, *expected);
+                .icmp_imm(IntCC::Equal, selector, *expected);
             matches = self.builder.ins().band(matches, next);
         }
         matches
@@ -8005,7 +8852,7 @@ impl<'a> FunctionCompiler<'a> {
     ) -> std::result::Result<(), String> {
         let sources = self.resolve_view_place(loan)?;
         let origins = self.resolve_view_place(origin)?;
-        let mut alternatives = Vec::<(String, Vec<(Value, i64)>)>::new();
+        let mut alternatives = Vec::<(String, Vec<(Variable, i64)>)>::new();
         for source in &sources.alternatives {
             for origin in &origins.alternatives {
                 let projection = if source.place == origin.place {
@@ -8637,6 +9484,14 @@ impl<'a> FunctionCompiler<'a> {
 
     fn store_place(&mut self, place: &str, value: ValueRef) -> std::result::Result<(), String> {
         let resolved = self.resolve_view_place(place)?;
+        self.store_resolved_view_place(resolved, value)
+    }
+
+    fn store_resolved_view_place(
+        &mut self,
+        resolved: DirectViewPlace,
+        value: ValueRef,
+    ) -> std::result::Result<(), String> {
         if resolved.alternatives.len() == 1 && resolved.alternatives[0].conditions.is_empty() {
             return self.store_static_place(&resolved.alternatives[0].place, value);
         }
@@ -8670,6 +9525,7 @@ impl<'a> FunctionCompiler<'a> {
             self.store_root(root, updated)
         };
         result?;
+        self.publish_mutable_root_write_through(root)?;
         self.refresh_cleanup_registrations_for_mutation(place)
     }
 
@@ -9306,6 +10162,230 @@ impl<'a> FunctionCompiler<'a> {
         Ok(converted)
     }
 
+    fn mutable_sink_for_static_place(&mut self, place: &str) -> std::result::Result<Value, String> {
+        let (root, projection) = place.split_once('.').unwrap_or((place, ""));
+        if let Some(index) = self.mutable_param_indices.get(root).copied() {
+            let index = self.builder.ins().iconst(types::I64, index as i64);
+            let current = self.builder.ins().call(self.current_mutable_sink, &[index]);
+            let parent = self.builder.inst_results(current)[0];
+            let (projection_ptr, projection_len) = self.string_constant(projection.as_bytes())?;
+            let projected = self.builder.ins().call(
+                self.mutable_sink_project,
+                &[parent, projection_ptr, projection_len],
+            );
+            return Ok(self.builder.inst_results(projected)[0]);
+        }
+
+        let cleanup_place = self
+            .cleanup_places
+            .iter()
+            .filter_map(|cleanup_place| {
+                if place == cleanup_place {
+                    Some((cleanup_place.clone(), String::new()))
+                } else {
+                    place
+                        .strip_prefix(&format!("{cleanup_place}."))
+                        .map(|projection| (cleanup_place.clone(), projection.to_string()))
+                }
+            })
+            .max_by_key(|(cleanup_place, _)| cleanup_place.len());
+        let Some((cleanup_place, projection)) = cleanup_place else {
+            return Ok(self.builder.ins().iconst(types::I64, 0));
+        };
+        let registration_variable = self
+            .cleanup_registration_vars
+            .get(&cleanup_place)
+            .copied()
+            .ok_or_else(|| {
+                format!("direct backend has no cleanup registration for mutable place `{place}`")
+            })?;
+        let registration_id = self.builder.use_var(registration_variable);
+        let root = self.load_static_place(&cleanup_place)?;
+        let root = self.ensure_opaque(root)?;
+        let root = self.transfer_owned_opaque_value(&root);
+        let (projection_ptr, projection_len) = self.string_constant(projection.as_bytes())?;
+        let sink = self.builder.ins().call(
+            self.mutable_sink_new,
+            &[registration_id, root, projection_ptr, projection_len],
+        );
+        Ok(self.builder.inst_results(sink)[0])
+    }
+
+    fn mutable_sink_for_resolved_place(
+        &mut self,
+        resolved: DirectViewPlace,
+    ) -> std::result::Result<Value, String> {
+        if resolved.alternatives.is_empty() {
+            return Ok(self.builder.ins().iconst(types::I64, 0));
+        }
+        if resolved.alternatives.len() == 1 && resolved.alternatives[0].conditions.is_empty() {
+            return self.mutable_sink_for_static_place(&resolved.alternatives[0].place);
+        }
+
+        let sink_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            8,
+            3,
+        ));
+        let sink_ptr = self.builder.ins().stack_addr(types::I64, sink_slot, 0);
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        self.builder.ins().store(MemFlags::new(), zero, sink_ptr, 0);
+        let merge = self.builder.create_block();
+        let alternative_count = resolved.alternatives.len();
+        for (index, alternative) in resolved.alternatives.into_iter().enumerate() {
+            if index + 1 < alternative_count {
+                let selected = self.view_alternative_condition(&alternative);
+                let create_block = self.builder.create_block();
+                let next_block = self.builder.create_block();
+                self.builder
+                    .ins()
+                    .brif(selected, create_block, &[], next_block, &[]);
+                self.builder.switch_to_block(create_block);
+                let sink = self.mutable_sink_for_static_place(&alternative.place)?;
+                self.builder.ins().store(MemFlags::new(), sink, sink_ptr, 0);
+                self.builder.ins().jump(merge, &[]);
+                self.builder.seal_block(create_block);
+                self.builder.switch_to_block(next_block);
+                self.builder.seal_block(next_block);
+            } else {
+                let sink = self.mutable_sink_for_static_place(&alternative.place)?;
+                self.builder.ins().store(MemFlags::new(), sink, sink_ptr, 0);
+                self.builder.ins().jump(merge, &[]);
+            }
+        }
+        self.builder.switch_to_block(merge);
+        self.builder.seal_block(merge);
+        Ok(self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), sink_ptr, 0))
+    }
+
+    fn mutable_sink_for_place(&mut self, place: &str) -> std::result::Result<Value, String> {
+        let resolved = self.resolve_view_place(place)?;
+        self.mutable_sink_for_resolved_place(resolved)
+    }
+
+    fn install_direct_mutable_sinks(&mut self, sinks: &[Value]) -> std::result::Result<(), String> {
+        let count = self.builder.ins().iconst(types::I64, sinks.len() as i64);
+        let pointer = if sinks.is_empty() {
+            self.builder.ins().iconst(types::I64, 0)
+        } else {
+            let byte_len = u32::try_from(sinks.len().saturating_mul(8))
+                .map_err(|_| "direct mutable sink buffer is too large".to_string())?;
+            let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                byte_len,
+                3,
+            ));
+            let pointer = self.builder.ins().stack_addr(types::I64, slot, 0);
+            for (index, sink) in sinks.iter().copied().enumerate() {
+                self.builder
+                    .ins()
+                    .store(MemFlags::new(), sink, pointer, (index as i32) * 8);
+            }
+            pointer
+        };
+        self.builder
+            .ins()
+            .call(self.set_next_mutable_sinks, &[pointer, count]);
+        Ok(())
+    }
+
+    fn install_indirect_mutable_sinks(
+        &mut self,
+        public_sinks: &[Value],
+        capture_sinks: &[(usize, Value)],
+    ) -> std::result::Result<(), String> {
+        let store_buffer = |compiler: &mut Self,
+                            values: &[Value]|
+         -> std::result::Result<Value, String> {
+            if values.is_empty() {
+                return Ok(compiler.builder.ins().iconst(types::I64, 0));
+            }
+            let byte_len = u32::try_from(values.len().saturating_mul(8))
+                .map_err(|_| "direct mutable sink buffer is too large".to_string())?;
+            let slot = compiler.builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                byte_len,
+                3,
+            ));
+            let pointer = compiler.builder.ins().stack_addr(types::I64, slot, 0);
+            for (index, value) in values.iter().copied().enumerate() {
+                compiler
+                    .builder
+                    .ins()
+                    .store(MemFlags::new(), value, pointer, (index as i32) * 8);
+            }
+            Ok(pointer)
+        };
+        let public_ptr = store_buffer(self, public_sinks)?;
+        let capture_indices = capture_sinks
+            .iter()
+            .map(|(index, _)| self.builder.ins().iconst(types::I64, *index as i64))
+            .collect::<Vec<_>>();
+        let capture_values = capture_sinks
+            .iter()
+            .map(|(_, sink)| *sink)
+            .collect::<Vec<_>>();
+        let capture_indices_ptr = store_buffer(self, &capture_indices)?;
+        let capture_values_ptr = store_buffer(self, &capture_values)?;
+        let public_count = self
+            .builder
+            .ins()
+            .iconst(types::I64, public_sinks.len() as i64);
+        let capture_count = self
+            .builder
+            .ins()
+            .iconst(types::I64, capture_sinks.len() as i64);
+        self.builder.ins().call(
+            self.set_next_indirect_mutable_sinks,
+            &[
+                public_ptr,
+                public_count,
+                capture_indices_ptr,
+                capture_values_ptr,
+                capture_count,
+            ],
+        );
+        Ok(())
+    }
+
+    fn release_mutable_sinks(&mut self, sinks: impl IntoIterator<Item = Value>) {
+        for sink in sinks {
+            self.builder.ins().call(self.mutable_sink_release, &[sink]);
+        }
+    }
+
+    fn publish_mutable_root_write_through(
+        &mut self,
+        root: &str,
+    ) -> std::result::Result<(), String> {
+        let Some(index) = self.mutable_param_indices.get(root).copied() else {
+            return Ok(());
+        };
+        let index = self.builder.ins().iconst(types::I64, index as i64);
+        let sink = self.builder.ins().call(self.current_mutable_sink, &[index]);
+        let sink = self.builder.inst_results(sink)[0];
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        let active = self.builder.ins().icmp(IntCC::NotEqual, sink, zero);
+        let publish = self.builder.create_block();
+        let done = self.builder.create_block();
+        self.builder.ins().brif(active, publish, &[], done, &[]);
+        self.builder.switch_to_block(publish);
+        let current = self.load_root(root)?;
+        let current = self.ensure_opaque(current)?;
+        let current = self.transfer_owned_opaque_value(&current);
+        self.builder
+            .ins()
+            .call(self.mutable_sink_store_owned, &[sink, current]);
+        self.builder.ins().jump(done, &[]);
+        self.builder.seal_block(publish);
+        self.builder.switch_to_block(done);
+        self.builder.seal_block(done);
+        Ok(())
+    }
+
     fn set_cleanup_active(&mut self, place: &str, active: bool) -> std::result::Result<(), String> {
         let Some(variable) = self.cleanup_active_vars.get(place).copied() else {
             return Err(format!(
@@ -9592,7 +10672,7 @@ impl<'a> FunctionCompiler<'a> {
                     return Ok(());
                 }
                 if self
-                    .compile_opaque_member_call(ty, loaded, "close", Some(place), &[])
+                    .compile_opaque_member_call(ty, loaded, "close", Some(place), &[], None)
                     .is_ok()
                 {
                     return Ok(());
@@ -9603,6 +10683,7 @@ impl<'a> FunctionCompiler<'a> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn compile_class_member_call(
         &mut self,
         class_name: &str,
@@ -9611,17 +10692,29 @@ impl<'a> FunctionCompiler<'a> {
         field: &str,
         receiver_place: Option<&str>,
         args: &[MirArg],
+        trait_name: Option<&str>,
     ) -> std::result::Result<ValueRef, String> {
-        let mut method = find_method(self.classes.get(class_name), field).cloned();
-        if method.is_none() {
-            method = receiver_type_hint
+        let mut method = trait_name.and_then(|trait_name| {
+            receiver_type_hint
                 .as_ref()
-                .and_then(|ty| self.find_trait_method(ty, field).cloned());
-        }
-        if method.is_none() {
-            method = self
-                .find_trait_method(&Type::named(class_name), field)
-                .cloned();
+                .and_then(|ty| self.find_trait_method_for_trait(ty, trait_name, field))
+                .or_else(|| {
+                    self.find_trait_method_for_trait(&Type::named(class_name), trait_name, field)
+                })
+                .cloned()
+        });
+        if trait_name.is_none() {
+            method = find_method(self.classes.get(class_name), field).cloned();
+            if method.is_none() {
+                method = receiver_type_hint
+                    .as_ref()
+                    .and_then(|ty| self.find_trait_method(ty, field).cloned());
+            }
+            if method.is_none() {
+                method = self
+                    .find_trait_method(&Type::named(class_name), field)
+                    .cloned();
+            }
         }
         let Some(method) = method else {
             return Err(format!(
@@ -9649,6 +10742,7 @@ impl<'a> FunctionCompiler<'a> {
             .unwrap_or_default();
         let mut lowered_args = Vec::new();
         let mut writeback_places = Vec::new();
+        let mut mutable_sink_places = vec![None; expected.len()];
         let receiver_expected = expected.first().cloned().unwrap_or(object.ty.clone());
         let receiver = self.coerce_value(object.clone(), &receiver_expected)?;
         if matches!(receiver.ty, DirectType::Opaque(_)) {
@@ -9664,6 +10758,9 @@ impl<'a> FunctionCompiler<'a> {
                 ));
             };
             writeback_places.push(place.to_string());
+            if let Some(slot) = mutable_sink_places.first_mut() {
+                *slot = Some(place.to_string());
+            }
         }
         for (index, argument) in args.iter().enumerate() {
             let loaded = if let Some(expected_ty) = expected.get(index + 1) {
@@ -9678,6 +10775,9 @@ impl<'a> FunctionCompiler<'a> {
             };
             if let Some(place) = &argument.writeback_place {
                 writeback_places.push(place.clone());
+                if let Some(slot) = mutable_sink_places.get_mut(index + 1) {
+                    *slot = Some(place.clone());
+                }
             }
             if matches!(coerced.ty, DirectType::Opaque(_)) {
                 lowered_args.push(self.transfer_opaque_arg(&coerced));
@@ -9685,8 +10785,22 @@ impl<'a> FunctionCompiler<'a> {
                 lowered_args.extend(coerced.values);
             }
         }
+        let mutable_sinks = if mutable_sink_places.iter().any(Option::is_some) {
+            let mut sinks = Vec::with_capacity(mutable_sink_places.len());
+            for place in &mutable_sink_places {
+                sinks.push(match place {
+                    Some(place) => self.mutable_sink_for_place(place)?,
+                    None => self.builder.ins().iconst(types::I64, 0),
+                });
+            }
+            self.install_direct_mutable_sinks(&sinks)?;
+            sinks
+        } else {
+            Vec::new()
+        };
         let inst = self.builder.ins().call(func_ref, &lowered_args);
         let results = self.builder.inst_results(inst).to_vec();
+        self.release_mutable_sinks(mutable_sinks);
         let (result, writebacks) = self.split_call_results(&method_function_name, results)?;
         self.apply_writeback_places(&writeback_places, writebacks)?;
         Ok(result)
@@ -9699,6 +10813,7 @@ impl<'a> FunctionCompiler<'a> {
         field: &str,
         receiver_place: Option<&str>,
         args: &[MirArg],
+        trait_name: Option<&str>,
     ) -> std::result::Result<ValueRef, String> {
         if let Type::Named(name, _) = object_ty {
             let has_declared_class_method = find_method(self.classes.get(name), field).is_some();
@@ -9712,6 +10827,7 @@ impl<'a> FunctionCompiler<'a> {
                     field,
                     receiver_place,
                     args,
+                    None,
                 );
             }
         }
@@ -9837,13 +10953,7 @@ impl<'a> FunctionCompiler<'a> {
                 return match field {
                     "__slice" => {
                         let [start_arg, has_start_arg, end_arg, has_end_arg, line_arg, column_arg] =
-                            args
-                        else {
-                            return Err(
-                                "direct backend expected internal String slicing to receive start, start presence, end, end presence, line, and column"
-                                    .to_string(),
-                            );
-                        };
+                            direct_internal_slice_args(args)?;
                         let start = self.load_operand_with_integer_hint(
                             &start_arg.value,
                             Some(ScalarKind::Int64),
@@ -10159,8 +11269,7 @@ impl<'a> FunctionCompiler<'a> {
                 return match field {
                     "__slice" => {
                         let [start_arg, has_start_arg, end_arg, has_end_arg, line_arg, column_arg] =
-                            <&[MirArg; 6]>::try_from(args)
-                                .expect("MIR lowering emits six arguments for Array slicing");
+                            direct_internal_slice_args(args)?;
                         let integer_hint = Some(ScalarKind::Int64);
                         let start =
                             self.load_operand_with_integer_hint(&start_arg.value, integer_hint)?;
@@ -10452,13 +11561,7 @@ impl<'a> FunctionCompiler<'a> {
                 return match field {
                     "__slice" => {
                         let [start_arg, has_start_arg, end_arg, has_end_arg, line_arg, column_arg] =
-                            args
-                        else {
-                            return Err(
-                                "direct backend expected internal vector slicing to receive start, start presence, end, end presence, line, and column"
-                                    .to_string(),
-                            );
-                        };
+                            direct_internal_slice_args(args)?;
                         let start = self.load_operand_with_integer_hint(
                             &start_arg.value,
                             Some(ScalarKind::Int64),
@@ -13431,6 +14534,7 @@ impl<'a> FunctionCompiler<'a> {
                     field,
                     receiver_place,
                     args,
+                    None,
                 ) {
                     return Ok(result);
                 }
@@ -13846,7 +14950,7 @@ impl<'a> FunctionCompiler<'a> {
             let _ = class_args;
         }
 
-        let candidates = self.dynamic_method_candidates(field);
+        let candidates = self.dynamic_method_candidates(field, trait_name);
         if candidates.is_empty() {
             return Err(format!(
                 "direct backend does not know dynamic method `.{}` on `{}`",
@@ -13867,6 +14971,7 @@ impl<'a> FunctionCompiler<'a> {
                 field,
                 receiver_place,
                 args,
+                trait_name,
             );
         }
 
@@ -13885,10 +14990,17 @@ impl<'a> FunctionCompiler<'a> {
         let join_block = self.builder.create_block();
         let mut current_fallthrough = None;
         let result_vars = self.declare_temporary_result_storage(&result_ty)?;
+        // Every runtime candidate starts from the same ownership state. Emitting
+        // one candidate's taken edge can consume or release an owned projected
+        // receiver, but that edge is skipped when control falls through to the
+        // next candidate. Keep the compile-time ledger path-local so a later
+        // candidate still emits the release owed by its runtime path.
+        let caller_owned = self.owned_opaque_temporaries.clone();
         for (candidate_ty, _method) in candidates.iter() {
             let Type::Named(candidate_name, _) = candidate_ty else {
                 continue;
             };
+            self.owned_opaque_temporaries = caller_owned.clone();
             let matched = self.value_matches_runtime_type(object.values[0], candidate_ty)?;
             let then_block = self.builder.create_block();
             let else_block = self.builder.create_block();
@@ -13896,6 +15008,7 @@ impl<'a> FunctionCompiler<'a> {
                 .ins()
                 .brif(matched, then_block, &[], else_block, &[]);
             self.builder.switch_to_block(then_block);
+            self.owned_opaque_temporaries = caller_owned.clone();
             let call_result = self.compile_class_member_call(
                 candidate_name,
                 Some(candidate_ty.clone()),
@@ -13903,6 +15016,7 @@ impl<'a> FunctionCompiler<'a> {
                 field,
                 receiver_place,
                 args,
+                trait_name,
             )?;
             let coerced_result = self.coerce_value(call_result, &result_ty)?;
             self.store_result_vars(&result_vars, &coerced_result)?;
@@ -13910,6 +15024,7 @@ impl<'a> FunctionCompiler<'a> {
             self.builder.ins().jump(join_block, &[]);
             self.builder.seal_block(then_block);
             self.builder.switch_to_block(else_block);
+            self.owned_opaque_temporaries = caller_owned.clone();
             current_fallthrough = Some(else_block);
         }
         if let Some(else_block) = current_fallthrough {
@@ -13920,6 +15035,11 @@ impl<'a> FunctionCompiler<'a> {
         }
         self.builder.switch_to_block(join_block);
         self.builder.seal_block(join_block);
+        // Every successful candidate released its branch-local temporaries
+        // before jumping here. The restored fallthrough ledger belongs only to
+        // the trapping no-match edge and must not be released a second time at
+        // the join.
+        self.owned_opaque_temporaries.clear();
         self.load_result_vars(&result_vars, result_ty)
     }
 
@@ -14246,14 +15366,23 @@ impl<'a> FunctionCompiler<'a> {
         )
     }
 
-    fn dynamic_method_candidates(&self, field: &str) -> Vec<(Type, MirMethod)> {
+    fn dynamic_method_candidates(
+        &self,
+        field: &str,
+        trait_name: Option<&str>,
+    ) -> Vec<(Type, MirMethod)> {
         let mut candidates = Vec::new();
-        for class in self.classes.values() {
-            if let Some(method) = class.methods.iter().find(|method| method.name == field) {
-                candidates.push((usize::MAX, Type::named(&class.name), method.clone()));
+        if trait_name.is_none() {
+            for class in self.classes.values() {
+                if let Some(method) = class.methods.iter().find(|method| method.name == field) {
+                    candidates.push((usize::MAX, Type::named(&class.name), method.clone()));
+                }
             }
         }
         for trait_impl in &self.trait_impls {
+            if trait_name.is_some_and(|name| trait_impl.trait_name != name) {
+                continue;
+            }
             if let Some(method) = trait_impl
                 .methods
                 .iter()
@@ -14277,10 +15406,31 @@ impl<'a> FunctionCompiler<'a> {
     }
 
     fn find_trait_method(&self, ty: &Type, field: &str) -> Option<&MirMethod> {
+        self.find_trait_method_with_identity(ty, None, field)
+    }
+
+    fn find_trait_method_for_trait(
+        &self,
+        ty: &Type,
+        trait_name: &str,
+        field: &str,
+    ) -> Option<&MirMethod> {
+        self.find_trait_method_with_identity(ty, Some(trait_name), field)
+    }
+
+    fn find_trait_method_with_identity(
+        &self,
+        ty: &Type,
+        trait_name: Option<&str>,
+        field: &str,
+    ) -> Option<&MirMethod> {
         let mut best = None;
         let mut best_specificity = 0usize;
         let mut ambiguous = false;
         for trait_impl in &self.trait_impls {
+            if trait_name.is_some_and(|name| trait_impl.trait_name != name) {
+                continue;
+            }
             let mut type_params = BTreeSet::new();
             collect_type_params_from_type(&trait_impl.for_type, &mut type_params);
             let mut substitutions = HashMap::new();
@@ -14512,11 +15662,23 @@ fn receiver_type(
     )
 }
 
+#[cfg(test)]
 fn cleanup_place_type(
     function: &MirFunction,
     classes: &HashMap<String, MirClass>,
     place: &str,
     function_return_types: &HashMap<String, DirectType>,
+) -> std::result::Result<DirectType, String> {
+    let reachable = reachable_direct_block_labels(function)?;
+    cleanup_place_type_in_reachable(function, classes, place, function_return_types, &reachable)
+}
+
+fn cleanup_place_type_in_reachable(
+    function: &MirFunction,
+    classes: &HashMap<String, MirClass>,
+    place: &str,
+    function_return_types: &HashMap<String, DirectType>,
+    reachable: &HashSet<String>,
 ) -> std::result::Result<DirectType, String> {
     let mut root_types = HashMap::new();
     if function.receiver.is_some() {
@@ -14551,6 +15713,9 @@ fn cleanup_place_type(
             )?);
     }
     for block in &function.blocks {
+        if !reachable.contains(&block.label) {
+            continue;
+        }
         for instruction in &block.instructions {
             let Instruction::Assign { target, value } = instruction else {
                 continue;
@@ -14653,9 +15818,12 @@ fn direct_type_contains_unknown(ty: &DirectType) -> bool {
     }
 }
 
-fn collect_cleanup_places(function: &MirFunction) -> Vec<String> {
+fn collect_cleanup_places(function: &MirFunction, reachable: &HashSet<String>) -> Vec<String> {
     let mut cleanup_places = Vec::<String>::new();
     for block in &function.blocks {
+        if !reachable.contains(&block.label) {
+            continue;
+        }
         for instruction in &block.instructions {
             let Instruction::PushCleanup { place } = instruction else {
                 continue;
@@ -14682,7 +15850,10 @@ fn direct_place_paths_overlap(left: &str, right: &str) -> bool {
     shared == left_segments.len() || shared == right_segments.len()
 }
 
-fn validate_module(module: &MirModule) -> std::result::Result<(), String> {
+fn validate_module(
+    module: &MirModule,
+) -> std::result::Result<HashMap<String, HashSet<String>>, String> {
+    crate::mir::validate_loan_flow(module)?;
     let mut classes = HashMap::new();
     for class in &module.classes {
         classes.insert(class.name.clone(), class.clone());
@@ -14696,15 +15867,28 @@ fn validate_module(module: &MirModule) -> std::result::Result<(), String> {
             )?;
         }
     }
+    let mut reachable_by_function = HashMap::new();
     for function in module.functions.iter().chain(module.top_level.iter()) {
-        validate_function(function, &classes)?;
+        let reachable = reachable_direct_block_labels(function)?;
+        validate_function_in_reachable(function, &classes, &reachable)?;
+        reachable_by_function.insert(function.name.clone(), reachable);
     }
-    Ok(())
+    Ok(reachable_by_function)
 }
 
+#[cfg(test)]
 fn validate_function(
     function: &MirFunction,
     classes: &HashMap<String, MirClass>,
+) -> std::result::Result<(), String> {
+    let reachable = reachable_direct_block_labels(function)?;
+    validate_function_in_reachable(function, classes, &reachable)
+}
+
+fn validate_function_in_reachable(
+    function: &MirFunction,
+    classes: &HashMap<String, MirClass>,
+    reachable: &HashSet<String>,
 ) -> std::result::Result<(), String> {
     if function.receiver.is_some() {
         receiver_type(function, classes)?;
@@ -14729,6 +15913,9 @@ fn validate_function(
         )?;
     }
     for block in &function.blocks {
+        if !reachable.contains(&block.label) {
+            continue;
+        }
         for instruction in &block.instructions {
             match instruction {
                 Instruction::Safepoint => {}
@@ -14820,6 +16007,9 @@ fn validate_rvalue(
             validate_non_consuming_operand(right, "the right side of a binary expression")
         }
         Rvalue::Call { callee, args } => {
+            if matches!(callee, CallTarget::Member { field, .. } if field == "__slice") {
+                direct_internal_slice_args(args)?;
+            }
             match callee {
                 CallTarget::Name(_) => {}
                 CallTarget::Value(function) => {
@@ -14833,7 +16023,9 @@ fn validate_rvalue(
                     ensure_direct_type(&call.return_type, classes, "extern return")?;
                     direct_ffi_type_for_source(&call.return_type, None)?;
                 }
-                CallTarget::Member { object, .. } => validate_operand(object)?,
+                CallTarget::Member { object, .. } | CallTarget::TraitMember { object, .. } => {
+                    validate_operand(object)?
+                }
             }
             for argument in args {
                 validate_operand(&argument.value)?;
@@ -15648,7 +16840,8 @@ fn infer_rvalue_type(
                 Some(DirectType::Opaque(Type::named("Duration")))
             }
             CallTarget::Name(name) => function_return_types.get(name).cloned(),
-            CallTarget::Member { object, field, .. } => {
+            CallTarget::Member { object, field, .. }
+            | CallTarget::TraitMember { object, field, .. } => {
                 let object_ty = infer_operand_type(object, variable_types, classes)?;
                 if matches!(object_ty.scalar_kind(), Some(kind) if kind.is_float())
                     && field == "sqrt"
@@ -17228,10 +18421,19 @@ fn runtime_type_is_wildcard(ty: &Type) -> bool {
     }
 }
 
-fn collect_task_start_targets(module: &MirModule) -> BTreeSet<String> {
+fn collect_task_start_targets(
+    module: &MirModule,
+    reachable_by_function: &HashMap<String, HashSet<String>>,
+) -> BTreeSet<String> {
     let mut targets = BTreeSet::new();
     for function in module.functions.iter().chain(module.top_level.iter()) {
+        let Some(reachable) = reachable_by_function.get(&function.name) else {
+            continue;
+        };
         for block in &function.blocks {
+            if !reachable.contains(&block.label) {
+                continue;
+            }
             for instruction in &block.instructions {
                 if let Instruction::Assign {
                     value: Rvalue::StartTask { function, .. },

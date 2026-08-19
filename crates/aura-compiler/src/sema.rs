@@ -551,7 +551,8 @@ pub struct ClosureInfo {
     pub span: crate::diag::Span,
     pub params: Vec<FunctionParamContract>,
     pub return_type: Type,
-    /// Deterministic lexical-first-use capture order.
+    /// Explicit lists preserve source order; implicit captures use lexical
+    /// first-use order.
     pub captures: Vec<ClosureCapture>,
     pub call_kind: ClosureCallKind,
 }
@@ -4140,8 +4141,31 @@ fn default_argument_references_param(expr: &Expr, param_names: &[String]) -> Opt
     }
 }
 
-fn expr_references_name(expr: &Expr, name: &str) -> bool {
+pub(crate) fn expr_references_name(expr: &Expr, name: &str) -> bool {
     default_argument_references_param(expr, &[name.to_string()]).is_some()
+}
+
+fn grouped_expr(expr: &Expr) -> &Expr {
+    match &expr.kind {
+        ExprKind::Group(inner) => grouped_expr(inner),
+        _ => expr,
+    }
+}
+
+fn grouped_specialized_expr(expr: &Expr) -> &Expr {
+    match &expr.kind {
+        ExprKind::Group(inner) | ExprKind::Specialize { expr: inner, .. } => {
+            grouped_specialized_expr(inner)
+        }
+        _ => expr,
+    }
+}
+
+fn grouped_name(expr: &Expr) -> Option<&str> {
+    match &grouped_expr(expr).kind {
+        ExprKind::Name(name) => Some(name),
+        _ => None,
+    }
 }
 
 fn block_references_name(body: &[Stmt], name: &str) -> bool {
@@ -4208,6 +4232,270 @@ pub(crate) fn stmt_references_name(stmt: &Stmt, name: &str) -> bool {
     }
 }
 
+fn later_span(
+    current: Option<crate::diag::Span>,
+    candidate: Option<crate::diag::Span>,
+) -> Option<crate::diag::Span> {
+    match (current, candidate) {
+        (Some(left), Some(right)) if span_precedes(left, right) => Some(right),
+        (Some(left), _) => Some(left),
+        (None, right) => right,
+    }
+}
+
+fn last_name_reference_span_in_block(body: &[Stmt], name: &str) -> Option<crate::diag::Span> {
+    body.iter()
+        .rev()
+        .find_map(|stmt| last_name_reference_span_in_stmt(stmt, name))
+}
+
+fn last_name_reference_span_in_match(
+    match_stmt: &MatchStmt,
+    name: &str,
+) -> Option<crate::diag::Span> {
+    let mut last =
+        expr_references_name(&match_stmt.scrutinee, name).then_some(match_stmt.scrutinee.span);
+    for arm in &match_stmt.arms {
+        last = later_span(
+            last,
+            arm.guard
+                .as_ref()
+                .filter(|guard| expr_references_name(guard, name))
+                .map(|guard| guard.span),
+        );
+        last = later_span(last, last_name_reference_span_in_block(&arm.body, name));
+    }
+    last
+}
+
+/// Returns a span at the actual nested use rather than the header of the
+/// enclosing control-flow statement. Loan expiration compares source
+/// positions, so collapsing an inner use to an earlier `if`/`match`/loop
+/// header would otherwise end an inherited loan before checking that body.
+fn last_name_reference_span_in_stmt(stmt: &Stmt, name: &str) -> Option<crate::diag::Span> {
+    if !stmt_references_name(stmt, name) {
+        return None;
+    }
+    match stmt {
+        Stmt::If(if_stmt) => {
+            let mut last = None;
+            for branch in &if_stmt.branches {
+                last = later_span(
+                    last,
+                    expr_references_name(&branch.condition, name).then_some(branch.condition.span),
+                );
+                last = later_span(last, last_name_reference_span_in_block(&branch.body, name));
+            }
+            if let Some(body) = &if_stmt.else_body {
+                last = later_span(last, last_name_reference_span_in_block(body, name));
+            }
+            last.or(Some(if_stmt.span))
+        }
+        Stmt::Match(match_stmt) => {
+            last_name_reference_span_in_match(match_stmt, name).or(Some(match_stmt.span))
+        }
+        Stmt::For(for_stmt) => Some(
+            last_name_reference_span_in_block(&for_stmt.body, name)
+                .map(|span| later_span(Some(for_stmt.span), Some(span)).unwrap_or(for_stmt.span))
+                .or_else(|| last_name_reference_span_in_expr(&for_stmt.iterable, name))
+                .unwrap_or(for_stmt.span),
+        ),
+        Stmt::With(with_stmt) => later_span(
+            expr_references_name(&with_stmt.value, name).then_some(with_stmt.value.span),
+            last_name_reference_span_in_block(&with_stmt.body, name),
+        )
+        .or(Some(with_stmt.span)),
+        Stmt::While(while_stmt) => Some(
+            block_end_span(&while_stmt.body)
+                .map(|span| {
+                    later_span(Some(while_stmt.span), Some(span)).unwrap_or(while_stmt.span)
+                })
+                .unwrap_or(while_stmt.span),
+        ),
+        Stmt::Assign(assign) => {
+            last_name_reference_span_in_expr(&assign.value, name).or_else(|| match &assign.target {
+                AssignTarget::Name(target) if target == name => Some(assign.span),
+                AssignTarget::Member { object, .. } => {
+                    last_name_reference_span_in_expr(object, name)
+                }
+                AssignTarget::Index { object, index } => later_span(
+                    last_name_reference_span_in_expr(object, name),
+                    last_name_reference_span_in_expr(index, name),
+                ),
+                _ => None,
+            })
+        }
+        Stmt::View(view) => last_name_reference_span_in_expr(&view.source, name),
+        Stmt::Destructure(stmt) => last_name_reference_span_in_expr(&stmt.value, name),
+        Stmt::Assert(stmt) => later_span(
+            last_name_reference_span_in_expr(&stmt.condition, name),
+            stmt.message
+                .as_ref()
+                .and_then(|message| last_name_reference_span_in_expr(message, name)),
+        ),
+        Stmt::Return(stmt) => stmt
+            .value
+            .as_ref()
+            .and_then(|value| last_name_reference_span_in_expr(value, name)),
+        Stmt::Expr(stmt) => last_name_reference_span_in_expr(&stmt.expr, name),
+        Stmt::Pass(_) | Stmt::Break(_) | Stmt::Continue(_) => None,
+    }
+}
+
+fn block_end_span(body: &[Stmt]) -> Option<crate::diag::Span> {
+    body.last().map(statement_end_span)
+}
+
+fn statement_end_span(stmt: &Stmt) -> crate::diag::Span {
+    match stmt {
+        Stmt::If(stmt) => stmt
+            .else_body
+            .as_ref()
+            .and_then(|body| block_end_span(body))
+            .or_else(|| {
+                stmt.branches
+                    .last()
+                    .and_then(|branch| block_end_span(&branch.body))
+            })
+            .unwrap_or(stmt.span),
+        Stmt::Match(stmt) => stmt
+            .arms
+            .last()
+            .and_then(|arm| block_end_span(&arm.body))
+            .unwrap_or(stmt.span),
+        Stmt::For(stmt) => block_end_span(&stmt.body).unwrap_or(stmt.span),
+        Stmt::With(stmt) => block_end_span(&stmt.body).unwrap_or(stmt.span),
+        Stmt::While(stmt) => block_end_span(&stmt.body).unwrap_or(stmt.span),
+        _ => statement_span(stmt),
+    }
+}
+
+fn last_name_reference_span_in_expr(expr: &Expr, name: &str) -> Option<crate::diag::Span> {
+    let combine = |items: Vec<Option<crate::diag::Span>>| items.into_iter().fold(None, later_span);
+    match &expr.kind {
+        ExprKind::Name(candidate) => (candidate == name).then_some(expr.span),
+        ExprKind::Group(inner)
+        | ExprKind::Try(inner)
+        | ExprKind::Specialize { expr: inner, .. }
+        | ExprKind::Unary { expr: inner, .. }
+        | ExprKind::Cast { expr: inner, .. }
+        | ExprKind::Member { object: inner, .. } => last_name_reference_span_in_expr(inner, name),
+        ExprKind::Index { object, index } => combine(vec![
+            last_name_reference_span_in_expr(object, name),
+            last_name_reference_span_in_expr(index, name),
+        ]),
+        ExprKind::Slice {
+            object, start, end, ..
+        } => combine(vec![
+            last_name_reference_span_in_expr(object, name),
+            start
+                .as_deref()
+                .and_then(|value| last_name_reference_span_in_expr(value, name)),
+            end.as_deref()
+                .and_then(|value| last_name_reference_span_in_expr(value, name)),
+        ]),
+        ExprKind::Call { callee, args } => combine(
+            std::iter::once(last_name_reference_span_in_expr(callee, name))
+                .chain(
+                    args.iter()
+                        .map(|argument| last_name_reference_span_in_expr(&argument.value, name)),
+                )
+                .collect(),
+        ),
+        ExprKind::Tuple(elements) | ExprKind::List(elements) | ExprKind::Set(elements) => combine(
+            elements
+                .iter()
+                .map(|element| last_name_reference_span_in_expr(element, name))
+                .collect(),
+        ),
+        ExprKind::Map(entries) => combine(
+            entries
+                .iter()
+                .flat_map(|entry| [&entry.key, &entry.value])
+                .map(|value| last_name_reference_span_in_expr(value, name))
+                .collect(),
+        ),
+        ExprKind::Comprehension { output, clauses } => {
+            let mut spans = clauses
+                .iter()
+                .flat_map(|clause| std::iter::once(&clause.iterable).chain(clause.filters.iter()))
+                .map(|value| last_name_reference_span_in_expr(value, name))
+                .collect::<Vec<_>>();
+            match output {
+                ComprehensionOutput::List(value) | ComprehensionOutput::Set(value) => {
+                    spans.push(last_name_reference_span_in_expr(value, name));
+                }
+                ComprehensionOutput::Map { key, value } => {
+                    spans.push(last_name_reference_span_in_expr(key, name));
+                    spans.push(last_name_reference_span_in_expr(value, name));
+                }
+            }
+            combine(spans)
+        }
+        ExprKind::FString(parts) => combine(
+            parts
+                .iter()
+                .filter_map(|part| match part {
+                    crate::ast::FormatPart::Literal(_) => None,
+                    crate::ast::FormatPart::Expr(value)
+                    | crate::ast::FormatPart::Formatted { expr: value, .. } => {
+                        Some(last_name_reference_span_in_expr(value, name))
+                    }
+                })
+                .collect(),
+        ),
+        ExprKind::Match {
+            scrutinee, arms, ..
+        } => combine(
+            std::iter::once(last_name_reference_span_in_expr(scrutinee, name))
+                .chain(
+                    arms.iter()
+                        .map(|arm| last_name_reference_span_in_expr(&arm.value, name)),
+                )
+                .collect(),
+        ),
+        ExprKind::Membership {
+            value, container, ..
+        }
+        | ExprKind::Binary {
+            left: value,
+            right: container,
+            ..
+        } => combine(vec![
+            last_name_reference_span_in_expr(value, name),
+            last_name_reference_span_in_expr(container, name),
+        ]),
+        ExprKind::CompareChain { first, links } => combine(
+            std::iter::once(last_name_reference_span_in_expr(first, name))
+                .chain(
+                    links
+                        .iter()
+                        .map(|link| last_name_reference_span_in_expr(&link.operand, name)),
+                )
+                .collect(),
+        ),
+        ExprKind::Conditional {
+            then_expr,
+            condition,
+            else_expr,
+        } => combine(vec![
+            last_name_reference_span_in_expr(condition, name),
+            last_name_reference_span_in_expr(then_expr, name),
+            last_name_reference_span_in_expr(else_expr, name),
+        ]),
+        ExprKind::Lambda { params, body, .. } if params.iter().any(|param| param.name == name) => {
+            None
+        }
+        ExprKind::Lambda { body, .. } => last_name_reference_span_in_expr(body, name),
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Bool(_)
+        | ExprKind::String(_)
+        | ExprKind::DurationNanos(_)
+        | ExprKind::BuiltinOmitted => None,
+    }
+}
+
 fn statement_span(stmt: &Stmt) -> crate::diag::Span {
     match stmt {
         Stmt::Assign(stmt) => stmt.span,
@@ -4229,6 +4517,61 @@ fn statement_span(stmt: &Stmt) -> crate::diag::Span {
 
 fn span_precedes(left: crate::diag::Span, right: crate::diag::Span) -> bool {
     (left.line, left.column) < (right.line, right.column)
+}
+
+fn collect_view_return_entries(
+    body: &[Stmt],
+    aliases: &mut BTreeMap<String, Expr>,
+    values: &mut Vec<(Expr, BTreeMap<String, Expr>)>,
+) {
+    for stmt in body {
+        match stmt {
+            Stmt::View(view) => {
+                aliases.insert(view.name.clone(), view.source.clone());
+            }
+            Stmt::Return(stmt) if stmt.view.is_some() => {
+                if let Some(value) = &stmt.value {
+                    values.push((value.clone(), aliases.clone()));
+                }
+            }
+            Stmt::If(stmt) => {
+                for branch in &stmt.branches {
+                    collect_view_return_entries(&branch.body, &mut aliases.clone(), values);
+                }
+                if let Some(body) = &stmt.else_body {
+                    collect_view_return_entries(body, &mut aliases.clone(), values);
+                }
+            }
+            Stmt::Match(stmt) => {
+                for arm in &stmt.arms {
+                    collect_view_return_entries(&arm.body, &mut aliases.clone(), values);
+                }
+            }
+            Stmt::For(stmt) => {
+                collect_view_return_entries(&stmt.body, &mut aliases.clone(), values)
+            }
+            Stmt::With(stmt) => {
+                collect_view_return_entries(&stmt.body, &mut aliases.clone(), values)
+            }
+            Stmt::While(stmt) => {
+                collect_view_return_entries(&stmt.body, &mut aliases.clone(), values)
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Clone)]
+enum ReturnedProjectionSummary {
+    Known(BTreeSet<String>),
+    Cycle,
+    Unknown,
+}
+
+#[derive(Default)]
+struct ReturnedViewSummaryContext {
+    locals: BTreeMap<String, Type>,
+    type_param_bounds: BTreeMap<String, Vec<TraitBound>>,
 }
 
 fn collect_binding_target_names(target: &crate::ast::BindingTarget, names: &mut BTreeSet<String>) {
@@ -4416,6 +4759,21 @@ fn type_contains_closure_value(ty: &Type) -> bool {
         }
         // Function parameter and return types describe calls; they are not
         // values stored inside the function pointer itself.
+        Type::Function { .. } | Type::TypeParam(_) | Type::Module(_) | Type::Unit => false,
+    }
+}
+
+fn type_contains_loan_closure(ty: &Type) -> bool {
+    match ty {
+        Type::Closure { captures, .. } => captures.iter().any(|capture| {
+            matches!(
+                capture.mode,
+                ClosureCaptureMode::SharedView | ClosureCaptureMode::MutableView
+            )
+        }),
+        Type::Tuple(elements) | Type::Named(_, elements) => {
+            elements.iter().any(type_contains_loan_closure)
+        }
         Type::Function { .. } | Type::TypeParam(_) | Type::Module(_) | Type::Unit => false,
     }
 }
@@ -5598,6 +5956,15 @@ struct LocalBinding {
 struct ViewBinding {
     kind: crate::ast::ViewKind,
     source: PlacePath,
+    /// The immediately reborrowed view, when this loan was created through
+    /// another descriptor.  Ancestors are suspended while a descendant is
+    /// live and resume after the descendant's inferred last use.
+    parent: Option<String>,
+    /// Every transitive parent captured when the reborrow is created.  This
+    /// lineage must outlive an intermediate parent's active loan metadata:
+    /// an intermediate view can reach its inferred last use while a deeper
+    /// descendant still keeps the original ancestor suspended.
+    ancestors: BTreeSet<String>,
     created_at: crate::diag::Span,
     last_use: crate::diag::Span,
 }
@@ -5622,6 +5989,15 @@ struct BorrowedCallPlace {
     passing: ReceiverKind,
     param_name: String,
     origin_span: crate::diag::Span,
+}
+
+#[derive(Clone)]
+struct ActiveMatchBorrow {
+    /// Canonical physical place protected by the mutable match.
+    physical: PlacePath,
+    /// Syntactic scrutinee route authorized to update that place. Re-spelling
+    /// the same place through an owner or a different view remains forbidden.
+    access: PlacePath,
 }
 
 /// A compiler-known `for` iterable form.
@@ -5725,7 +6101,7 @@ struct FunctionChecker<'a> {
     type_params: BTreeMap<String, ()>,
     type_param_bounds: BTreeMap<String, Vec<TraitBound>>,
     implicit_borrowed_params: BTreeMap<String, Type>,
-    active_match_borrow_places: Rc<RefCell<Vec<PlacePath>>>,
+    active_match_borrow_places: Rc<RefCell<Vec<ActiveMatchBorrow>>>,
     rng_clone_obligations: Rc<RefCell<BTreeSet<String>>>,
     array_equality_obligations: Rc<RefCell<BTreeSet<String>>>,
     expr_result_entries: Rc<RefCell<HashMap<usize, ExprResultEntry>>>,
@@ -5736,6 +6112,7 @@ struct FunctionChecker<'a> {
 
 #[derive(Clone)]
 struct ResolvedTraitMethodInfo {
+    module_name: String,
     decl: FunctionDecl,
     signature: FunctionSignature,
     type_param_bounds: BTreeMap<String, Vec<TraitBound>>,
@@ -7886,6 +8263,7 @@ impl<'a> FunctionChecker<'a> {
         label: &str,
         locals: &mut HashMap<String, LocalBinding>,
     ) -> Result<()> {
+        self.reject_view_value_for_passing(expr, passing, label, locals)?;
         match passing {
             ReceiverKind::Value => {
                 if let Some(place) = self.borrow_call_place(expr) {
@@ -7903,7 +8281,7 @@ impl<'a> FunctionChecker<'a> {
                     ));
                 }
                 if let Some(place) = self.borrow_call_place(expr) {
-                    self.ensure_place_not_frozen(&place, expr.span, locals)?;
+                    self.ensure_place_mutation_allowed(&place, expr.span, locals)?;
                 }
                 Ok(())
             }
@@ -8207,7 +8585,10 @@ impl<'a> FunctionChecker<'a> {
 
     fn peel_specialization<'b>(&self, expr: &'b Expr) -> (&'b Expr, Option<&'b [TypeRef]>) {
         match &expr.kind {
-            ExprKind::Specialize { expr, type_args } => (&**expr, Some(type_args.as_slice())),
+            ExprKind::Group(inner) => self.peel_specialization(inner),
+            ExprKind::Specialize { expr, type_args } => {
+                (grouped_expr(expr), Some(type_args.as_slice()))
+            }
             _ => (expr, None),
         }
     }
@@ -8349,7 +8730,9 @@ impl<'a> FunctionChecker<'a> {
         if self.is_copy_type(&binding.ty) {
             return Ok(());
         }
-        self.ensure_place_not_frozen_for_move(&PlacePath::root(name.to_string()), span, locals)?;
+        let place = PlacePath::root(name.to_string());
+        self.ensure_place_not_frozen_for_move(&place, span, locals)?;
+        self.ensure_place_not_locked_by_view(&place, None, span, locals)?;
         let binding = locals
             .get_mut(name)
             .ok_or_else(|| Diagnostic::at(span, format!("unknown name `{}`", name)))?;
@@ -8574,6 +8957,11 @@ impl<'a> FunctionChecker<'a> {
         expr: &Expr,
         locals: &mut HashMap<String, LocalBinding>,
     ) -> Result<()> {
+        // Every path through this helper consumes an owned value. Keep the
+        // region check centralized so calls, projections, constants, `try`,
+        // owned control-flow scrutinees, builtin arguments, and operator
+        // operands cannot each grow a separate view-erasure loophole.
+        self.reject_owned_view_value(expr, locals, "an owned value")?;
         let key = expr as *const Expr as usize;
         let Some(entry) = self.expr_result_entries.borrow_mut().remove(&key) else {
             return self.consume_value_expr_raw(expr, locals);
@@ -8594,6 +8982,22 @@ impl<'a> FunctionChecker<'a> {
         replay_result?;
         self.merge_control_flow_moves(locals, &[&post_typecheck, &replay_locals]);
         Ok(())
+    }
+
+    /// Consumes an ordinary value produced in a read-only context without
+    /// mistaking a direct view read for ownership transfer of its descriptor.
+    /// Capability validation runs before this helper; mutable returned
+    /// temporaries therefore remain rejected while shared/local views are
+    /// read through their pointee for the duration of this expression.
+    fn consume_direct_read_expr(
+        &self,
+        expr: &Expr,
+        locals: &mut HashMap<String, LocalBinding>,
+    ) -> Result<()> {
+        if self.direct_view_value_kind(expr, locals)?.is_some() {
+            return Ok(());
+        }
+        self.consume_value_expr(expr, locals)
     }
 
     fn consume_value_expr_raw(
@@ -8644,7 +9048,19 @@ impl<'a> FunctionChecker<'a> {
                     expr, object, field, &object_ty, &member_ty, locals,
                 )
             }
-            ExprKind::Index { .. } => self.type_of_expr(expr, locals).map(|_| ()),
+            ExprKind::Index { .. } => {
+                if let Some(place) = self.borrow_call_place(expr) {
+                    if self
+                        .place_path_type(&place, locals, expr.span)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|ty| !self.is_copy_type(&ty))
+                    {
+                        self.ensure_place_not_locked_by_view(&place, None, expr.span, locals)?;
+                    }
+                }
+                self.type_of_expr(expr, locals).map(|_| ())
+            }
             // Slices materialize a fresh owned value. Their source and
             // endpoints were fully checked while producing that value; moving
             // the result must not replay or consume any of those inputs.
@@ -8671,6 +9087,9 @@ impl<'a> FunctionChecker<'a> {
     ) -> Result<()> {
         if self.is_copy_type(member_ty) {
             return Ok(());
+        }
+        if let Some(place) = self.borrow_call_place(expr) {
+            self.ensure_place_not_locked_by_view(&place, None, expr.span, locals)?;
         }
         if let Some(name) = self.borrowed_root_binding_name(object, locals) {
             let mut diagnostic = Diagnostic::at(
@@ -8857,7 +9276,8 @@ impl<'a> FunctionChecker<'a> {
                     "finish using `{name}` before changing `{place}`; use `match mut {place}` to update its payload or `match own {place}` to consume it"
                 )));
             }
-            return Err(Diagnostic::at(
+            return Err(Diagnostic::coded_at(
+                "AU3002",
                 span,
                 format!(
                     "cannot use pattern binding `{}` after reassigning match scrutinee `{}`",
@@ -9704,7 +10124,7 @@ impl<'a> FunctionChecker<'a> {
 
         let mut body_locals = locals.clone();
         for iterable in &form.iterables {
-            if let Some(place) = self.borrow_call_place(iterable) {
+            if let Some(place) = self.borrowed_iterable_place(iterable, locals)? {
                 let root = place.root.clone();
                 if let Some(binding) = body_locals.get_mut(&root) {
                     if place.is_root() {
@@ -9750,6 +10170,7 @@ impl<'a> FunctionChecker<'a> {
         clause: &ComprehensionClause,
         locals: &mut HashMap<String, LocalBinding>,
     ) -> Result<(HashMap<String, LocalBinding>, ComprehensionClauseInfo)> {
+        self.reject_mutable_returned_view_value(&clause.iterable, locals, false)?;
         let (binding_type, binding_passing, receive_owned, sources) = if let Some(form) =
             self.loop_form(&clause.iterable)?
         {
@@ -9827,7 +10248,7 @@ impl<'a> FunctionChecker<'a> {
         let mut clause_locals = locals.clone();
         if !receive_owned {
             for source in sources {
-                if let Some(place) = self.borrow_call_place(source) {
+                if let Some(place) = self.borrowed_iterable_place(source, locals)? {
                     let root = place.root.clone();
                     if let Some(binding) = clause_locals.get_mut(&root) {
                         if place.is_root() {
@@ -9880,6 +10301,7 @@ impl<'a> FunctionChecker<'a> {
         clause_infos.push(clause_info);
 
         for filter in &clause.filters {
+            self.reject_mutable_returned_view_value(filter, &mut body_locals, false)?;
             let filter_ty =
                 self.type_of_expr_hint(filter, &mut body_locals, Some(&Type::named("bool")))?;
             if filter_ty != Type::named("bool") {
@@ -9889,7 +10311,7 @@ impl<'a> FunctionChecker<'a> {
                     format!("comprehension filter must have type `bool`, found `{filter_ty}`"),
                 ));
             }
-            self.consume_value_expr(filter, &mut body_locals)?;
+            self.consume_direct_read_expr(filter, &mut body_locals)?;
         }
 
         let result_types = if clause_index + 1 < clauses.len() {
@@ -9906,6 +10328,7 @@ impl<'a> FunctionChecker<'a> {
                                     expected: Option<&Type>,
                                     label: &str|
              -> Result<Type> {
+                self.reject_mutable_returned_view_value(value, &mut body_locals, false)?;
                 // A comprehension always stores each produced value into a
                 // fresh owned collection. This transfer happens even when the
                 // collection itself is immediately observed through shared
@@ -10147,6 +10570,7 @@ impl<'a> FunctionChecker<'a> {
         locals: &mut HashMap<String, LocalBinding>,
     ) -> Result<()> {
         let value_ty = self.type_of_expr(&destructure.value, locals)?;
+        self.reject_owned_view_value(&destructure.value, locals, "a destructured owned value")?;
         let mut candidate = locals.clone();
         self.bind_target(
             &destructure.target,
@@ -10181,18 +10605,34 @@ impl<'a> FunctionChecker<'a> {
             self.expire_views_before(statement_span(stmt), locals);
             match stmt {
                 Stmt::Assign(assign) => {
+                    let transferred_closure_loans = match &assign.target {
+                        AssignTarget::Name(target)
+                            if grouped_name(&assign.value)
+                                .is_some_and(|source| target != source) =>
+                        {
+                            let source = grouped_name(&assign.value)
+                                .expect("guarded grouped closure move")
+                                .to_string();
+                            locals
+                                .get(&source)
+                                .filter(|binding| !binding.closure_loans.is_empty())
+                                .map(|binding| (source, binding.closure_loans.clone()))
+                        }
+                        _ => None,
+                    };
                     self.check_assign(assign, locals)?;
+                    let assigned_value = grouped_expr(&assign.value);
                     if let (
                         AssignTarget::Name(binding_name),
                         ExprKind::Lambda {
                             captures: Some(_), ..
                         },
-                    ) = (&assign.target, &assign.value.kind)
+                    ) = (&assign.target, &assigned_value.kind)
                     {
                         let id = ClosureId::new(
                             self.module_name,
                             self.closure_owner.clone(),
-                            assign.value.span,
+                            assigned_value.span,
                         );
                         let info = self.closure_infos.borrow().get(&id).cloned();
                         if let Some(info) = info {
@@ -10200,8 +10640,9 @@ impl<'a> FunctionChecker<'a> {
                                 .iter()
                                 .skip(stmt_index + 1)
                                 .rev()
-                                .find(|stmt| stmt_references_name(stmt, binding_name))
-                                .map(statement_span)
+                                .find_map(|stmt| {
+                                    last_name_reference_span_in_stmt(stmt, binding_name)
+                                })
                                 .unwrap_or(assign.span);
                             let mut loans = Vec::new();
                             for capture in info.captures.iter().filter(|capture| {
@@ -10231,9 +10672,12 @@ impl<'a> FunctionChecker<'a> {
                                     capture.span,
                                     locals,
                                 )?;
+                                let ancestors = self.view_ancestor_names(parent, locals);
                                 loans.push(ViewBinding {
                                     kind,
                                     source,
+                                    parent: parent.map(str::to_string),
+                                    ancestors,
                                     created_at: capture.span,
                                     last_use,
                                 });
@@ -10241,6 +10685,26 @@ impl<'a> FunctionChecker<'a> {
                             if let Some(binding) = locals.get_mut(binding_name) {
                                 binding.closure_loans = loans;
                             }
+                        }
+                    } else if let (
+                        AssignTarget::Name(binding_name),
+                        Some((source_name, mut loans)),
+                    ) = (&assign.target, transferred_closure_loans)
+                    {
+                        let last_use = body
+                            .iter()
+                            .skip(stmt_index + 1)
+                            .rev()
+                            .find_map(|stmt| last_name_reference_span_in_stmt(stmt, binding_name))
+                            .unwrap_or(assign.span);
+                        for loan in &mut loans {
+                            loan.last_use = last_use;
+                        }
+                        if let Some(source) = locals.get_mut(&source_name) {
+                            source.closure_loans.clear();
+                        }
+                        if let Some(binding) = locals.get_mut(binding_name) {
+                            binding.closure_loans = loans;
                         }
                     }
                 }
@@ -10252,16 +10716,13 @@ impl<'a> FunctionChecker<'a> {
                             format!("view binding `{}` would shadow an existing name", view.name),
                         ));
                     }
-                    let direct_parent = match &view.source.kind {
-                        ExprKind::Name(name)
-                            if locals
-                                .get(name)
-                                .is_some_and(|binding| binding.view.is_some()) =>
-                        {
-                            Some(name.clone())
-                        }
-                        _ => None,
-                    };
+                    let syntactic_place = self.borrow_call_place(&view.source);
+                    let direct_parent = syntactic_place.as_ref().and_then(|place| {
+                        locals
+                            .get(&place.root)
+                            .is_some_and(|binding| binding.view.is_some())
+                            .then(|| place.root.clone())
+                    });
                     let source_place = self.view_place(&view.source, locals)?.ok_or_else(|| {
                         Diagnostic::coded_at(
                             "AU3004",
@@ -10310,7 +10771,19 @@ impl<'a> FunctionChecker<'a> {
                             format!("mutable view source `{source_place}` is not mutable"),
                         ));
                     }
-                    let ty = self.type_of_expr(&view.source, locals)?;
+                    let ty = if returned_kind.is_some() {
+                        self.type_of_expr(&view.source, locals)?
+                    } else {
+                        let type_place = syntactic_place.as_ref().unwrap_or(&source_place);
+                        self.place_path_type(type_place, locals, view.source.span)?
+                            .ok_or_else(|| {
+                                Diagnostic::coded_at(
+                                    "AU3004",
+                                    view.source.span,
+                                    "a view source must have a known stable place type",
+                                )
+                            })?
+                    };
                     let kind = if view.mutable {
                         crate::ast::ViewKind::Mutable
                     } else {
@@ -10327,14 +10800,14 @@ impl<'a> FunctionChecker<'a> {
                         .iter()
                         .skip(stmt_index + 1)
                         .rev()
-                        .find(|stmt| stmt_references_name(stmt, &view.name))
-                        .map(statement_span)
+                        .find_map(|stmt| last_name_reference_span_in_stmt(stmt, &view.name))
                         .unwrap_or(view.span);
                     let passing = if kind == crate::ast::ViewKind::Mutable {
                         ReceiverKind::BorrowMut
                     } else {
                         ReceiverKind::Borrow
                     };
+                    let ancestors = self.view_ancestor_names(parent.as_deref(), locals);
                     locals.insert(
                         view.name.clone(),
                         LocalBinding {
@@ -10357,6 +10830,8 @@ impl<'a> FunctionChecker<'a> {
                             view: Some(ViewBinding {
                                 kind,
                                 source: source_place,
+                                parent,
+                                ancestors,
                                 created_at: view.span,
                                 last_use,
                             }),
@@ -10368,6 +10843,7 @@ impl<'a> FunctionChecker<'a> {
                 Stmt::Pass(_) => {}
                 Stmt::Assert(assert_stmt) => {
                     let condition_ty = self.type_of_expr(&assert_stmt.condition, locals)?;
+                    self.reject_mutable_returned_view_value(&assert_stmt.condition, locals, false)?;
                     if condition_ty != Type::named("bool") {
                         return Err(Diagnostic::at(
                             assert_stmt.span,
@@ -10380,11 +10856,16 @@ impl<'a> FunctionChecker<'a> {
                             "Aura has no implicit truthiness; compare the value explicitly, for example `value != 0`",
                         ));
                     }
-                    self.consume_value_expr(&assert_stmt.condition, locals)?;
+                    self.consume_direct_read_expr(&assert_stmt.condition, locals)?;
 
                     if let Some(message) = &assert_stmt.message {
                         let mut message_locals = locals.clone();
                         let message_ty = self.type_of_expr(message, &mut message_locals)?;
+                        self.reject_mutable_returned_view_value(
+                            message,
+                            &mut message_locals,
+                            false,
+                        )?;
                         if message_ty != Type::named("str") {
                             return Err(Diagnostic::at(
                                 assert_stmt.span,
@@ -10398,6 +10879,7 @@ impl<'a> FunctionChecker<'a> {
                 }
                 Stmt::Expr(expr_stmt) => {
                     self.type_of_expr(&expr_stmt.expr, locals)?;
+                    self.reject_mutable_returned_view_value(&expr_stmt.expr, locals, false)?;
                     self.consume_value_expr(&expr_stmt.expr, locals)?;
                 }
                 Stmt::Return(return_stmt) => {
@@ -10443,6 +10925,24 @@ impl<'a> FunctionChecker<'a> {
                                 "a returned view must derive from its declared receiver or parameter origin",
                             )
                         })?;
+                        let source_kind = self
+                            .borrow_call_place(value)
+                            .and_then(|place| {
+                                locals
+                                    .get(&place.root)
+                                    .and_then(|binding| binding.view.as_ref())
+                                    .map(|view| view.kind)
+                            })
+                            .or(self.returned_view_call_kind(value, locals)?);
+                        if expected_kind == crate::ast::ViewKind::Mutable
+                            && source_kind == Some(crate::ast::ViewKind::Shared)
+                        {
+                            return Err(Diagnostic::coded_at(
+                                "AU3010",
+                                value.span,
+                                "a shared view cannot be returned as a mutable view",
+                            ));
+                        }
                         if returned.root != contract.origin {
                             return Err(Diagnostic::coded_at(
                                 "AU3010",
@@ -10461,11 +10961,47 @@ impl<'a> FunctionChecker<'a> {
                             "`return view` requires a matching `-> view ... from source` declaration",
                         ));
                     }
+                    if view_contract.is_none()
+                        && return_stmt.value.as_ref().is_some_and(|value| {
+                            self.returned_view_call_kind(value, locals)
+                                .ok()
+                                .flatten()
+                                .is_some()
+                        })
+                    {
+                        return Err(Diagnostic::coded_at(
+                            "AU3010",
+                            return_stmt.span,
+                            "a returned view cannot satisfy an ordinary owned return",
+                        )
+                        .with_help(
+                            "declare `-> view T from source` and use `return view ...`, or return an explicit owned clone",
+                        ));
+                    }
                     let ty = if let Some(value) = &return_stmt.value {
                         self.type_of_expr_hint(value, locals, Some(return_type))?
                     } else {
                         Type::Unit
                     };
+                    if view_contract.is_none() {
+                        if let Some(value) = &return_stmt.value {
+                            self.reject_owned_view_value(
+                                value,
+                                locals,
+                                "an ordinary owned return",
+                            )?;
+                        }
+                    }
+                    if type_contains_loan_closure(&ty) {
+                        return Err(Diagnostic::coded_at(
+                            "AU3010",
+                            return_stmt.span,
+                            "a function cannot return a closure containing a live view",
+                        )
+                        .with_help(
+                            "keep the loan-bearing closure in its matching inferred local and call it directly",
+                        ));
+                    }
                     if &ty != return_type {
                         return Err(Diagnostic::at(
                             return_stmt.span,
@@ -10484,8 +11020,24 @@ impl<'a> FunctionChecker<'a> {
                     break;
                 }
                 Stmt::If(if_stmt) => {
+                    let control_last_uses = locals
+                        .keys()
+                        .filter_map(|name| {
+                            last_name_reference_span_in_stmt(stmt, name)
+                                .map(|span| (name.clone(), span))
+                        })
+                        .collect::<BTreeMap<_, _>>();
+                    let mut fallthrough_locals = locals.clone();
+                    let mut branch_entry_states = Vec::new();
                     for branch in &if_stmt.branches {
-                        let condition_ty = self.type_of_expr(&branch.condition, locals)?;
+                        self.expire_views_before(branch.condition.span, &mut fallthrough_locals);
+                        let condition_ty =
+                            self.type_of_expr(&branch.condition, &mut fallthrough_locals)?;
+                        self.reject_mutable_returned_view_value(
+                            &branch.condition,
+                            &mut fallthrough_locals,
+                            false,
+                        )?;
                         if condition_ty != Type::named("bool") {
                             return Err(Diagnostic::at(
                                 branch.span,
@@ -10495,13 +11047,21 @@ impl<'a> FunctionChecker<'a> {
                                 ),
                             ));
                         }
+                        branch_entry_states.push(fallthrough_locals.clone());
                     }
 
                     let mut all_return = true;
                     let mut branch_states = Vec::new();
                     let mut later_branches_reachable = true;
-                    for branch in &if_stmt.branches {
-                        let mut branch_locals = locals.clone();
+                    for (branch, branch_entry) in
+                        if_stmt.branches.iter().zip(branch_entry_states.iter())
+                    {
+                        let mut branch_locals = branch_entry.clone();
+                        self.expire_views_unused_in_branch(
+                            &branch.body,
+                            &control_last_uses,
+                            &mut branch_locals,
+                        );
                         let branch_flow = self.check_block(
                             &branch.body,
                             &mut branch_locals,
@@ -10524,7 +11084,12 @@ impl<'a> FunctionChecker<'a> {
 
                     let mut else_state = None;
                     if let Some(else_body) = &if_stmt.else_body {
-                        let mut else_locals = locals.clone();
+                        let mut else_locals = fallthrough_locals.clone();
+                        self.expire_views_unused_in_branch(
+                            else_body,
+                            &control_last_uses,
+                            &mut else_locals,
+                        );
                         let else_flow = self.check_block(
                             else_body,
                             &mut else_locals,
@@ -10550,7 +11115,7 @@ impl<'a> FunctionChecker<'a> {
                             .collect::<Vec<_>>();
                         self.merge_control_flow_moves(locals, &states);
                     } else {
-                        let baseline_locals = locals.clone();
+                        let baseline_locals = fallthrough_locals;
                         let mut states = branch_states
                             .iter()
                             .map(|state| state as &HashMap<String, LocalBinding>)
@@ -10567,6 +11132,7 @@ impl<'a> FunctionChecker<'a> {
                     }
                 }
                 Stmt::Match(match_stmt) => {
+                    self.reject_mutable_returned_view_value(&match_stmt.scrutinee, locals, false)?;
                     let match_flow = self.check_match(
                         match_stmt,
                         locals,
@@ -10580,6 +11146,7 @@ impl<'a> FunctionChecker<'a> {
                     }
                 }
                 Stmt::For(for_stmt) => {
+                    self.reject_mutable_returned_view_value(&for_stmt.iterable, locals, false)?;
                     if let Some(form) = self.loop_form(&for_stmt.iterable)? {
                         self.check_lockstep_for(
                             for_stmt,
@@ -10678,7 +11245,9 @@ impl<'a> FunctionChecker<'a> {
                         }
                     };
                     if for_stmt.borrow_mode == Some(ReceiverKind::BorrowMut) {
-                        if let Some(place) = self.borrow_call_place(&for_stmt.iterable) {
+                        if let Some(place) =
+                            self.borrowed_iterable_place(&for_stmt.iterable, locals)?
+                        {
                             self.ensure_place_not_frozen(&place, for_stmt.iterable.span, locals)?;
                         }
                     }
@@ -10709,7 +11278,9 @@ impl<'a> FunctionChecker<'a> {
                         },
                     };
                     if let Some(borrow_mode) = effective_borrow_mode {
-                        if let Some(place) = self.borrow_call_place(&for_stmt.iterable) {
+                        if let Some(place) =
+                            self.borrowed_iterable_place(&for_stmt.iterable, locals)?
+                        {
                             let root = place.root.clone();
                             if let Some(binding) = body_locals.get_mut(&root) {
                                 if place.is_root() {
@@ -10755,6 +11326,7 @@ impl<'a> FunctionChecker<'a> {
                 }
                 Stmt::While(while_stmt) => {
                     let condition_ty = self.type_of_expr(&while_stmt.condition, locals)?;
+                    self.reject_mutable_returned_view_value(&while_stmt.condition, locals, false)?;
                     if condition_ty != Type::named("bool") {
                         return Err(Diagnostic::at(
                             while_stmt.span,
@@ -10824,6 +11396,8 @@ impl<'a> FunctionChecker<'a> {
         }
 
         let value_ty = self.type_of_expr(&with_stmt.value, locals)?;
+        self.reject_mutable_returned_view_value(&with_stmt.value, locals, false)?;
+        self.reject_owned_view_value(&with_stmt.value, locals, "a managed `with` resource")?;
         self.require_with_resource(&value_ty, with_stmt.span)?;
         self.consume_value_expr(&with_stmt.value, locals)?;
 
@@ -10886,7 +11460,7 @@ impl<'a> FunctionChecker<'a> {
             }
 
             if let Some(place) = self.borrow_call_place(object) {
-                self.ensure_place_not_frozen(&place, assign.span, locals)?;
+                self.ensure_place_mutation_allowed(&place, assign.span, locals)?;
                 let through_view = locals
                     .get(&place.root)
                     .and_then(|binding| binding.view.as_ref())
@@ -10908,6 +11482,7 @@ impl<'a> FunctionChecker<'a> {
 
             let object_ty = self.type_of_expr(object, locals)?;
             let locals_before_index = locals.clone();
+            self.reject_mutable_returned_view_value(index, locals, false)?;
             let target_ty = if let Some(target_ty) = array_element_type(&object_ty).cloned() {
                 self.check_array_index_type(index, locals)?;
                 target_ty
@@ -10968,7 +11543,7 @@ impl<'a> FunctionChecker<'a> {
                 &mut index_borrowed_places,
             )?;
             self.reject_retained_access_overlap(&retained_target, &index_borrowed_places)?;
-            self.consume_value_expr(index, locals)?;
+            self.consume_direct_read_expr(index, locals)?;
             let index_moved_accesses = self.newly_moved_place_accesses(
                 &locals_before_index,
                 locals,
@@ -10978,6 +11553,14 @@ impl<'a> FunctionChecker<'a> {
             self.reject_retained_access_overlap(&retained_target, &index_moved_accesses)?;
             let locals_before_value = locals.clone();
             let value_ty = self.type_of_expr_hint(&assign.value, locals, Some(&target_ty))?;
+            self.reject_mutable_returned_view_value(&assign.value, locals, false)?;
+            if assign.op.is_none() {
+                self.reject_owned_view_value(
+                    &assign.value,
+                    locals,
+                    "an indexed collection element",
+                )?;
+            }
             let operator_access = if let Some(op) = assign.op {
                 if Self::binary_uses_builtin_value_semantics(op, &target_ty, &value_ty) {
                     None
@@ -11049,7 +11632,7 @@ impl<'a> FunctionChecker<'a> {
             }
 
             if let Some(path) = self.member_target_path(object, field) {
-                self.ensure_place_not_frozen(&path, assign.span, locals)?;
+                self.ensure_place_mutation_allowed(&path, assign.span, locals)?;
                 let through_view = locals
                     .get(&path.root)
                     .and_then(|binding| binding.view.as_ref())
@@ -11087,6 +11670,10 @@ impl<'a> FunctionChecker<'a> {
             let target_ty = self.resolve_member_target_type(object, field, assign.span, locals)?;
             let locals_before_value = locals.clone();
             let value_ty = self.type_of_expr_hint(&assign.value, locals, Some(&target_ty))?;
+            self.reject_mutable_returned_view_value(&assign.value, locals, false)?;
+            if assign.op.is_none() {
+                self.reject_owned_view_value(&assign.value, locals, "a class field")?;
+            }
             let operator_access = if let Some(op) = assign.op {
                 if Self::binary_uses_builtin_value_semantics(op, &target_ty, &value_ty) {
                     None
@@ -11198,6 +11785,27 @@ impl<'a> FunctionChecker<'a> {
             locals,
             existing_ty.as_ref().or(annotation_ty.as_ref()),
         )?;
+        self.reject_mutable_returned_view_value(&assign.value, locals, false)?;
+        let direct_view_kind = self.direct_view_value_kind(&assign.value, locals)?;
+        let writes_through_existing_mutable_view =
+            existing_binding.as_ref().is_some_and(|binding| {
+                binding
+                    .view
+                    .as_ref()
+                    .is_some_and(|view| view.kind == crate::ast::ViewKind::Mutable)
+                    && self.is_copy_type(&value_ty)
+                    && matches!(&grouped_expr(&assign.value).kind, ExprKind::Name(_))
+            });
+        if direct_view_kind.is_some() && !writes_through_existing_mutable_view {
+            return Err(Diagnostic::coded_at(
+                "AU3010",
+                assign.value.span,
+                "a view must initialize an explicit `view` binding",
+            )
+            .with_help(format!(
+                "write `view {binding_name} = ...` with the returned view's declared capability"
+            )));
+        }
 
         if let Some(existing) = existing_binding {
             if assign.mutable {
@@ -11220,7 +11828,7 @@ impl<'a> FunctionChecker<'a> {
                 ));
             }
 
-            self.ensure_place_not_frozen(
+            self.ensure_place_mutation_allowed(
                 &PlacePath::root(binding_name.clone()),
                 assign.span,
                 locals,
@@ -11366,7 +11974,7 @@ impl<'a> FunctionChecker<'a> {
                 ));
             }
 
-            if assign.op.is_none() {
+            if assign.op.is_none() && !writes_through_existing_mutable_view {
                 self.consume_value_expr(&assign.value, locals)?;
             } else if let Some(operator) = operator_access {
                 self.apply_operator_operand_passing(
@@ -11602,11 +12210,12 @@ impl<'a> FunctionChecker<'a> {
         locals: &mut HashMap<String, LocalBinding>,
         expected: Option<&Type>,
     ) -> Result<Type> {
+        self.reject_owned_view_value(expr, locals, "an owned aggregate")?;
         match &expr.kind {
             ExprKind::Group(inner) => self.type_expr_consuming_result(inner, locals, expected),
             ExprKind::Cast { expr: inner, .. } => {
                 let ty = self.type_of_expr_hint(expr, locals, expected)?;
-                self.consume_value_expr(inner, locals)?;
+                self.consume_direct_read_expr(inner, locals)?;
                 Ok(ty)
             }
             ExprKind::Try(inner) => {
@@ -11634,6 +12243,20 @@ impl<'a> FunctionChecker<'a> {
                         )
                     })
                     .collect::<Result<Vec<_>>>()?;
+                if let Some((index, _)) = element_types
+                    .iter()
+                    .enumerate()
+                    .find(|(_, ty)| type_contains_loan_closure(ty))
+                {
+                    return Err(Diagnostic::coded_at(
+                        "AU3010",
+                        elements[index].span,
+                        "a closure containing a live view cannot be stored in an aggregate",
+                    )
+                    .with_help(
+                        "keep the loan closure in its matching inferred local and call it directly",
+                    ));
+                }
                 Ok(Type::Tuple(element_types))
             }
             ExprKind::List(elements) => {
@@ -11641,6 +12264,16 @@ impl<'a> FunctionChecker<'a> {
                 for element in elements {
                     let actual =
                         self.type_expr_consuming_result(element, locals, element_ty.as_ref())?;
+                    if type_contains_loan_closure(&actual) {
+                        return Err(Diagnostic::coded_at(
+                            "AU3010",
+                            element.span,
+                            "a closure containing a live view cannot be stored in a collection",
+                        )
+                        .with_help(
+                            "keep the loan closure in its matching inferred local and call it directly",
+                        ));
+                    }
                     element_ty.get_or_insert(actual);
                 }
                 Ok(Type::Named(
@@ -11655,6 +12288,13 @@ impl<'a> FunctionChecker<'a> {
                 for element in elements {
                     let actual =
                         self.type_expr_consuming_result(element, locals, element_ty.as_ref())?;
+                    if type_contains_loan_closure(&actual) {
+                        return Err(Diagnostic::coded_at(
+                            "AU3010",
+                            element.span,
+                            "a closure containing a live view cannot be stored in a collection",
+                        ));
+                    }
                     element_ty.get_or_insert(actual);
                 }
                 Ok(Type::Named(
@@ -11684,9 +12324,23 @@ impl<'a> FunctionChecker<'a> {
                 for entry in entries {
                     let actual_key =
                         self.type_expr_consuming_result(&entry.key, locals, key_ty.as_ref())?;
+                    if type_contains_loan_closure(&actual_key) {
+                        return Err(Diagnostic::coded_at(
+                            "AU3010",
+                            entry.key.span,
+                            "a closure containing a live view cannot be stored in a collection",
+                        ));
+                    }
                     key_ty.get_or_insert(actual_key);
                     let actual_value =
                         self.type_expr_consuming_result(&entry.value, locals, value_ty.as_ref())?;
+                    if type_contains_loan_closure(&actual_value) {
+                        return Err(Diagnostic::coded_at(
+                            "AU3010",
+                            entry.value.span,
+                            "a closure containing a live view cannot be stored in a collection",
+                        ));
+                    }
                     value_ty.get_or_insert(actual_value);
                 }
                 Ok(Type::Named(
@@ -11708,6 +12362,16 @@ impl<'a> FunctionChecker<'a> {
                 self.type_of_expr(condition, locals)?;
                 let result_ty =
                     self.conditional_result_hint(then_expr, else_expr, locals, expected)?;
+                if type_contains_loan_closure(&result_ty) {
+                    return Err(Diagnostic::coded_at(
+                        "AU3010",
+                        expr.span,
+                        "a closure containing a live view cannot be selected by a conditional",
+                    )
+                    .with_help(
+                        "keep the loan closure in its matching inferred local and call it directly",
+                    ));
+                }
                 let mut then_locals = locals.clone();
                 self.type_expr_consuming_result(then_expr, &mut then_locals, Some(&result_ty))?;
                 let mut else_locals = locals.clone();
@@ -11724,17 +12388,27 @@ impl<'a> FunctionChecker<'a> {
                 scrutinee,
                 capability,
                 arms,
-            } => self.type_of_match_expr(
-                MatchExprParts {
-                    scrutinee,
-                    borrow_mode: *capability,
-                    arms,
-                    span: expr.span,
-                },
-                locals,
-                expected,
-                BranchResultUse::Consumed,
-            ),
+            } => {
+                let result = self.type_of_match_expr(
+                    MatchExprParts {
+                        scrutinee,
+                        borrow_mode: *capability,
+                        arms,
+                        span: expr.span,
+                    },
+                    locals,
+                    expected,
+                    BranchResultUse::Consumed,
+                )?;
+                if type_contains_loan_closure(&result) {
+                    return Err(Diagnostic::coded_at(
+                        "AU3010",
+                        expr.span,
+                        "a closure containing a live view cannot be selected by a match expression",
+                    ));
+                }
+                Ok(result)
+            }
             _ => {
                 let ty = self.type_of_expr_hint(expr, locals, expected)?;
                 self.consume_value_expr_raw(expr, locals)?;
@@ -12205,7 +12879,15 @@ impl<'a> FunctionChecker<'a> {
 
         let mut captures = Vec::new();
         let mut lambda_locals = HashMap::new();
-        for (name, capture_span) in capture_uses {
+        let capture_sequence = explicit_captures
+            .map(|listed| {
+                listed
+                    .iter()
+                    .map(|capture| (capture.name.clone(), capture.span))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or(capture_uses);
+        for (name, capture_span) in capture_sequence {
             let Some(binding) = locals.get(&name) else {
                 continue;
             };
@@ -12218,6 +12900,18 @@ impl<'a> FunctionChecker<'a> {
                     "AU3001",
                     capture_span,
                     format!("cannot capture partially moved value `{name}`"),
+                ));
+            }
+            if type_contains_loan_closure(&binding.ty) {
+                return Err(Diagnostic::coded_at(
+                    "AU3010",
+                    capture_span,
+                    format!(
+                        "capture `{name}` contains a live view and cannot be nested in another closure"
+                    ),
+                )
+                .with_help(
+                    "keep the loan closure in its matching inferred local and call it directly",
                 ));
             }
             let explicit_mode = explicit_modes
@@ -12270,11 +12964,34 @@ impl<'a> FunctionChecker<'a> {
                     }
                     ClosureCaptureMode::MutableView
                 }
+                Some(ParamMode::Own) if binding.view.is_some() => {
+                    return Err(Diagnostic::coded_at(
+                        "AU3004",
+                        capture_span,
+                        format!("capture `own {name}` cannot take ownership of a view's pointee"),
+                    )
+                    .with_help(format!(
+                        "clone `{name}` into an owned local first, then capture that local"
+                    )));
+                }
                 Some(ParamMode::Own) | None if self.is_copy_type(&binding.ty) => {
                     ClosureCaptureMode::Copy
                 }
                 Some(ParamMode::Own) | None => ClosureCaptureMode::Move,
             };
+            if matches!(
+                mode,
+                ClosureCaptureMode::SharedView | ClosureCaptureMode::MutableView
+            ) {
+                let kind = if mode == ClosureCaptureMode::MutableView {
+                    crate::ast::ViewKind::Mutable
+                } else {
+                    crate::ast::ViewKind::Shared
+                };
+                let source = self.canonicalize_view_place(PlacePath::root(name.clone()), locals);
+                let parent = binding.view.as_ref().map(|_| name.as_str());
+                self.ensure_view_loan_available(&source, kind, parent, capture_span, locals)?;
+            }
             captures.push(ClosureCapture {
                 name: name.clone(),
                 ty: binding.ty.clone(),
@@ -12361,6 +13078,8 @@ impl<'a> FunctionChecker<'a> {
         }
 
         let expected_return = expected_signature.and_then(|(_, return_type)| return_type);
+        self.reject_mutable_returned_view_value(body, &mut lambda_locals, false)?;
+        self.reject_owned_view_value(body, &mut lambda_locals, "an owned lambda result")?;
         let return_type = self.type_of_expr_hint(body, &mut lambda_locals, expected_return)?;
         if let Some(expected_return) = expected_return {
             if return_type != *expected_return {
@@ -12370,6 +13089,16 @@ impl<'a> FunctionChecker<'a> {
                     format!("lambda body has type `{return_type}`, expected `{expected_return}`"),
                 ));
             }
+        }
+        if type_contains_loan_closure(&return_type) {
+            return Err(Diagnostic::coded_at(
+                "AU3010",
+                body.span,
+                "a closure cannot return another closure containing a live view",
+            )
+            .with_help(
+                "keep the loan-bearing closure in its matching inferred local and call it directly",
+            ));
         }
         self.consume_value_expr(body, &mut lambda_locals)?;
         let call_kind = if captures.iter().any(|capture| {
@@ -12819,6 +13548,16 @@ impl<'a> FunctionChecker<'a> {
                     } else {
                         self.type_of_expr(element, locals)?
                     };
+                    if type_contains_loan_closure(&actual) {
+                        return Err(Diagnostic::coded_at(
+                            "AU3010",
+                            element.span,
+                            "a closure containing a live view cannot be stored in a collection",
+                        )
+                        .with_help(
+                            "keep the loan closure in its matching inferred local and call it directly",
+                        ));
+                    }
                     if !has_contextual_element_type && type_contains_closure_value(&actual) {
                         return Err(Diagnostic::coded_at(
                             "AU2002",
@@ -12865,6 +13604,13 @@ impl<'a> FunctionChecker<'a> {
                     } else {
                         self.type_of_expr(element, locals)?
                     };
+                    if type_contains_loan_closure(&actual) {
+                        return Err(Diagnostic::coded_at(
+                            "AU3010",
+                            element.span,
+                            "a closure containing a live view cannot be stored in a collection",
+                        ));
+                    }
                     if !has_contextual_element_type && type_contains_closure_value(&actual) {
                         return Err(Diagnostic::coded_at(
                             "AU2002",
@@ -12936,6 +13682,13 @@ impl<'a> FunctionChecker<'a> {
                     } else {
                         self.type_of_expr(&entry.key, locals)?
                     };
+                    if type_contains_loan_closure(&actual_key) {
+                        return Err(Diagnostic::coded_at(
+                            "AU3010",
+                            entry.key.span,
+                            "a closure containing a live view cannot be stored in a collection",
+                        ));
+                    }
                     if !has_contextual_key_type && type_contains_closure_value(&actual_key) {
                         return Err(Diagnostic::coded_at(
                             "AU2002",
@@ -12967,6 +13720,13 @@ impl<'a> FunctionChecker<'a> {
                     } else {
                         self.type_of_expr(&entry.value, locals)?
                     };
+                    if type_contains_loan_closure(&actual_value) {
+                        return Err(Diagnostic::coded_at(
+                            "AU3010",
+                            entry.value.span,
+                            "a closure containing a live view cannot be stored in a collection",
+                        ));
+                    }
                     if !has_contextual_value_type && type_contains_closure_value(&actual_value) {
                         return Err(Diagnostic::coded_at(
                             "AU2002",
@@ -14863,6 +15623,7 @@ impl<'a> FunctionChecker<'a> {
                 let trait_substitutions =
                     self_type_substitutions(&trait_info.decl, &bound.trait_args, self_ty.clone());
                 matches.push(ResolvedTraitMethodInfo {
+                    module_name: trait_info.module_name.clone(),
                     decl: method.decl.clone(),
                     signature: FunctionSignature {
                         params: method
@@ -14993,6 +15754,7 @@ impl<'a> FunctionChecker<'a> {
             matches.push((
                 trait_impl_specificity(trait_impl),
                 ResolvedTraitMethodInfo {
+                    module_name: trait_impl.module_name.clone(),
                     decl: method.decl.clone(),
                     signature: FunctionSignature {
                         params: method
@@ -15187,6 +15949,17 @@ impl<'a> FunctionChecker<'a> {
             }
 
             let hinted_field_ty = substitute_type(&field_info.ty, &substitutions);
+            if self
+                .direct_view_value_kind(&argument.value, locals)?
+                .is_some()
+            {
+                return Err(Diagnostic::coded_at(
+                    "AU3010",
+                    argument.value.span,
+                    format!("view cannot be stored in field `{field_name}` of `{surface_name}`"),
+                )
+                .with_help("store an explicit owned clone instead"));
+            }
             let actual =
                 match self.type_of_expr_hint(&argument.value, locals, Some(&hinted_field_ty)) {
                     Ok(actual) => actual,
@@ -15211,6 +15984,16 @@ impl<'a> FunctionChecker<'a> {
                 ));
             }
             let resolved_field_ty = substitute_type(&field_info.ty, &substitutions);
+            if type_contains_loan_closure(&actual) {
+                return Err(Diagnostic::coded_at(
+                    "AU3010",
+                    argument.value.span,
+                    "a closure containing a live view cannot be stored in a class field",
+                )
+                .with_help(
+                    "keep the loan closure in its matching inferred local and call it directly",
+                ));
+            }
             if type_contains_closure_value(&actual) {
                 return Err(Diagnostic::coded_at(
                     "AU2002",
@@ -15221,9 +16004,10 @@ impl<'a> FunctionChecker<'a> {
                     "capturing closures cannot be stored in fields because a written `def` type erases capture metadata; use a named function or a capture-free lambda",
                 ));
             }
-            if !self.is_copy_type(&actual) {
-                self.consume_value_expr(&argument.value, locals)?;
-            }
+            // Replay even Copy-valued constructor arguments. The replay is a
+            // no-op for ordinary Copy values, but it recursively rejects a
+            // returned-view result hidden behind a conditional or match arm.
+            self.consume_value_expr(&argument.value, locals)?;
         }
 
         for field in &class.decl.fields {
@@ -15322,6 +16106,7 @@ impl<'a> FunctionChecker<'a> {
             variant.named_payloads,
         )?;
         for (argument, payload) in ordered_args.iter().zip(variant.payloads.iter()) {
+            self.reject_owned_view_value(&argument.value, locals, "an enum payload")?;
             let hinted_payload_ty = substitute_type(&payload.ty, &substitutions);
             let actual = if has_unresolved_type_params(&hinted_payload_ty) {
                 self.type_of_expr(&argument.value, locals)?
@@ -15337,9 +16122,20 @@ impl<'a> FunctionChecker<'a> {
                     ),
                 ));
             }
-            if !self.is_copy_type(&actual) {
-                self.consume_value_expr(&argument.value, locals)?;
+            if type_contains_loan_closure(&actual) {
+                return Err(Diagnostic::coded_at(
+                    "AU3010",
+                    argument.value.span,
+                    "a closure containing a live view cannot be stored in an enum payload",
+                )
+                .with_help(
+                    "keep the loan closure in its matching inferred local and call it directly",
+                ));
             }
+            // Replaying Copy payloads is normally a no-op, but a view of a
+            // Copy pointee is still a descriptor and must not decay into an
+            // owned enum snapshot.
+            self.consume_value_expr(&argument.value, locals)?;
         }
 
         let mut resolved_args = Vec::with_capacity(enum_info.decl.type_params.len());
@@ -15379,7 +16175,46 @@ impl<'a> FunctionChecker<'a> {
         locals: &mut HashMap<String, LocalBinding>,
         expected: Option<&Type>,
     ) -> Result<Type> {
-        let (base_callee, explicit_type_args) = self.peel_specialization(callee);
+        // The parser preserves `f[T](...)` as `Specialize`, while a grouping
+        // boundary necessarily leaves `(f[T])(...)` as `Group(Index(...))`.
+        // Recover the same direct-call specialization only when the indexed
+        // object is known to be a returned-view callable; ordinary runtime
+        // indexing remains untouched.
+        let grouped = grouped_expr(callee);
+        let mut grouped_specialization_base = None;
+        let mut grouped_specialization_args = None;
+        if matches!(&callee.kind, ExprKind::Group(_)) {
+            if let ExprKind::Index { object, index } = &grouped.kind {
+                if self
+                    .returned_view_callee(object, locals)?
+                    .is_some_and(|(decl, _, _)| decl.view_return.is_some())
+                {
+                    let type_arg_exprs = match &index.kind {
+                        ExprKind::Tuple(elements) => elements.as_slice(),
+                        _ => std::slice::from_ref(&**index),
+                    };
+                    let type_refs = type_arg_exprs
+                        .iter()
+                        .map(Self::spawn_type_ref_from_expr)
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| {
+                            Diagnostic::at(
+                                index.span,
+                                "function specialization expects type arguments",
+                            )
+                        })?;
+                    grouped_specialization_base = Some(object.as_ref());
+                    grouped_specialization_args = Some(type_refs);
+                }
+            }
+        }
+        let (base_callee, explicit_type_args) = match (
+            grouped_specialization_base,
+            grouped_specialization_args.as_deref(),
+        ) {
+            (Some(base), Some(type_args)) => (base, Some(type_args)),
+            _ => self.peel_specialization(callee),
+        };
 
         let extern_target = match &base_callee.kind {
             ExprKind::Name(name) if !locals.contains_key(name) => self
@@ -16637,10 +17472,20 @@ impl<'a> FunctionChecker<'a> {
                                         ),
                                     ));
                                 }
+                                self.reject_owned_view_value(
+                                    &args[0].value,
+                                    locals,
+                                    "an enum payload",
+                                )?;
                                 let actual = self.type_of_expr(&args[0].value, locals)?;
-                                if !self.is_copy_type(&actual) {
-                                    self.consume_value_expr(&args[0].value, locals)?;
+                                if type_contains_loan_closure(&actual) {
+                                    return Err(Diagnostic::coded_at(
+                                        "AU3010",
+                                        args[0].value.span,
+                                        "a closure containing a live view cannot be stored in an enum payload",
+                                    ));
                                 }
+                                self.consume_value_expr(&args[0].value, locals)?;
                                 return Ok(Type::Named("Option".to_string(), vec![actual]));
                             }
                             "None" => {
@@ -16679,6 +17524,11 @@ impl<'a> FunctionChecker<'a> {
                                 ));
                             }
                             for (payload_ty, argument) in variant_payloads.iter().zip(args) {
+                                self.reject_owned_view_value(
+                                    &argument.value,
+                                    locals,
+                                    "an enum payload",
+                                )?;
                                 let actual = self.type_of_expr_hint(
                                     &argument.value,
                                     locals,
@@ -16693,9 +17543,14 @@ impl<'a> FunctionChecker<'a> {
                                         ),
                                     ));
                                 }
-                                if !self.is_copy_type(payload_ty) {
-                                    self.consume_value_expr(&argument.value, locals)?;
+                                if type_contains_loan_closure(&actual) {
+                                    return Err(Diagnostic::coded_at(
+                                        "AU3010",
+                                        argument.value.span,
+                                        "a closure containing a live view cannot be stored in an enum payload",
+                                    ));
                                 }
+                                self.consume_value_expr(&argument.value, locals)?;
                             }
                             return Ok(expected_ty.clone());
                         }
@@ -16766,6 +17621,16 @@ impl<'a> FunctionChecker<'a> {
                             } else {
                                 ClosureArgumentPolicy::Reject
                             };
+                        let seed_substitutions = if let Some(type_args) = explicit_type_args {
+                            self.explicit_type_substitutions(
+                                &function.decl.type_params,
+                                type_args,
+                                span,
+                                &format!("function `{}`", function.decl.name),
+                            )?
+                        } else {
+                            HashMap::new()
+                        };
                         return self
                             .type_check_callable_args_detailed(
                                 &format!("function `{}`", function.decl.name),
@@ -16781,7 +17646,7 @@ impl<'a> FunctionChecker<'a> {
                                 span,
                                 locals,
                                 expected,
-                                HashMap::new(),
+                                seed_substitutions,
                                 closure_argument_policy,
                             )
                             .map(|checked| checked.return_type);
@@ -18079,6 +18944,24 @@ impl<'a> FunctionChecker<'a> {
                                         span,
                                         format!("`{}` requires exactly one argument", field),
                                     )?;
+                                    let direct_view = self
+                                        .borrow_call_place(&send_arg.value)
+                                        .and_then(|place| locals.get(&place.root))
+                                        .is_some_and(|binding| binding.view.is_some());
+                                    if direct_view
+                                        || self
+                                            .returned_view_call_kind(&send_arg.value, locals)?
+                                            .is_some()
+                                    {
+                                        return Err(Diagnostic::coded_at(
+                                            "AU3008",
+                                            send_arg.span,
+                                            "a view cannot be inserted into a Queue, even when its pointee type is Transfer",
+                                        )
+                                        .with_help(
+                                            "send an owned copy or clone whose lifetime is independent of the view",
+                                        ));
+                                    }
                                     let actual = self.type_of_expr_hint(
                                         &send_arg.value,
                                         locals,
@@ -18552,6 +19435,24 @@ impl<'a> FunctionChecker<'a> {
                                     args[target_index].span,
                                 )?;
                                 let spawn_args = &args[required_count..];
+                                for (index, argument) in spawn_args.iter().enumerate() {
+                                    if self
+                                        .direct_view_value_kind(&argument.value, locals)?
+                                        .is_some()
+                                    {
+                                        return Err(Diagnostic::coded_at(
+                                            "AU3008",
+                                            argument.span,
+                                            format!(
+                                                "view argument {} cannot cross a task boundary",
+                                                index + 1
+                                            ),
+                                        )
+                                        .with_help(
+                                            "pass an explicit owned copy or clone whose lifetime is independent of the view",
+                                        ));
+                                    }
+                                }
                                 let capture_passings = vec![
                                     ReceiverKind::Value;
                                     callable.signature.param_passings.len()
@@ -18591,6 +19492,23 @@ impl<'a> FunctionChecker<'a> {
                                             param.default.as_ref().map(|default| default.span)
                                         })
                                         .unwrap_or(param.span);
+                                    if argument.is_some_and(|argument| {
+                                        self.borrow_call_place(&argument.value)
+                                            .and_then(|place| locals.get(&place.root))
+                                            .is_some_and(|binding| binding.view.is_some())
+                                    }) {
+                                        return Err(Diagnostic::coded_at(
+                                            "AU3008",
+                                            value_span,
+                                            format!(
+                                                "view argument `{}` cannot cross a task boundary",
+                                                param.name
+                                            ),
+                                        )
+                                        .with_help(
+                                            "pass an explicit owned copy or clone whose lifetime is independent of the view",
+                                        ));
+                                    }
                                     let concrete_param =
                                         checked_callable.params.get(index).ok_or_else(|| {
                                             Diagnostic::at(
@@ -20372,6 +21290,19 @@ impl<'a> FunctionChecker<'a> {
         span: crate::diag::Span,
         display_name: &str,
     ) -> Result<Type> {
+        if function.decl.view_return.is_some() {
+            return Err(Diagnostic::coded_at(
+                "AU3010",
+                span,
+                format!(
+                    "view-returning callable `{}` cannot be stored as a structural function value",
+                    function.decl.name
+                ),
+            )
+            .with_help(
+                "call it directly and bind the result with `view`, because structural `def(...) -> R` types cannot encode a returned-view origin",
+            ));
+        }
         let mut substitutions = if let Some(explicit_type_args) = explicit_type_args {
             if explicit_type_args.len() != function.decl.type_params.len() {
                 return Err(Diagnostic::at(
@@ -20645,10 +21576,16 @@ impl<'a> FunctionChecker<'a> {
         loop_depth: usize,
         allow_return: bool,
     ) -> Result<BlockFlow> {
+        let control_last_uses = locals
+            .keys()
+            .filter_map(|name| {
+                last_name_reference_span_in_match(match_stmt, name).map(|span| (name.clone(), span))
+            })
+            .collect::<BTreeMap<_, _>>();
         let shared_scrutinee =
             self.shared_match_scrutinee_name(&match_stmt.scrutinee, match_stmt.capability);
         let shared_match_place = (match_stmt.capability == ReceiverKind::Borrow)
-            .then(|| self.shared_match_place(&match_stmt.scrutinee))
+            .then(|| self.shared_match_place(&match_stmt.scrutinee, locals))
             .flatten();
         let active_match_borrow = if match_stmt.capability == ReceiverKind::BorrowMut {
             self.begin_match_borrow_mut(&match_stmt.scrutinee, match_stmt.span, locals)?
@@ -20885,6 +21822,11 @@ impl<'a> FunctionChecker<'a> {
                         match_stmt.capability,
                         &mut arm_locals,
                     )?;
+                    self.expire_views_unused_in_branch(
+                        &arm.body,
+                        &control_last_uses,
+                        &mut arm_locals,
+                    );
                     let arm_flow = self.check_block(
                         &arm.body,
                         &mut arm_locals,
@@ -21109,6 +22051,7 @@ impl<'a> FunctionChecker<'a> {
                     match_stmt.capability,
                     &mut arm_locals,
                 )?;
+                self.expire_views_unused_in_branch(&arm.body, &control_last_uses, &mut arm_locals);
                 let arm_flow = self.check_block(
                     &arm.body,
                     &mut arm_locals,
@@ -21200,16 +22143,26 @@ impl<'a> FunctionChecker<'a> {
     /// Returns a conservative source place for a bare shared match. Field
     /// projections retain their precision; indexed scrutinees retain the
     /// collection root because Aura does not yet model index identity.
-    fn shared_match_place(&self, expr: &Expr) -> Option<PlacePath> {
-        match &expr.kind {
+    fn shared_match_place(
+        &self,
+        expr: &Expr,
+        locals: &HashMap<String, LocalBinding>,
+    ) -> Option<PlacePath> {
+        let place = match &expr.kind {
             ExprKind::Name(name) => Some(PlacePath::root(name.clone())),
-            ExprKind::Group(inner) => self.shared_match_place(inner),
-            ExprKind::Member { object, field } => {
-                Some(self.shared_match_place(object)?.with_field(field.clone()))
+            ExprKind::Group(inner) => self.shared_match_place(inner, locals),
+            ExprKind::Member { object, field } => Some(
+                self.shared_match_place(object, locals)?
+                    .with_field(field.clone()),
+            ),
+            ExprKind::Index { object, .. } => self.shared_match_place(object, locals),
+            ExprKind::Call { .. } => {
+                let mut place_locals = locals.clone();
+                self.view_place(expr, &mut place_locals).ok().flatten()
             }
-            ExprKind::Index { object, .. } => self.shared_match_place(object),
             _ => None,
-        }
+        };
+        place.map(|place| self.canonicalize_view_place(place, locals))
     }
 
     fn retain_shared_match_place(
@@ -21489,7 +22442,7 @@ impl<'a> FunctionChecker<'a> {
         } = parts;
         let shared_scrutinee = self.shared_match_scrutinee_name(scrutinee, borrow_mode);
         let shared_match_place = (borrow_mode == ReceiverKind::Borrow)
-            .then(|| self.shared_match_place(scrutinee))
+            .then(|| self.shared_match_place(scrutinee, locals))
             .flatten();
         let active_match_borrow = if borrow_mode == ReceiverKind::BorrowMut {
             self.begin_match_borrow_mut(scrutinee, span, locals)?
@@ -22294,7 +23247,7 @@ impl<'a> FunctionChecker<'a> {
                 self.is_mutable_place(object, locals)
             }
             ExprKind::Index { object, index } => {
-                let object_ty = self.type_of_expr(object, locals)?;
+                let object_ty = self.type_of_member_object_expr(object, locals)?;
                 let Type::Tuple(elements) = object_ty else {
                     return Ok(false);
                 };
@@ -22329,8 +23282,30 @@ impl<'a> FunctionChecker<'a> {
                 let parent = self.borrow_call_place(object)?;
                 Some(parent.with_field(field.clone()))
             }
+            ExprKind::Index { object, index } => {
+                let ExprKind::Int(value) = index.kind else {
+                    return None;
+                };
+                let index = usize::try_from(value).ok()?;
+                self.borrow_call_place(object)
+                    .map(|parent| parent.with_tuple(index))
+            }
             _ => None,
         }
+    }
+
+    /// Resolves the physical place held for the duration of a borrowing
+    /// iteration. Ordinary place expressions use their spelling directly;
+    /// returned views use the callee contract to recover the caller place.
+    fn borrowed_iterable_place(
+        &self,
+        expr: &Expr,
+        locals: &mut HashMap<String, LocalBinding>,
+    ) -> Result<Option<PlacePath>> {
+        if let Some(place) = self.borrow_call_place(expr) {
+            return Ok(Some(self.canonicalize_view_place(place, locals)));
+        }
+        self.view_place(expr, locals)
     }
 
     fn canonicalize_view_place(
@@ -22341,15 +23316,84 @@ impl<'a> FunctionChecker<'a> {
         let mut current = place;
         let mut seen = BTreeSet::new();
         while seen.insert(current.root.clone()) {
-            let Some(view) = locals
-                .get(&current.root)
-                .and_then(|binding| binding.view.as_ref())
-            else {
+            let Some(binding) = locals.get(&current.root) else {
                 break;
             };
-            current = view.source.followed_by(&current.projections);
+            let Some(view) = binding.view.as_ref() else {
+                break;
+            };
+            let source_is_conservative_footprint = self
+                .place_path_type(&view.source, locals, view.created_at)
+                .ok()
+                .flatten()
+                .is_some_and(|source_ty| source_ty != binding.ty);
+            current = if source_is_conservative_footprint {
+                // A branch-selected returned view keeps a conservative origin
+                // footprint for conflict checks.  Its child projections are
+                // typed relative to the alias, but cannot safely be appended
+                // to that broader origin path.
+                view.source.clone()
+            } else {
+                view.source.followed_by(&current.projections)
+            };
         }
         current
+    }
+
+    fn view_expr_has_conservative_footprint(
+        &self,
+        expr: &Expr,
+        locals: &HashMap<String, LocalBinding>,
+    ) -> Result<bool> {
+        match &expr.kind {
+            ExprKind::Group(inner) => self.view_expr_has_conservative_footprint(inner, locals),
+            ExprKind::Name(name) => {
+                let Some(binding) = locals.get(name) else {
+                    return Ok(false);
+                };
+                let Some(view) = binding.view.as_ref() else {
+                    return Ok(false);
+                };
+                Ok(self
+                    .place_path_type(&view.source, locals, view.created_at)?
+                    .is_some_and(|source_ty| source_ty != binding.ty))
+            }
+            ExprKind::Member { object, .. } | ExprKind::Index { object, .. } => {
+                self.view_expr_has_conservative_footprint(object, locals)
+            }
+            ExprKind::Call { callee, args } => {
+                // Projection summaries with zero or multiple alternatives
+                // deliberately identify only the declaration's conservative
+                // origin. A projection applied by an outer call or member
+                // access must not be appended to that broader place.
+                let mut contract_locals = locals.clone();
+                let Some((decl, receiver, owner_module)) =
+                    self.returned_view_callee(callee, &mut contract_locals)?
+                else {
+                    return Ok(false);
+                };
+                if decl.view_return.is_none() {
+                    return Ok(false);
+                }
+                let substitutions = self.returned_view_call_type_substitutions(
+                    &decl,
+                    &owner_module,
+                    receiver.as_ref(),
+                    callee,
+                    args,
+                    &mut contract_locals,
+                )?;
+                Ok(self
+                    .transitive_unique_returned_view_projection(
+                        &decl,
+                        &owner_module,
+                        &mut BTreeSet::new(),
+                        &substitutions,
+                    )
+                    .is_none())
+            }
+            _ => Ok(false),
+        }
     }
 
     fn view_place(
@@ -22360,11 +23404,18 @@ impl<'a> FunctionChecker<'a> {
         let place = match &expr.kind {
             ExprKind::Name(name) => Some(PlacePath::root(name.clone())),
             ExprKind::Group(inner) => return self.view_place(inner, locals),
-            ExprKind::Member { object, field } => self
-                .view_place(object, locals)?
-                .map(|place| place.with_field(field.clone())),
+            ExprKind::Member { object, field } => {
+                let conservative = self.view_expr_has_conservative_footprint(object, locals)?;
+                self.view_place(object, locals)?.map(|place| {
+                    if conservative {
+                        place
+                    } else {
+                        place.with_field(field.clone())
+                    }
+                })
+            }
             ExprKind::Index { object, index } => {
-                let object_ty = self.type_of_expr(object, locals)?;
+                let object_ty = self.type_of_member_object_expr(object, locals)?;
                 let Type::Tuple(elements) = object_ty else {
                     return Err(Diagnostic::coded_at(
                         "AU3004",
@@ -22390,8 +23441,14 @@ impl<'a> FunctionChecker<'a> {
                         format!("tuple has no position {index}"),
                     ));
                 }
-                self.view_place(object, locals)?
-                    .map(|place| place.with_tuple(index))
+                let conservative = self.view_expr_has_conservative_footprint(object, locals)?;
+                self.view_place(object, locals)?.map(|place| {
+                    if conservative {
+                        place
+                    } else {
+                        place.with_tuple(index)
+                    }
+                })
             }
             ExprKind::Call { callee, args } => {
                 return self.returned_view_call_place(callee, args, locals)
@@ -22401,46 +23458,127 @@ impl<'a> FunctionChecker<'a> {
         Ok(place.map(|place| self.canonicalize_view_place(place, locals)))
     }
 
+    fn returned_view_callee(
+        &self,
+        callee: &Expr,
+        locals: &mut HashMap<String, LocalBinding>,
+    ) -> Result<Option<(crate::ast::FunctionDecl, Option<Expr>, String)>> {
+        let base = grouped_specialized_expr(callee);
+        match &base.kind {
+            ExprKind::Name(name) => {
+                if locals.contains_key(name) {
+                    return Ok(None);
+                }
+                Ok(self
+                    .resolve_function_info(name)
+                    .map(|function| (function.decl.clone(), None, function.module_name.clone())))
+            }
+            ExprKind::Member { object, field } => {
+                if let Some((module_path, function_name)) = self.qualified_module_item(base) {
+                    let function = self.module_namespace(&module_path).and_then(|namespace| {
+                        namespace
+                            .functions
+                            .get(&function_name)
+                            .or_else(|| namespace.all_functions.get(&function_name))
+                    });
+                    return Ok(function.map(|function| {
+                        (function.decl.clone(), None, function.module_name.clone())
+                    }));
+                }
+                if let Some((module_path, class_name)) = self.qualified_module_item(object) {
+                    let method = self.module_namespace(&module_path).and_then(|namespace| {
+                        namespace.classes.get(&class_name).and_then(|class| {
+                            class.methods.get(field).map(|method| (class, method))
+                        })
+                    });
+                    return Ok(method
+                        .filter(|(_, method)| method.decl.receiver.is_none())
+                        .map(|(class, method)| {
+                            (method.decl.clone(), None, class.module_name.clone())
+                        }));
+                }
+                let object_base = grouped_specialized_expr(object);
+                if let ExprKind::Name(name) = &object_base.kind {
+                    if !locals.contains_key(name) {
+                        if let Some(class) = self.resolve_class_info(name) {
+                            return Ok(class
+                                .methods
+                                .get(field)
+                                .filter(|method| method.decl.receiver.is_none())
+                                .map(|method| {
+                                    (method.decl.clone(), None, class.module_name.clone())
+                                }));
+                        }
+                        return Ok(None);
+                    }
+                }
+                let receiver_ty = self.type_of_member_object_expr(object, locals)?;
+                if let Type::Named(class_name, _) = &receiver_ty {
+                    if let Some(class) = self.resolve_class_info(class_name) {
+                        if let Some(method) = class.methods.get(field) {
+                            return Ok(Some((
+                                method.decl.clone(),
+                                Some((**object).clone()),
+                                class.module_name.clone(),
+                            )));
+                        }
+                    }
+                }
+                if let Type::TypeParam(type_param_name) = &receiver_ty {
+                    if let Ok(method) = self.trait_method_from_type_param(type_param_name, field) {
+                        return Ok(Some((
+                            method.decl,
+                            Some((**object).clone()),
+                            method.module_name,
+                        )));
+                    }
+                }
+                if let Some((trait_impl, method, _substitutions)) =
+                    self.trait_method_for_concrete_type(&receiver_ty, field, callee.span)?
+                {
+                    return Ok(Some((
+                        method.decl.clone(),
+                        Some((**object).clone()),
+                        trait_impl.module_name.clone(),
+                    )));
+                }
+                Ok(None)
+            }
+            ExprKind::Index { object, .. } => self.returned_view_callee(object, locals),
+            _ => Ok(None),
+        }
+    }
+
     fn returned_view_call_place(
         &self,
         callee: &Expr,
         args: &[Argument],
         locals: &mut HashMap<String, LocalBinding>,
     ) -> Result<Option<PlacePath>> {
-        let (base, _) = self.peel_specialization(callee);
-        let (decl, receiver) = match &base.kind {
-            ExprKind::Name(name) => {
-                let Some(function) = self.resolve_function_info(name) else {
-                    return Ok(None);
-                };
-                (&function.decl, None)
-            }
-            ExprKind::Member { object, field } => {
-                let receiver_ty = self.type_of_member_object_expr(object, locals)?;
-                let Type::Named(class_name, _) = receiver_ty else {
-                    return Ok(None);
-                };
-                let Some(method) = self
-                    .resolve_class_info(&class_name)
-                    .and_then(|class| class.methods.get(field))
-                else {
-                    return Ok(None);
-                };
-                (&method.decl, Some(&**object))
-            }
-            _ => return Ok(None),
+        let Some((decl, receiver, owner_module)) = self.returned_view_callee(callee, locals)?
+        else {
+            return Ok(None);
         };
         let Some(contract) = &decl.view_return else {
             return Ok(None);
         };
+        let substitutions = self.returned_view_call_type_substitutions(
+            &decl,
+            &owner_module,
+            receiver.as_ref(),
+            callee,
+            args,
+            locals,
+        )?;
         if contract.origin == "self" {
-            let receiver = receiver.ok_or_else(|| {
+            let receiver = receiver.as_ref().ok_or_else(|| {
                 Diagnostic::coded_at(
                     "AU3010",
                     callee.span,
                     "returned view origin `self` requires an instance receiver",
                 )
             })?;
+            let conservative = self.view_expr_has_conservative_footprint(receiver, locals)?;
             return self
                 .view_place(receiver, locals)?
                 .ok_or_else(|| {
@@ -22450,7 +23588,24 @@ impl<'a> FunctionChecker<'a> {
                         "returned view origin `self` requires an addressable receiver place",
                     )
                 })
-                .map(Some);
+                .map(|mut place| {
+                    if !conservative {
+                        if let Some(projection) = self.transitive_unique_returned_view_projection(
+                            &decl,
+                            &owner_module,
+                            &mut BTreeSet::new(),
+                            &substitutions,
+                        ) {
+                            for segment in projection.split('.').filter(|part| !part.is_empty()) {
+                                place = match segment.parse::<usize>() {
+                                    Ok(index) => place.with_tuple(index),
+                                    Err(_) => place.with_field(segment.to_string()),
+                                };
+                            }
+                        }
+                    }
+                    Some(place)
+                });
         }
         let Some(origin_index) = decl
             .params
@@ -22476,6 +23631,7 @@ impl<'a> FunctionChecker<'a> {
                 ),
             ));
         };
+        let conservative = self.view_expr_has_conservative_footprint(&argument.value, locals)?;
         self.view_place(&argument.value, locals)?
             .ok_or_else(|| {
                 Diagnostic::coded_at(
@@ -22487,7 +23643,963 @@ impl<'a> FunctionChecker<'a> {
                     ),
                 )
             })
-            .map(Some)
+            .map(|mut place| {
+                if !conservative {
+                    if let Some(projection) = self.transitive_unique_returned_view_projection(
+                        &decl,
+                        &owner_module,
+                        &mut BTreeSet::new(),
+                        &substitutions,
+                    ) {
+                        for segment in projection.split('.').filter(|part| !part.is_empty()) {
+                            place = match segment.parse::<usize>() {
+                                Ok(index) => place.with_tuple(index),
+                                Err(_) => place.with_field(segment.to_string()),
+                            };
+                        }
+                    }
+                }
+                Some(place)
+            })
+    }
+
+    fn returned_view_call_type_substitutions(
+        &self,
+        decl: &crate::ast::FunctionDecl,
+        owner_module: &str,
+        receiver: Option<&Expr>,
+        callee: &Expr,
+        args: &[Argument],
+        locals: &mut HashMap<String, LocalBinding>,
+    ) -> Result<HashMap<String, Type>> {
+        let (_, explicit_type_args) = self.peel_specialization(callee);
+        let mut substitutions = if let Some(type_args) = explicit_type_args {
+            self.explicit_type_substitutions(
+                &decl.type_params,
+                type_args,
+                callee.span,
+                &format!("callable `{}`", decl.name),
+            )?
+        } else {
+            HashMap::new()
+        };
+        let context = self.returned_view_summary_context(owner_module, decl);
+        if let (Some(receiver), Some(pattern)) = (receiver, context.locals.get("self")) {
+            let mut type_locals = locals.clone();
+            let actual = self.type_of_expr(receiver, &mut type_locals)?;
+            let _ = unify_type_pattern(pattern, &actual, &mut substitutions);
+        }
+        let ordered = bind_call_arguments(
+            &format!("callable `{}`", decl.name),
+            &callable_params_from_decl(&decl.params),
+            args,
+            callee.span,
+            CallConvention::PositionalOrNamed,
+        )?;
+        for (param, argument) in decl.params.iter().zip(ordered) {
+            let Some(argument) = argument else {
+                continue;
+            };
+            let Some(pattern) = context.locals.get(&param.name) else {
+                continue;
+            };
+            let mut type_locals = locals.clone();
+            let actual = self.type_of_expr(&argument.value, &mut type_locals)?;
+            let _ = unify_type_pattern(pattern, &actual, &mut substitutions);
+        }
+        Ok(substitutions)
+    }
+
+    fn transitive_unique_returned_view_projection(
+        &self,
+        decl: &crate::ast::FunctionDecl,
+        owner_module: &str,
+        seen: &mut BTreeSet<String>,
+        substitutions: &HashMap<String, Type>,
+    ) -> Option<String> {
+        let ReturnedProjectionSummary::Known(mut projections) =
+            self.returned_view_projection_summary(decl, owner_module, seen, substitutions)
+        else {
+            return None;
+        };
+        (projections.len() == 1).then(|| projections.pop_first().expect("one returned projection"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn returned_view_expr_projection_summary_with_aliases(
+        &self,
+        owner_module: &str,
+        enclosing_decl: &crate::ast::FunctionDecl,
+        expr: &Expr,
+        outer_origin: &str,
+        seen: &mut BTreeSet<String>,
+        aliases: &BTreeMap<String, Expr>,
+        alias_seen: &mut BTreeSet<String>,
+        substitutions: &HashMap<String, Type>,
+    ) -> ReturnedProjectionSummary {
+        let expr = grouped_expr(expr);
+        match &expr.kind {
+            ExprKind::Name(name) if name == outer_origin => {
+                return ReturnedProjectionSummary::Known(BTreeSet::from([String::new()]));
+            }
+            ExprKind::Name(name) => {
+                let Some(alias) = aliases.get(name) else {
+                    return ReturnedProjectionSummary::Unknown;
+                };
+                if !alias_seen.insert(name.clone()) {
+                    return ReturnedProjectionSummary::Unknown;
+                }
+                let summary = self.returned_view_expr_projection_summary_with_aliases(
+                    owner_module,
+                    enclosing_decl,
+                    alias,
+                    outer_origin,
+                    seen,
+                    aliases,
+                    alias_seen,
+                    substitutions,
+                );
+                alias_seen.remove(name);
+                return summary;
+            }
+            ExprKind::Member { object, field } => {
+                return match self.returned_view_expr_projection_summary_with_aliases(
+                    owner_module,
+                    enclosing_decl,
+                    object,
+                    outer_origin,
+                    seen,
+                    aliases,
+                    alias_seen,
+                    substitutions,
+                ) {
+                    ReturnedProjectionSummary::Known(projections) => {
+                        ReturnedProjectionSummary::Known(
+                            projections
+                                .into_iter()
+                                .map(|projection| {
+                                    if projection.is_empty() {
+                                        field.clone()
+                                    } else {
+                                        format!("{projection}.{field}")
+                                    }
+                                })
+                                .collect(),
+                        )
+                    }
+                    other => other,
+                };
+            }
+            ExprKind::Index { object, index } => {
+                let ExprKind::Int(index) = index.kind else {
+                    return ReturnedProjectionSummary::Unknown;
+                };
+                let Ok(index) = usize::try_from(index) else {
+                    return ReturnedProjectionSummary::Unknown;
+                };
+                return match self.returned_view_expr_projection_summary_with_aliases(
+                    owner_module,
+                    enclosing_decl,
+                    object,
+                    outer_origin,
+                    seen,
+                    aliases,
+                    alias_seen,
+                    substitutions,
+                ) {
+                    ReturnedProjectionSummary::Known(projections) => {
+                        ReturnedProjectionSummary::Known(
+                            projections
+                                .into_iter()
+                                .map(|projection| {
+                                    if projection.is_empty() {
+                                        index.to_string()
+                                    } else {
+                                        format!("{projection}.{index}")
+                                    }
+                                })
+                                .collect(),
+                        )
+                    }
+                    other => other,
+                };
+            }
+            ExprKind::Call { .. } => {}
+            _ => return ReturnedProjectionSummary::Unknown,
+        }
+        let ExprKind::Call { callee, args } = &expr.kind else {
+            unreachable!("call arm is selected above")
+        };
+        let Some((callee_decl, callee_owner)) = self.returned_view_function_in_owner(
+            owner_module,
+            enclosing_decl,
+            callee,
+            substitutions,
+            aliases,
+        ) else {
+            return ReturnedProjectionSummary::Unknown;
+        };
+        let Some(callee_contract) = &callee_decl.view_return else {
+            return ReturnedProjectionSummary::Unknown;
+        };
+        let origin_expr = if callee_contract.origin == "self" {
+            let ExprKind::Member { object, .. } = &grouped_specialized_expr(callee).kind else {
+                return ReturnedProjectionSummary::Unknown;
+            };
+            object.as_ref()
+        } else {
+            let Some(index) = callee_decl
+                .params
+                .iter()
+                .position(|param| param.name == callee_contract.origin)
+            else {
+                return ReturnedProjectionSummary::Unknown;
+            };
+            let Ok(ordered) = bind_call_arguments(
+                &format!("callable `{}`", callee_decl.name),
+                &callable_params_from_decl(&callee_decl.params),
+                args,
+                callee.span,
+                CallConvention::PositionalOrNamed,
+            ) else {
+                return ReturnedProjectionSummary::Unknown;
+            };
+            let Some(argument) = ordered.get(index).copied().flatten() else {
+                return ReturnedProjectionSummary::Unknown;
+            };
+            &argument.value
+        };
+        let bases = self.returned_view_expr_projection_summary_with_aliases(
+            owner_module,
+            enclosing_decl,
+            origin_expr,
+            outer_origin,
+            seen,
+            aliases,
+            alias_seen,
+            substitutions,
+        );
+        let nested_substitutions = self.returned_view_nested_call_type_substitutions(
+            owner_module,
+            enclosing_decl,
+            &callee_decl,
+            &callee_owner,
+            callee,
+            args,
+            substitutions,
+            aliases,
+        );
+        let nested = self.returned_view_projection_summary(
+            &callee_decl,
+            &callee_owner,
+            seen,
+            &nested_substitutions,
+        );
+        match (bases, nested) {
+            (ReturnedProjectionSummary::Known(bases), ReturnedProjectionSummary::Known(nested)) => {
+                ReturnedProjectionSummary::Known(
+                    bases
+                        .into_iter()
+                        .flat_map(|base| {
+                            nested.iter().cloned().map(move |projection| {
+                                match (base.is_empty(), projection.is_empty()) {
+                                    (true, _) => projection,
+                                    (_, true) => base.clone(),
+                                    _ => format!("{base}.{projection}"),
+                                }
+                            })
+                        })
+                        .collect(),
+                )
+            }
+            (ReturnedProjectionSummary::Cycle, _) | (_, ReturnedProjectionSummary::Cycle) => {
+                ReturnedProjectionSummary::Cycle
+            }
+            _ => ReturnedProjectionSummary::Unknown,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn returned_view_nested_call_type_substitutions(
+        &self,
+        owner_module: &str,
+        enclosing_decl: &crate::ast::FunctionDecl,
+        callee_decl: &crate::ast::FunctionDecl,
+        callee_owner: &str,
+        callee: &Expr,
+        args: &[Argument],
+        outer_substitutions: &HashMap<String, Type>,
+        aliases: &BTreeMap<String, Expr>,
+    ) -> HashMap<String, Type> {
+        let mut substitutions = HashMap::new();
+        let (_, explicit_type_args) = self.peel_specialization(callee);
+        if let Some(type_args) = explicit_type_args {
+            if let Ok(lowered) = self.lower_explicit_type_args(type_args) {
+                let lowered = lowered
+                    .iter()
+                    .map(|ty| substitute_type(ty, outer_substitutions))
+                    .collect::<Vec<_>>();
+                substitutions =
+                    substitutions_from_decl_type_args(&callee_decl.type_params, &lowered);
+            }
+        }
+
+        let enclosing_context = self.returned_view_summary_context(owner_module, enclosing_decl);
+        let callee_context = self.returned_view_summary_context(callee_owner, callee_decl);
+        if let ExprKind::Member { object, .. } = &grouped_specialized_expr(callee).kind {
+            if let (Some(pattern), Some(actual)) = (
+                callee_context.locals.get("self"),
+                self.returned_view_expr_type_in_owner(
+                    owner_module,
+                    enclosing_decl,
+                    object,
+                    &enclosing_context,
+                    outer_substitutions,
+                    aliases,
+                    &mut BTreeSet::new(),
+                ),
+            ) {
+                let _ = unify_type_pattern(pattern, &actual, &mut substitutions);
+            }
+        }
+        let Ok(ordered) = bind_call_arguments(
+            &format!("callable `{}`", callee_decl.name),
+            &callable_params_from_decl(&callee_decl.params),
+            args,
+            callee.span,
+            CallConvention::PositionalOrNamed,
+        ) else {
+            return substitutions;
+        };
+        for (param, argument) in callee_decl.params.iter().zip(ordered) {
+            let Some(argument) = argument else {
+                continue;
+            };
+            let (Some(pattern), Some(actual)) = (
+                callee_context.locals.get(&param.name),
+                self.returned_view_expr_type_in_owner(
+                    owner_module,
+                    enclosing_decl,
+                    &argument.value,
+                    &enclosing_context,
+                    outer_substitutions,
+                    aliases,
+                    &mut BTreeSet::new(),
+                ),
+            ) else {
+                continue;
+            };
+            let _ = unify_type_pattern(pattern, &actual, &mut substitutions);
+        }
+        substitutions
+    }
+
+    fn returned_view_projection_summary(
+        &self,
+        decl: &crate::ast::FunctionDecl,
+        owner_module: &str,
+        seen: &mut BTreeSet<String>,
+        substitutions: &HashMap<String, Type>,
+    ) -> ReturnedProjectionSummary {
+        let Some(contract) = decl.view_return.as_ref() else {
+            return ReturnedProjectionSummary::Unknown;
+        };
+        let key = format!(
+            "{}::{}:{}:{}:{:?}:{:?}:{substitutions:?}",
+            owner_module, decl.name, decl.span.line, decl.span.column, decl.view_return, decl.body
+        );
+        if !seen.insert(key.clone()) {
+            return ReturnedProjectionSummary::Cycle;
+        }
+
+        if decl.body.is_empty() {
+            let owning_trait = self
+                .returned_view_traits_in_owner(owner_module)
+                .into_iter()
+                .find(|trait_info| {
+                    trait_info.methods.get(&decl.name).is_some_and(|method| {
+                        method.decl.span == decl.span && method.decl.receiver == decl.receiver
+                    })
+                });
+            if let Some(trait_info) = owning_trait {
+                let qualified_trait_name =
+                    format!("{}.{}", trait_info.module_name, trait_info.decl.name);
+                let mut projections = BTreeSet::new();
+                let mut found = false;
+                let mut deferred_cycle = false;
+                for trait_impl in self.trait_impls_in_scope().filter(|trait_impl| {
+                    trait_impl.trait_name == trait_info.decl.name
+                        || trait_impl.trait_name == qualified_trait_name
+                }) {
+                    let Some(method) = trait_impl.methods.get(&decl.name) else {
+                        continue;
+                    };
+                    found = true;
+                    match self.returned_view_projection_summary(
+                        &method.decl,
+                        &trait_impl.module_name,
+                        seen,
+                        &HashMap::new(),
+                    ) {
+                        ReturnedProjectionSummary::Known(nested) => projections.extend(nested),
+                        ReturnedProjectionSummary::Cycle => deferred_cycle = true,
+                        ReturnedProjectionSummary::Unknown => {
+                            seen.remove(&key);
+                            return ReturnedProjectionSummary::Unknown;
+                        }
+                    }
+                }
+                seen.remove(&key);
+                return if !projections.is_empty() {
+                    ReturnedProjectionSummary::Known(projections)
+                } else if found && deferred_cycle {
+                    ReturnedProjectionSummary::Cycle
+                } else {
+                    ReturnedProjectionSummary::Unknown
+                };
+            }
+        }
+
+        let mut returns = Vec::new();
+        collect_view_return_entries(&decl.body, &mut BTreeMap::new(), &mut returns);
+        if returns.is_empty() {
+            seen.remove(&key);
+            return ReturnedProjectionSummary::Unknown;
+        }
+
+        let mut projections = BTreeSet::new();
+        let mut deferred_cycle = false;
+        for (value, aliases) in &returns {
+            match self.returned_view_expr_projection_summary_with_aliases(
+                owner_module,
+                decl,
+                value,
+                &contract.origin,
+                seen,
+                aliases,
+                &mut BTreeSet::new(),
+                substitutions,
+            ) {
+                ReturnedProjectionSummary::Known(returned) => projections.extend(returned),
+                ReturnedProjectionSummary::Cycle => {
+                    deferred_cycle = true;
+                }
+                ReturnedProjectionSummary::Unknown => {
+                    seen.remove(&key);
+                    return ReturnedProjectionSummary::Unknown;
+                }
+            }
+        }
+        seen.remove(&key);
+        if projections.is_empty() {
+            if deferred_cycle {
+                ReturnedProjectionSummary::Cycle
+            } else {
+                ReturnedProjectionSummary::Unknown
+            }
+        } else {
+            ReturnedProjectionSummary::Known(projections)
+        }
+    }
+
+    fn returned_view_free_function_info_in_owner(
+        &self,
+        owner_module: &str,
+        decl: &crate::ast::FunctionDecl,
+    ) -> Option<&FunctionInfo> {
+        let matches = |info: &&FunctionInfo| {
+            info.module_name == owner_module
+                && info.decl.name == decl.name
+                && info.decl.span == decl.span
+        };
+        if owner_module == self.module_name {
+            return self.functions.values().find(matches);
+        }
+        self.module_namespace(owner_module).and_then(|namespace| {
+            namespace
+                .all_functions
+                .values()
+                .chain(namespace.functions.values())
+                .find(matches)
+        })
+    }
+
+    fn returned_view_classes_in_owner<'b>(&'b self, owner_module: &str) -> Vec<&'b ClassInfo> {
+        if owner_module == self.module_name {
+            self.classes
+                .values()
+                .filter(|class| class.module_name == owner_module)
+                .collect::<Vec<_>>()
+        } else {
+            self.module_namespace(owner_module)
+                .map(|namespace| {
+                    namespace
+                        .all_classes
+                        .values()
+                        .chain(namespace.classes.values())
+                        .filter(|class| class.module_name == owner_module)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        }
+    }
+
+    fn returned_view_traits_in_owner<'b>(&'b self, owner_module: &str) -> Vec<&'b TraitInfo> {
+        if owner_module == self.module_name {
+            self.traits
+                .values()
+                .filter(|trait_info| trait_info.module_name == owner_module)
+                .collect::<Vec<_>>()
+        } else {
+            self.module_namespace(owner_module)
+                .map(|namespace| {
+                    namespace
+                        .all_traits
+                        .values()
+                        .chain(namespace.traits.values())
+                        .filter(|trait_info| trait_info.module_name == owner_module)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        }
+    }
+
+    fn returned_view_summary_context(
+        &self,
+        owner_module: &str,
+        decl: &crate::ast::FunctionDecl,
+    ) -> ReturnedViewSummaryContext {
+        let mut context = ReturnedViewSummaryContext::default();
+        if let Some(info) = self.returned_view_free_function_info_in_owner(owner_module, decl) {
+            for (param, ty) in decl.params.iter().zip(&info.signature.params) {
+                context.locals.insert(param.name.clone(), ty.clone());
+            }
+            context.type_param_bounds = info.type_param_bounds.clone();
+            return context;
+        }
+        for class in self.returned_view_classes_in_owner(owner_module) {
+            let Some(method) = class.methods.get(&decl.name).filter(|method| {
+                method.decl.span == decl.span && method.decl.receiver == decl.receiver
+            }) else {
+                continue;
+            };
+            let class_name = if class.module_name == self.module_name {
+                class.decl.name.clone()
+            } else {
+                format!("{}.{}", class.module_name, class.decl.name)
+            };
+            context.locals.insert(
+                "self".to_string(),
+                Type::Named(
+                    class_name,
+                    class
+                        .decl
+                        .type_params
+                        .iter()
+                        .cloned()
+                        .map(Type::TypeParam)
+                        .collect(),
+                ),
+            );
+            for (param, ty) in decl.params.iter().zip(&method.signature.params) {
+                context.locals.insert(param.name.clone(), ty.clone());
+            }
+            context.type_param_bounds = class.type_param_bounds.clone();
+            context
+                .type_param_bounds
+                .extend(method.type_param_bounds.clone());
+            return context;
+        }
+        for trait_impl in self
+            .trait_impls_in_scope()
+            .filter(|trait_impl| trait_impl.module_name == owner_module)
+        {
+            let Some(method) = trait_impl.methods.get(&decl.name).filter(|method| {
+                method.decl.span == decl.span && method.decl.receiver == decl.receiver
+            }) else {
+                continue;
+            };
+            context
+                .locals
+                .insert("self".to_string(), trait_impl.for_type.clone());
+            for (param, ty) in decl.params.iter().zip(&method.signature.params) {
+                context.locals.insert(param.name.clone(), ty.clone());
+            }
+            context.type_param_bounds = trait_impl.type_param_bounds.clone();
+            context
+                .type_param_bounds
+                .extend(method.type_param_bounds.clone());
+            return context;
+        }
+        for trait_info in self.returned_view_traits_in_owner(owner_module) {
+            let Some(method) = trait_info.methods.get(&decl.name).filter(|method| {
+                method.decl.span == decl.span && method.decl.receiver == decl.receiver
+            }) else {
+                continue;
+            };
+            context
+                .locals
+                .insert("self".to_string(), Type::TypeParam("Self".to_string()));
+            for (param, ty) in decl.params.iter().zip(&method.signature.params) {
+                context.locals.insert(param.name.clone(), ty.clone());
+            }
+            context.type_param_bounds = method.type_param_bounds.clone();
+            return context;
+        }
+        context
+    }
+
+    fn returned_view_signature_in_owner(
+        &self,
+        owner_module: &str,
+        decl: &crate::ast::FunctionDecl,
+    ) -> Option<FunctionSignature> {
+        if let Some(info) = self.returned_view_free_function_info_in_owner(owner_module, decl) {
+            return Some(info.signature.clone());
+        }
+        for class in self.returned_view_classes_in_owner(owner_module) {
+            if let Some(method) = class.methods.get(&decl.name).filter(|method| {
+                method.decl.span == decl.span && method.decl.receiver == decl.receiver
+            }) {
+                return Some(method.signature.clone());
+            }
+        }
+        for trait_impl in self
+            .trait_impls_in_scope()
+            .filter(|trait_impl| trait_impl.module_name == owner_module)
+        {
+            if let Some(method) = trait_impl.methods.get(&decl.name).filter(|method| {
+                method.decl.span == decl.span && method.decl.receiver == decl.receiver
+            }) {
+                return Some(method.signature.clone());
+            }
+        }
+        for trait_info in self.returned_view_traits_in_owner(owner_module) {
+            if let Some(method) = trait_info.methods.get(&decl.name).filter(|method| {
+                method.decl.span == decl.span && method.decl.receiver == decl.receiver
+            }) {
+                return Some(method.signature.clone());
+            }
+        }
+        None
+    }
+
+    fn returned_view_class_in_owner(
+        &self,
+        owner_module: &str,
+        expr: &Expr,
+        context: &ReturnedViewSummaryContext,
+    ) -> Option<&ClassInfo> {
+        let expr = grouped_specialized_expr(expr);
+        match &expr.kind {
+            ExprKind::Name(name) if !context.locals.contains_key(name) => self
+                .returned_view_classes_in_owner(owner_module)
+                .into_iter()
+                .find(|class| class.decl.name == *name),
+            ExprKind::Member { object, field } => {
+                let module_path = self.infer_module_path_in_owner(owner_module, object)?;
+                let namespace = self.module_namespace(&module_path)?;
+                namespace
+                    .all_classes
+                    .get(field)
+                    .or_else(|| namespace.classes.get(field))
+            }
+            _ => None,
+        }
+    }
+
+    fn returned_view_trait_in_owner(&self, owner_module: &str, name: &str) -> Option<&TraitInfo> {
+        self.returned_view_traits_in_owner(owner_module)
+            .into_iter()
+            .find(|trait_info| {
+                trait_info.decl.name == name
+                    || format!("{}.{}", trait_info.module_name, trait_info.decl.name) == name
+            })
+            .or_else(|| self.traits.get(name))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn returned_view_expr_type_in_owner(
+        &self,
+        owner_module: &str,
+        enclosing_decl: &crate::ast::FunctionDecl,
+        expr: &Expr,
+        context: &ReturnedViewSummaryContext,
+        substitutions: &HashMap<String, Type>,
+        aliases: &BTreeMap<String, Expr>,
+        alias_seen: &mut BTreeSet<String>,
+    ) -> Option<Type> {
+        let expr = grouped_specialized_expr(expr);
+        match &expr.kind {
+            ExprKind::Name(name) => {
+                if let Some(ty) = context.locals.get(name) {
+                    return Some(substitute_type(ty, substitutions));
+                }
+                let source = aliases.get(name)?;
+                if !alias_seen.insert(name.clone()) {
+                    return None;
+                }
+                let ty = self.returned_view_expr_type_in_owner(
+                    owner_module,
+                    enclosing_decl,
+                    source,
+                    context,
+                    substitutions,
+                    aliases,
+                    alias_seen,
+                );
+                alias_seen.remove(name);
+                ty
+            }
+            ExprKind::Member { object, field } => {
+                let object_ty = self.returned_view_expr_type_in_owner(
+                    owner_module,
+                    enclosing_decl,
+                    object,
+                    context,
+                    substitutions,
+                    aliases,
+                    alias_seen,
+                )?;
+                self.resolve_member_type(&object_ty, field, expr.span).ok()
+            }
+            ExprKind::Index { object, index } => {
+                let Type::Tuple(elements) = self.returned_view_expr_type_in_owner(
+                    owner_module,
+                    enclosing_decl,
+                    object,
+                    context,
+                    substitutions,
+                    aliases,
+                    alias_seen,
+                )?
+                else {
+                    return None;
+                };
+                let ExprKind::Int(index) = index.kind else {
+                    return None;
+                };
+                elements.get(usize::try_from(index).ok()?).cloned()
+            }
+            ExprKind::Call { callee, args } => {
+                let (decl, owner) = self.returned_view_function_in_owner(
+                    owner_module,
+                    enclosing_decl,
+                    callee,
+                    substitutions,
+                    aliases,
+                )?;
+                let call_substitutions = self.returned_view_nested_call_type_substitutions(
+                    owner_module,
+                    enclosing_decl,
+                    &decl,
+                    &owner,
+                    callee,
+                    args,
+                    substitutions,
+                    aliases,
+                );
+                self.returned_view_signature_in_owner(&owner, &decl)
+                    .map(|signature| substitute_type(&signature.return_type, &call_substitutions))
+            }
+            _ => None,
+        }
+    }
+
+    fn returned_view_function_in_owner(
+        &self,
+        owner_module: &str,
+        enclosing_decl: &crate::ast::FunctionDecl,
+        callee: &Expr,
+        substitutions: &HashMap<String, Type>,
+        aliases: &BTreeMap<String, Expr>,
+    ) -> Option<(crate::ast::FunctionDecl, String)> {
+        let callee = grouped_specialized_expr(callee);
+        match &callee.kind {
+            ExprKind::Name(name) => {
+                let info = if owner_module == self.module_name {
+                    self.functions
+                        .get(name)
+                        .filter(|info| info.module_name == owner_module)
+                } else {
+                    self.module_registry
+                        .get(owner_module)
+                        .and_then(|namespace| {
+                            namespace
+                                .all_functions
+                                .get(name)
+                                .or_else(|| namespace.functions.get(name))
+                                .filter(|info| info.module_name == owner_module)
+                        })
+                }?;
+                Some((info.decl.clone(), info.module_name.clone()))
+            }
+            ExprKind::Member { object, field } => {
+                if let Some(module_path) = self.infer_module_path_in_owner(owner_module, object) {
+                    let namespace = self.module_namespace(&module_path)?;
+                    let info = namespace
+                        .functions
+                        .get(field)
+                        .or_else(|| namespace.all_functions.get(field))?;
+                    return Some((info.decl.clone(), info.module_name.clone()));
+                }
+                let mut context = self.returned_view_summary_context(owner_module, enclosing_decl);
+                let symbolic_receiver_ty = self.returned_view_expr_type_in_owner(
+                    owner_module,
+                    enclosing_decl,
+                    object,
+                    &context,
+                    &HashMap::new(),
+                    aliases,
+                    &mut BTreeSet::new(),
+                );
+                let required_trait = match symbolic_receiver_ty {
+                    Some(Type::TypeParam(type_param)) => {
+                        let mut matches = context
+                            .type_param_bounds
+                            .get(&type_param)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|bound| {
+                                let trait_info = self.returned_view_trait_in_owner(
+                                    owner_module,
+                                    &bound.trait_name,
+                                )?;
+                                trait_info.methods.contains_key(field).then(|| {
+                                    (
+                                        bound.trait_name.clone(),
+                                        trait_info.decl.name.clone(),
+                                        format!(
+                                            "{}.{}",
+                                            trait_info.module_name, trait_info.decl.name
+                                        ),
+                                    )
+                                })
+                            });
+                        let matched = matches.next();
+                        matched.filter(|_| matches.next().is_none())
+                    }
+                    _ => None,
+                };
+                for ty in context.locals.values_mut() {
+                    *ty = substitute_type(ty, substitutions);
+                }
+                if let Some(class) =
+                    self.returned_view_class_in_owner(owner_module, object, &context)
+                {
+                    if let Some(method) = class
+                        .methods
+                        .get(field)
+                        .filter(|method| method.decl.receiver.is_none())
+                    {
+                        return Some((method.decl.clone(), class.module_name.clone()));
+                    }
+                }
+                let receiver_ty = self.returned_view_expr_type_in_owner(
+                    owner_module,
+                    enclosing_decl,
+                    object,
+                    &context,
+                    substitutions,
+                    aliases,
+                    &mut BTreeSet::new(),
+                )?;
+                if let Type::Named(class_name, _) = &receiver_ty {
+                    if let Some(class) = self.resolve_class_info(class_name) {
+                        if let Some(method) = class.methods.get(field) {
+                            return Some((method.decl.clone(), class.module_name.clone()));
+                        }
+                    }
+                }
+                if let Type::TypeParam(type_param) = &receiver_ty {
+                    let mut matches = context
+                        .type_param_bounds
+                        .get(type_param)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|bound| {
+                            let trait_info =
+                                self.returned_view_trait_in_owner(owner_module, &bound.trait_name)?;
+                            let method = trait_info.methods.get(field)?;
+                            Some((trait_info, method))
+                        });
+                    let (trait_info, method) = matches.next()?;
+                    if matches.next().is_none() {
+                        return Some((method.decl.clone(), trait_info.module_name.clone()));
+                    }
+                    return None;
+                }
+                if let Some((bound_name, trait_name, qualified_trait_name)) = required_trait {
+                    let mut matches = self
+                        .trait_impls_in_scope()
+                        .filter(|trait_impl| {
+                            trait_impl.trait_name == bound_name
+                                || trait_impl.trait_name == trait_name
+                                || trait_impl.trait_name == qualified_trait_name
+                        })
+                        .filter_map(|trait_impl| {
+                            self.trait_impl_substitutions(trait_impl, &receiver_ty)?;
+                            let method = trait_impl.methods.get(field)?;
+                            Some((
+                                crate::sema::trait_impl_specificity(trait_impl),
+                                trait_impl,
+                                method,
+                            ))
+                        })
+                        .collect::<Vec<_>>();
+                    matches.sort_by_key(|(specificity, _, _)| std::cmp::Reverse(*specificity));
+                    let best_specificity =
+                        matches.first().map(|(specificity, _, _)| *specificity)?;
+                    let mut best = matches
+                        .into_iter()
+                        .take_while(|(specificity, _, _)| *specificity == best_specificity);
+                    let (_, trait_impl, method) = best.next()?;
+                    if best.next().is_some() {
+                        return None;
+                    }
+                    return Some((method.decl.clone(), trait_impl.module_name.clone()));
+                }
+                self.trait_impls_in_scope()
+                    .filter_map(|trait_impl| {
+                        let substitutions =
+                            self.trait_impl_substitutions(trait_impl, &receiver_ty)?;
+                        let method = trait_impl.methods.get(field)?;
+                        Some((
+                            crate::sema::trait_impl_specificity(trait_impl),
+                            trait_impl,
+                            method,
+                            substitutions,
+                        ))
+                    })
+                    .max_by_key(|(specificity, _, _, _)| *specificity)
+                    .map(|(_, trait_impl, method, _)| {
+                        (method.decl.clone(), trait_impl.module_name.clone())
+                    })
+            }
+            _ => None,
+        }
+    }
+
+    fn infer_module_path_in_owner(&self, owner_module: &str, expr: &Expr) -> Option<String> {
+        match &grouped_specialized_expr(expr).kind {
+            ExprKind::Name(name) => {
+                let imported = if owner_module == self.module_name {
+                    self.current_module_namespace()
+                        .map(|namespace| &namespace.imported_modules)
+                        .unwrap_or(self.imported_modules)
+                } else {
+                    &self.module_registry.get(owner_module)?.imported_modules
+                };
+                imported.get(name).map(|namespace| namespace.path.clone())
+            }
+            ExprKind::Member { object, field } => {
+                let parent = self.infer_module_path_in_owner(owner_module, object)?;
+                self.module_namespace(&parent)
+                    .and_then(|namespace| namespace.modules.get(field))
+                    .map(|namespace| namespace.path.clone())
+            }
+            _ => None,
+        }
     }
 
     fn returned_view_call_parent(
@@ -22495,26 +24607,17 @@ impl<'a> FunctionChecker<'a> {
         expr: &Expr,
         locals: &mut HashMap<String, LocalBinding>,
     ) -> Option<String> {
+        let expr = grouped_expr(expr);
+        if let ExprKind::Member { object, .. } | ExprKind::Index { object, .. } = &expr.kind {
+            return self.returned_view_call_parent(object, locals);
+        }
         let ExprKind::Call { callee, args } = &expr.kind else {
             return None;
         };
-        let (base, _) = self.peel_specialization(callee);
-        let (decl, receiver) = match &base.kind {
-            ExprKind::Name(name) => (&self.resolve_function_info(name)?.decl, None),
-            ExprKind::Member { object, field } => {
-                let Type::Named(class_name, _) =
-                    self.type_of_member_object_expr(object, locals).ok()?
-                else {
-                    return None;
-                };
-                let method = self.resolve_class_info(&class_name)?.methods.get(field)?;
-                (&method.decl, Some(&**object))
-            }
-            _ => return None,
-        };
+        let (decl, receiver, _owner_module) = self.returned_view_callee(callee, locals).ok()??;
         let contract = decl.view_return.as_ref()?;
         let origin = if contract.origin == "self" {
-            receiver?
+            receiver.as_ref()?
         } else {
             let origin_index = decl
                 .params
@@ -22530,13 +24633,14 @@ impl<'a> FunctionChecker<'a> {
             .ok()?;
             &ordered.get(origin_index).copied().flatten()?.value
         };
-        let ExprKind::Name(name) = &origin.kind else {
-            return None;
-        };
+        let name = self
+            .borrow_call_place(origin)
+            .map(|place| place.root)
+            .or_else(|| self.returned_view_call_parent(origin, locals))?;
         locals
-            .get(name)
+            .get(&name)
             .is_some_and(|binding| binding.view.is_some())
-            .then(|| name.clone())
+            .then_some(name)
     }
 
     fn returned_view_call_kind(
@@ -22544,25 +24648,27 @@ impl<'a> FunctionChecker<'a> {
         expr: &Expr,
         locals: &mut HashMap<String, LocalBinding>,
     ) -> Result<Option<crate::ast::ViewKind>> {
+        let expr = grouped_expr(expr);
+        if let ExprKind::Member { object, .. } | ExprKind::Index { object, .. } = &expr.kind {
+            return self.returned_view_call_kind(object, locals);
+        }
         let ExprKind::Call { callee, .. } = &expr.kind else {
             return Ok(None);
         };
-        let (base, _) = self.peel_specialization(callee);
-        let contract = match &base.kind {
-            ExprKind::Name(name) => self
-                .resolve_function_info(name)
-                .and_then(|function| function.decl.view_return.as_ref()),
-            ExprKind::Member { object, field } => {
-                let receiver_ty = self.type_of_member_object_expr(object, locals)?;
-                let Type::Named(class_name, _) = receiver_ty else {
-                    return Ok(None);
-                };
-                self.resolve_class_info(&class_name)
-                    .and_then(|class| class.methods.get(field))
-                    .and_then(|method| method.decl.view_return.as_ref())
-            }
-            _ => None,
-        };
+        // Capability lookup is metadata-only and is often performed after the
+        // ordinary call checker has consumed an owned receiver.  Resolve it
+        // from the receiver's static type without replaying move-state errors;
+        // the call and any returned place are validated on their original
+        // source-order pass.
+        let mut contract_locals = locals.clone();
+        for binding in contract_locals.values_mut() {
+            binding.moved = false;
+            binding.moved_fields.clear();
+            binding.stale_match_borrow_place = None;
+        }
+        let contract = self
+            .returned_view_callee(callee, &mut contract_locals)?
+            .and_then(|(decl, _, _)| decl.view_return);
         Ok(contract.map(|contract| {
             if contract.mutable {
                 crate::ast::ViewKind::Mutable
@@ -22570,6 +24676,320 @@ impl<'a> FunctionChecker<'a> {
                 crate::ast::ViewKind::Shared
             }
         }))
+    }
+
+    fn direct_view_value_kind(
+        &self,
+        expr: &Expr,
+        locals: &mut HashMap<String, LocalBinding>,
+    ) -> Result<Option<crate::ast::ViewKind>> {
+        match &grouped_expr(expr).kind {
+            ExprKind::Name(name) => Ok(locals
+                .get(name)
+                .and_then(|binding| binding.view.as_ref())
+                .map(|view| view.kind)),
+            ExprKind::Call { .. } => self.returned_view_call_kind(expr, locals),
+            ExprKind::Member { object, .. } | ExprKind::Index { object, .. } => {
+                let kind = self.direct_view_value_kind(object, locals)?;
+                let Some(kind) = kind else {
+                    return Ok(None);
+                };
+                // Reading a Copy projection materializes a fresh pointee
+                // value; it does not move or store the surrounding view
+                // descriptor. Non-Copy projections remain borrowed values
+                // and must stay within view-aware contexts.
+                let mut type_locals = locals.clone();
+                let projected_ty = self.type_of_expr(expr, &mut type_locals)?;
+                if self.is_copy_type(&projected_ty) {
+                    Ok(None)
+                } else {
+                    Ok(Some(kind))
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn reject_view_value_for_passing(
+        &self,
+        expr: &Expr,
+        passing: ReceiverKind,
+        destination: &str,
+        locals: &mut HashMap<String, LocalBinding>,
+    ) -> Result<()> {
+        self.reject_mutable_returned_view_value(expr, locals, passing == ReceiverKind::BorrowMut)?;
+        if passing == ReceiverKind::Value {
+            self.reject_owned_view_value(expr, locals, destination)?;
+        }
+        Ok(())
+    }
+
+    fn reject_mutable_returned_view_value(
+        &self,
+        expr: &Expr,
+        locals: &mut HashMap<String, LocalBinding>,
+        allow_root: bool,
+    ) -> Result<()> {
+        let expr = grouped_expr(expr);
+        if matches!(expr.kind, ExprKind::Call { .. }) {
+            if self.returned_view_call_kind(expr, locals)? == Some(crate::ast::ViewKind::Mutable)
+                && !allow_root
+            {
+                return Err(Diagnostic::coded_at(
+                    "AU3010",
+                    expr.span,
+                    "a mutable returned view requires a mutable view binding or immediate mutable reborrow",
+                )
+                .with_help(
+                    "bind it with `view mut`, or pass the call directly to a `mut` parameter",
+                ));
+            }
+            let ExprKind::Call { callee, args } = &expr.kind else {
+                unreachable!();
+            };
+            let mut metadata_locals = locals.clone();
+            for binding in metadata_locals.values_mut() {
+                binding.moved = false;
+                binding.moved_fields.clear();
+                binding.stale_match_borrow_place = None;
+            }
+            if let Some((decl, receiver, _)) =
+                self.returned_view_callee(callee, &mut metadata_locals)?
+            {
+                if let Some(receiver) = receiver.as_ref() {
+                    self.reject_view_value_for_passing(
+                        receiver,
+                        decl.receiver.unwrap_or(ReceiverKind::Value),
+                        "an owned method receiver",
+                        locals,
+                    )?;
+                }
+                let ordered = bind_call_arguments(
+                    &format!("callable `{}`", decl.name),
+                    &callable_params_from_decl(&decl.params),
+                    args,
+                    callee.span,
+                    CallConvention::PositionalOrNamed,
+                )?;
+                for (argument, passing) in ordered.into_iter().zip(
+                    decl.params
+                        .iter()
+                        .map(|param| resolve_param_passing(param.mode)),
+                ) {
+                    if let Some(argument) = argument {
+                        self.reject_mutable_returned_view_value(
+                            &argument.value,
+                            locals,
+                            passing == ReceiverKind::BorrowMut,
+                        )?;
+                    }
+                }
+                return Ok(());
+            }
+            if let ExprKind::Member { object, field } = &grouped_specialized_expr(callee).kind {
+                if let Ok(Type::Named(receiver_name, _)) =
+                    self.type_of_member_object_expr(object, &mut metadata_locals)
+                {
+                    if let Some(member) = BuiltinMember::resolve(&receiver_name, field) {
+                        self.reject_view_value_for_passing(
+                            object,
+                            member.receiver_passing(),
+                            "an owned builtin receiver",
+                            locals,
+                        )?;
+                        // TaskGroup's fixed builtin signature stops at the
+                        // target callable. Every later argument is forwarded
+                        // to that callable and may therefore use its target
+                        // parameter name. Do not bind those names against the
+                        // builtin itself. Direct view roots deliberately reach
+                        // the ordinary TaskGroup checker so it can emit the
+                        // task-boundary-specific AU3008; nested mutable views
+                        // still receive their normal context validation.
+                        if matches!(
+                            member,
+                            BuiltinMember::TaskGroupStart
+                                | BuiltinMember::TaskGroupStartSoon
+                                | BuiltinMember::TaskGroupStartWithStack
+                                | BuiltinMember::TaskGroupStartSoonWithStack
+                        ) {
+                            for argument in args {
+                                self.reject_mutable_returned_view_value(
+                                    &argument.value,
+                                    locals,
+                                    true,
+                                )?;
+                            }
+                            return Ok(());
+                        }
+                        let ordered = member.bind_args(args, callee.span)?;
+                        for (index, argument) in ordered.into_iter().enumerate() {
+                            if let (Some(argument), Some(passing)) =
+                                (argument, member.argument_passing(index))
+                            {
+                                self.reject_view_value_for_passing(
+                                    &argument.value,
+                                    passing,
+                                    "an owned builtin argument",
+                                    locals,
+                                )?;
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+            let callable_params = match self.type_of_expr(callee, &mut metadata_locals) {
+                Ok(Type::Function { params, .. }) => Some(params),
+                Ok(Type::Closure { params, .. }) => Some(*params),
+                _ => None,
+            };
+            if let Some(params) = callable_params {
+                let bindings = params
+                    .iter()
+                    .map(|param| crate::call::CallableParam {
+                        name: &param.name,
+                        required: !param.has_default,
+                    })
+                    .collect::<Vec<_>>();
+                let ordered = bind_call_arguments(
+                    "function value",
+                    &bindings,
+                    args,
+                    callee.span,
+                    if params.iter().any(|param| param.name.is_empty()) {
+                        CallConvention::PositionalOnly
+                    } else {
+                        CallConvention::PositionalOrNamed
+                    },
+                )?;
+                for (argument, param) in ordered.into_iter().zip(params) {
+                    if let Some(argument) = argument {
+                        self.reject_mutable_returned_view_value(
+                            &argument.value,
+                            locals,
+                            param.passing == ReceiverKind::BorrowMut,
+                        )?;
+                    }
+                }
+                return Ok(());
+            }
+            // Builtins and structural callees that do not expose a resolved
+            // mutable parameter here must treat nested returned views as
+            // ordinary value expressions. Their ordinary call checker still
+            // performs the full type and ownership validation.
+            for argument in args {
+                self.reject_mutable_returned_view_value(&argument.value, locals, false)?;
+            }
+            return Ok(());
+        }
+        match &expr.kind {
+            ExprKind::Tuple(elements) | ExprKind::List(elements) | ExprKind::Set(elements) => {
+                for element in elements {
+                    self.reject_mutable_returned_view_value(element, locals, false)?;
+                }
+            }
+            ExprKind::Map(entries) => {
+                for entry in entries {
+                    self.reject_mutable_returned_view_value(&entry.key, locals, false)?;
+                    self.reject_mutable_returned_view_value(&entry.value, locals, false)?;
+                }
+            }
+            ExprKind::Unary { expr, .. }
+            | ExprKind::Cast { expr, .. }
+            | ExprKind::Specialize { expr, .. }
+            | ExprKind::Try(expr) => {
+                self.reject_mutable_returned_view_value(expr, locals, false)?;
+            }
+            ExprKind::Member { object, .. } => {
+                self.reject_mutable_returned_view_value(object, locals, allow_root)?;
+            }
+            ExprKind::Binary { left, right, .. }
+            | ExprKind::Membership {
+                value: left,
+                container: right,
+                ..
+            } => {
+                self.reject_mutable_returned_view_value(left, locals, false)?;
+                self.reject_mutable_returned_view_value(right, locals, false)?;
+            }
+            ExprKind::Conditional {
+                then_expr,
+                condition,
+                else_expr,
+            } => {
+                self.reject_mutable_returned_view_value(condition, locals, false)?;
+                self.reject_mutable_returned_view_value(then_expr, locals, false)?;
+                self.reject_mutable_returned_view_value(else_expr, locals, false)?;
+            }
+            ExprKind::Index { object, index } => {
+                self.reject_mutable_returned_view_value(object, locals, allow_root)?;
+                self.reject_mutable_returned_view_value(index, locals, false)?;
+            }
+            ExprKind::Slice {
+                object, start, end, ..
+            } => {
+                self.reject_mutable_returned_view_value(object, locals, false)?;
+                if let Some(start) = start {
+                    self.reject_mutable_returned_view_value(start, locals, false)?;
+                }
+                if let Some(end) = end {
+                    self.reject_mutable_returned_view_value(end, locals, false)?;
+                }
+            }
+            ExprKind::Match {
+                scrutinee, arms, ..
+            } => {
+                self.reject_mutable_returned_view_value(scrutinee, locals, false)?;
+                for arm in arms {
+                    self.reject_mutable_returned_view_value(&arm.value, locals, false)?;
+                }
+            }
+            ExprKind::CompareChain { first, links } => {
+                self.reject_mutable_returned_view_value(first, locals, false)?;
+                for link in links {
+                    self.reject_mutable_returned_view_value(&link.operand, locals, false)?;
+                }
+            }
+            ExprKind::Group(_) | ExprKind::Call { .. } => unreachable!("normalized above"),
+            ExprKind::FString(parts) => {
+                for part in parts {
+                    match part {
+                        crate::ast::FormatPart::Literal(_) => {}
+                        crate::ast::FormatPart::Expr(value)
+                        | crate::ast::FormatPart::Formatted { expr: value, .. } => {
+                            self.reject_mutable_returned_view_value(value, locals, false)?;
+                        }
+                    }
+                }
+            }
+            ExprKind::Name(_)
+            | ExprKind::Int(_)
+            | ExprKind::DurationNanos(_)
+            | ExprKind::BuiltinOmitted
+            | ExprKind::Float(_)
+            | ExprKind::Bool(_)
+            | ExprKind::String(_)
+            | ExprKind::Comprehension { .. }
+            | ExprKind::Lambda { .. } => {}
+        }
+        Ok(())
+    }
+
+    fn reject_owned_view_value(
+        &self,
+        expr: &Expr,
+        locals: &mut HashMap<String, LocalBinding>,
+        destination: &str,
+    ) -> Result<()> {
+        if self.direct_view_value_kind(expr, locals)?.is_none() {
+            return Ok(());
+        }
+        Err(Diagnostic::coded_at(
+            "AU3010",
+            expr.span,
+            format!("a view cannot be stored as {destination}"),
+        )
+        .with_help("keep it in a matching `view` binding, or produce an explicit owned value"))
     }
 
     fn expire_views_before(
@@ -22589,6 +25009,114 @@ impl<'a> FunctionChecker<'a> {
                 .closure_loans
                 .retain(|loan| !span_precedes(loan.last_use, span));
         }
+    }
+
+    fn expire_views_unused_in_branch(
+        &self,
+        body: &[Stmt],
+        control_last_uses: &BTreeMap<String, crate::diag::Span>,
+        locals: &mut HashMap<String, LocalBinding>,
+    ) {
+        for (name, binding) in locals.iter_mut() {
+            if block_references_name(body, name) {
+                continue;
+            }
+            let control_last_use = control_last_uses.get(name).copied();
+            if binding
+                .view
+                .as_ref()
+                .is_some_and(|view| control_last_use == Some(view.last_use))
+            {
+                binding.view = None;
+            }
+            binding
+                .closure_loans
+                .retain(|loan| control_last_use != Some(loan.last_use));
+        }
+    }
+
+    fn view_descends_from(
+        &self,
+        descendant: &str,
+        ancestor: &str,
+        locals: &HashMap<String, LocalBinding>,
+    ) -> bool {
+        if locals.get(descendant).is_some_and(|binding| {
+            binding
+                .view
+                .iter()
+                .chain(&binding.closure_loans)
+                .any(|view| {
+                    view.parent.as_deref() == Some(ancestor) || view.ancestors.contains(ancestor)
+                })
+        }) {
+            return true;
+        }
+        let mut pending = vec![descendant.to_string()];
+        let mut seen = BTreeSet::new();
+        while let Some(name) = pending.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let Some(binding) = locals.get(&name) else {
+                continue;
+            };
+            for parent in binding
+                .view
+                .iter()
+                .chain(&binding.closure_loans)
+                .filter_map(|view| view.parent.as_deref())
+            {
+                if parent == ancestor {
+                    return true;
+                }
+                pending.push(parent.to_string());
+            }
+        }
+        false
+    }
+
+    fn view_ancestor_names(
+        &self,
+        parent: Option<&str>,
+        locals: &HashMap<String, LocalBinding>,
+    ) -> BTreeSet<String> {
+        let mut ancestors = BTreeSet::new();
+        let Some(parent) = parent else {
+            return ancestors;
+        };
+        ancestors.insert(parent.to_string());
+        if let Some(binding) = locals.get(parent) {
+            for view in binding.view.iter().chain(&binding.closure_loans) {
+                if let Some(parent) = &view.parent {
+                    ancestors.insert(parent.clone());
+                }
+                ancestors.extend(view.ancestors.iter().cloned());
+            }
+        }
+        ancestors
+    }
+
+    fn access_uses_view_or_descendant(
+        &self,
+        active_view: &str,
+        through_view: Option<&str>,
+        locals: &HashMap<String, LocalBinding>,
+    ) -> bool {
+        through_view.is_some_and(|through| {
+            (through == active_view && !self.view_has_active_descendant(active_view, locals))
+                || self.view_descends_from(through, active_view, locals)
+        })
+    }
+
+    fn view_has_active_descendant(
+        &self,
+        ancestor: &str,
+        locals: &HashMap<String, LocalBinding>,
+    ) -> bool {
+        locals.keys().any(|candidate| {
+            candidate != ancestor && self.view_descends_from(candidate, ancestor, locals)
+        })
     }
 
     fn current_view_return(&self) -> Option<&crate::ast::ViewReturn> {
@@ -22638,9 +25166,16 @@ impl<'a> FunctionChecker<'a> {
         span: crate::diag::Span,
         locals: &HashMap<String, LocalBinding>,
     ) -> Result<()> {
+        if kind == crate::ast::ViewKind::Mutable {
+            self.ensure_place_not_frozen(requested, span, locals)?;
+        }
         for (name, binding) in locals {
             for active in binding.view.iter().chain(&binding.closure_loans) {
-                if parent == Some(name.as_str()) && binding.view.is_some() {
+                if binding.view.is_some()
+                    && parent.is_some_and(|parent| {
+                        parent == name || self.view_descends_from(parent, name, locals)
+                    })
+                {
                     continue;
                 }
                 if !active.source.overlaps(requested) {
@@ -22678,7 +25213,9 @@ impl<'a> FunctionChecker<'a> {
         let place = self.canonicalize_view_place(place.clone(), locals);
         for (name, binding) in locals {
             for view in binding.view.iter().chain(&binding.closure_loans) {
-                if view.source.overlaps(&place) && through_view != Some(name.as_str()) {
+                if view.source.overlaps(&place)
+                    && !self.access_uses_view_or_descendant(name, through_view, locals)
+                {
                     return Err(Diagnostic::coded_at(
                         "AU3002",
                         span,
@@ -22714,7 +25251,7 @@ impl<'a> FunctionChecker<'a> {
             for view in binding.view.iter().chain(&binding.closure_loans) {
                 if view.kind != crate::ast::ViewKind::Mutable
                     || !view.source.overlaps(&place)
-                    || through_view == Some(name.as_str())
+                    || self.access_uses_view_or_descendant(name, through_view, locals)
                 {
                     continue;
                 }
@@ -22985,6 +25522,21 @@ impl<'a> FunctionChecker<'a> {
             ExprKind::Match { arms, .. } => {
                 for arm in arms {
                     self.collect_result_place_accesses(&arm.value, locals, passing, label, places)?;
+                }
+                Ok(())
+            }
+            ExprKind::Call { .. } => {
+                if passing == ReceiverKind::Value {
+                    return Ok(());
+                }
+                let mut place_locals = locals.clone();
+                if let Some(path) = self.view_place(expr, &mut place_locals)? {
+                    places.push(BorrowedCallPlace {
+                        path,
+                        passing,
+                        param_name: label.to_string(),
+                        origin_span: expr.span,
+                    });
                 }
                 Ok(())
             }
@@ -23901,7 +26453,12 @@ impl<'a> FunctionChecker<'a> {
         locals: &mut HashMap<String, LocalBinding>,
     ) -> Result<()> {
         if let Some(place) = self.borrow_call_place(object) {
-            self.ensure_place_not_frozen(&place, span, locals)?;
+            self.ensure_place_mutation_allowed(&place, span, locals)?;
+            let through_view = locals
+                .get(&place.root)
+                .and_then(|binding| binding.view.as_ref())
+                .map(|_| place.root.as_str());
+            self.ensure_place_not_locked_by_view(&place, through_view, span, locals)?;
         }
         if self.is_mutable_place(object, locals)? {
             return Ok(());
@@ -24082,11 +26639,12 @@ impl<'a> FunctionChecker<'a> {
         place: &PlacePath,
         locals: &HashMap<String, LocalBinding>,
     ) -> Option<(PlacePath, crate::diag::Span)> {
+        let place = self.canonicalize_view_place(place.clone(), locals);
         let binding = locals.get(&place.root)?;
         binding
             .frozen_places
             .iter()
-            .find(|(frozen, _)| frozen.overlaps(place))
+            .find(|(frozen, _)| frozen.overlaps(&place))
             .map(|(frozen, origin)| (frozen.clone(), *origin))
     }
 
@@ -24095,11 +26653,12 @@ impl<'a> FunctionChecker<'a> {
         place: &PlacePath,
         locals: &HashMap<String, LocalBinding>,
     ) -> Option<(PlacePath, crate::diag::Span)> {
+        let place = self.canonicalize_view_place(place.clone(), locals);
         let binding = locals.get(&place.root)?;
         binding
             .shared_match_places
             .iter()
-            .find(|(shared, _)| shared.overlaps(place))
+            .find(|(shared, _)| shared.overlaps(&place))
             .map(|(shared, origin)| (shared.clone(), *origin))
     }
 
@@ -24109,7 +26668,51 @@ impl<'a> FunctionChecker<'a> {
         span: crate::diag::Span,
         locals: &HashMap<String, LocalBinding>,
     ) -> Result<()> {
-        if let Some((shared, origin)) = self.find_shared_match_place_conflict(place, locals) {
+        self.ensure_place_not_frozen_with_match_access(place, span, locals, false)
+    }
+
+    fn ensure_place_mutation_allowed(
+        &self,
+        place: &PlacePath,
+        span: crate::diag::Span,
+        locals: &HashMap<String, LocalBinding>,
+    ) -> Result<()> {
+        self.ensure_place_not_frozen_with_match_access(place, span, locals, true)
+    }
+
+    fn ensure_place_not_frozen_with_match_access(
+        &self,
+        access: &PlacePath,
+        span: crate::diag::Span,
+        locals: &HashMap<String, LocalBinding>,
+        allow_matching_access: bool,
+    ) -> Result<()> {
+        let place = self.canonicalize_view_place(access.clone(), locals);
+        if let Some(active) = self
+            .active_match_borrow_places
+            .borrow()
+            .iter()
+            .find(|active| {
+                active.physical.overlaps(&place)
+                    && !(allow_matching_access
+                        && active.access.root == access.root
+                        && access
+                            .projections
+                            .is_descendant_of_or_equal(&active.access.projections))
+            })
+            .cloned()
+        {
+            return Err(Diagnostic::coded_at(
+                "AU3002",
+                span,
+                format!(
+                    "cannot mutate `{place}` while `match mut` holds mutable access to `{}`",
+                    active.physical
+                ),
+            )
+            .with_help("mutate through the selected mutable pattern binding, or wait until the match arm ends"));
+        }
+        if let Some((shared, origin)) = self.find_shared_match_place_conflict(&place, locals) {
             return Err(Diagnostic::coded_at(
                 "AU3002",
                 span,
@@ -24122,7 +26725,7 @@ impl<'a> FunctionChecker<'a> {
                 "finish the selected match arm before mutating `{shared}`, or use `match mut {shared}` when the arm must update it"
             )));
         }
-        if let Some((frozen, origin)) = self.find_frozen_place_conflict(place, locals) {
+        if let Some((frozen, origin)) = self.find_frozen_place_conflict(&place, locals) {
             return Err(
                 Diagnostic::at(
                     span,
@@ -24201,13 +26804,14 @@ impl<'a> FunctionChecker<'a> {
         span: crate::diag::Span,
         locals: &mut HashMap<String, LocalBinding>,
     ) -> Result<Option<PlacePath>> {
-        let Some(place) = self.borrow_call_place(scrutinee) else {
+        let Some(access) = self.borrow_call_place(scrutinee) else {
             return Err(Diagnostic::coded_at(
                 "AU3002",
                 span,
                 "`match mut` requires a mutable place scrutinee",
             ));
         };
+        let place = self.canonicalize_view_place(access.clone(), locals);
         self.ensure_place_not_frozen(&place, span, locals)?;
         if !self.is_mutable_place(scrutinee, locals)? {
             return Err(Diagnostic::coded_at(
@@ -24220,7 +26824,7 @@ impl<'a> FunctionChecker<'a> {
             .active_match_borrow_places
             .borrow()
             .iter()
-            .find(|active| active.overlaps(&place))
+            .find(|active| active.physical.overlaps(&place))
             .cloned()
         {
             return Err(Diagnostic::coded_at(
@@ -24228,13 +26832,16 @@ impl<'a> FunctionChecker<'a> {
                 span,
                 format!(
                     "cannot start `match mut` on `{}` while an enclosing match already has mutable access to `{}`",
-                    place, active
+                    place, active.physical
                 ),
             ));
         }
         self.active_match_borrow_places
             .borrow_mut()
-            .push(place.clone());
+            .push(ActiveMatchBorrow {
+                physical: place.clone(),
+                access,
+            });
         Ok(Some(place))
     }
 
@@ -24356,6 +26963,7 @@ impl<'a> FunctionChecker<'a> {
         } else {
             locals
         };
+        self.reject_mutable_returned_view_value(guard, guard_locals, false)?;
         let actual = match self.type_of_expr(guard, guard_locals) {
             Ok(actual) => actual,
             Err(mut diagnostic)
@@ -25128,7 +27736,30 @@ impl<'a> FunctionChecker<'a> {
                 let object_ty = self.type_of_member_object_expr(object, locals)?;
                 self.resolve_member_type(&object_ty, field, expr.span)
             }
-            ExprKind::Index { .. } => self.type_of_expr(expr, locals),
+            ExprKind::Index { object, index } => {
+                let object_ty = self.type_of_member_object_expr(object, locals)?;
+                if let Type::Tuple(elements) = object_ty {
+                    let ExprKind::Int(value) = index.kind else {
+                        return self.type_of_expr(expr, locals);
+                    };
+                    let index = usize::try_from(value).map_err(|_| {
+                        Diagnostic::coded_at(
+                            "AU3004",
+                            index.span,
+                            "invalid tuple projection position",
+                        )
+                    })?;
+                    elements.get(index).cloned().ok_or_else(|| {
+                        Diagnostic::coded_at(
+                            "AU3004",
+                            expr.span,
+                            format!("tuple has no position {index}"),
+                        )
+                    })
+                } else {
+                    self.type_of_expr(expr, locals)
+                }
+            }
             _ => self.type_of_expr(expr, locals),
         }
     }
@@ -25541,6 +28172,7 @@ impl<'a> FunctionChecker<'a> {
                             self_ty.clone(),
                         );
                         matches.push(ResolvedTraitMethodInfo {
+                            module_name: trait_info.module_name.clone(),
                             decl: method.decl.clone(),
                             signature: FunctionSignature {
                                 params: method
@@ -26245,6 +28877,43 @@ impl<'a> FunctionChecker<'a> {
             .map(|param| substitute_type(param, &substitutions))
             .collect::<Vec<_>>();
 
+        if closure_argument_policy == ClosureArgumentPolicy::Reject {
+            if let Some((argument, _actual, _, _)) = resolved_args
+                .iter()
+                .find(|(_, actual, _, _)| type_contains_loan_closure(actual))
+            {
+                return Err(Diagnostic::coded_at(
+                    "AU3010",
+                    argument.map(|argument| argument.span).unwrap_or(span),
+                    "a call cannot erase the region of a closure containing a live view",
+                )
+                .with_help(
+                    "keep the loan-bearing closure in its matching inferred local and call it directly",
+                ));
+            }
+            if type_contains_loan_closure(&resolved_return_type) {
+                return Err(Diagnostic::coded_at(
+                    "AU3010",
+                    span,
+                    "a call cannot return a closure containing a live view",
+                ));
+            }
+        }
+
+        for (((argument, _, _, _), _param_decl), param_passing) in resolved_args
+            .iter()
+            .zip(param_decls.iter())
+            .zip(param_passings.iter().copied())
+        {
+            if let Some(argument) = *argument {
+                self.reject_mutable_returned_view_value(
+                    &argument.value,
+                    locals,
+                    param_passing == ReceiverKind::BorrowMut,
+                )?;
+            }
+        }
+
         let mut enclosing_accesses = seeded_borrowed_places.clone();
         for (
             (((argument, _actual, _nested_moved, _nested_borrowed), _expected), param_decl),
@@ -26267,8 +28936,25 @@ impl<'a> FunctionChecker<'a> {
                 &mut enclosing_accesses,
             )?;
         }
-        for (_argument, _actual, _nested_moved, nested_borrowed) in &resolved_args {
-            self.reject_retained_access_overlap(&enclosing_accesses, nested_borrowed)?;
+        for ((argument, _actual, _nested_moved, nested_borrowed), param_decl) in
+            resolved_args.iter().zip(param_decls.iter())
+        {
+            let own_access = argument.map(|argument| {
+                (
+                    argument.value.span,
+                    format!("parameter `{}`", param_decl.name),
+                )
+            });
+            let other_enclosing = enclosing_accesses
+                .iter()
+                .filter(|access| {
+                    own_access.as_ref().is_none_or(|(span, label)| {
+                        access.origin_span != *span || access.param_name != *label
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            self.reject_retained_access_overlap(&other_enclosing, nested_borrowed)?;
         }
 
         let mut source_order_accesses = seeded_borrowed_places.clone();
@@ -26296,11 +28982,11 @@ impl<'a> FunctionChecker<'a> {
                 &label,
                 &mut direct_accesses,
             )?;
-            for direct_access in &direct_accesses {
-                point_reads.retain(|read| {
-                    read.path != direct_access.path || read.origin_span != direct_access.origin_span
-                });
-            }
+            point_reads.retain(|read| {
+                !direct_accesses
+                    .iter()
+                    .any(|direct_access| read.path.overlaps(&direct_access.path))
+            });
             self.reject_retained_access_overlap(&source_order_accesses, &point_reads)?;
             // An argument that is itself a place is compared pairwise below,
             // where a parameter-aware diagnostic is produced, so this
@@ -26363,6 +29049,13 @@ impl<'a> FunctionChecker<'a> {
                 ));
             }
             if let Some(argument) = argument {
+                if param_passing == ReceiverKind::Value {
+                    self.reject_owned_view_value(
+                        &argument.value,
+                        locals,
+                        &format!("owned parameter `{}`", param_decl.name),
+                    )?;
+                }
                 match param_passing {
                     ReceiverKind::Value => {
                         if self.is_copy_type(&expected) {
@@ -26428,6 +29121,20 @@ impl<'a> FunctionChecker<'a> {
                         }
                     }
                     ReceiverKind::BorrowMut => {
+                        let argument_place = self.borrow_call_place(&argument.value);
+                        if let Some(place) = argument_place.as_ref() {
+                            self.ensure_place_mutation_allowed(place, argument.span, locals)?;
+                            let through_view = locals
+                                .get(&place.root)
+                                .and_then(|binding| binding.view.as_ref())
+                                .map(|_| place.root.as_str());
+                            self.ensure_place_not_locked_by_view(
+                                place,
+                                through_view,
+                                argument.span,
+                                locals,
+                            )?;
+                        }
                         if !self.is_mutable_place(&argument.value, locals)? {
                             return Err(Diagnostic::at(
                                 argument.span,
@@ -26437,8 +29144,7 @@ impl<'a> FunctionChecker<'a> {
                                 ),
                             ));
                         }
-                        if let Some(place) = self.borrow_call_place(&argument.value) {
-                            self.ensure_place_not_frozen(&place, argument.span, locals)?;
+                        if let Some(place) = argument_place {
                             self.reject_overlapping_borrow(
                                 &borrowed_places,
                                 &place,
@@ -26731,6 +29437,7 @@ impl<'a> FunctionChecker<'a> {
                 ));
             }
             for (payload_ty, argument) in variant_payload.iter().zip(args) {
+                self.reject_owned_view_value(&argument.value, locals, "an enum payload")?;
                 let actual = self.type_of_expr_hint(&argument.value, locals, Some(payload_ty))?;
                 if actual != *payload_ty {
                     return Err(Diagnostic::at(
@@ -26741,9 +29448,14 @@ impl<'a> FunctionChecker<'a> {
                         ),
                     ));
                 }
-                if !self.is_copy_type(payload_ty) {
-                    self.consume_value_expr(&argument.value, locals)?;
+                if type_contains_loan_closure(&actual) {
+                    return Err(Diagnostic::coded_at(
+                        "AU3010",
+                        argument.value.span,
+                        "a closure containing a live view cannot be stored in an enum payload",
+                    ));
                 }
+                self.consume_value_expr(&argument.value, locals)?;
             }
         }
         Ok(enum_ty.clone())

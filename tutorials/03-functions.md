@@ -161,10 +161,11 @@ See [examples/basics/named_builtin_arguments.au](../examples/basics/named_builti
 Functions may return any concrete type accepted in a return annotation,
 including scalars, tuples, strings, collections, numeric arrays, classes,
 enums, generic specializations, function values, `Result[T, E]`, `Option[T]`,
-`Task[T]`, and `None`. Every result is owned; return types never describe a
-borrow into an argument or local value.
+`Task[T]`, and `None`. An ordinary `-> T` result is owned. A separate
+`-> view T from source` or `-> view mut T from source` contract returns a
+non-owning view tied to one receiver or parameter.
 
-Every function return is an owned value. Returning a copy type produces an
+Every ordinary return is an owned value. Returning a copy type produces an
 ordinary independent copy:
 
 ```aura check-pass
@@ -193,10 +194,46 @@ type is clone-safe, accept an `own` parameter and move from it, or provide an
 owner operation such as an `own self` method. A shared parameter cannot expose
 one of its non-copy fields as a return value.
 
-Every function result is an owned value. Returning a Copy value copies it;
-returning a non-Copy value requires constructing, cloning, or moving a value
-the function owns. Return annotations contain only the result type and never
-name an argument, field, or lifetime source.
+An ordinary result never names an argument, field, or lifetime source.
+Returning a Copy value copies it; returning a non-Copy value requires
+constructing, cloning, or moving a value the function owns.
+
+Use an explicit returned-view contract when the result must keep borrowing one
+caller-owned place:
+
+```aura check-pass
+class User:
+    name: str
+
+class Counter:
+    value: int64
+
+def name(user: User) -> view str from user:
+    return view user.name
+
+def value_mut(counter: mut Counter) -> view mut int64 from counter:
+    return view mut counter.value
+
+def bump(value: mut int64):
+    value += 1
+
+def main():
+    user = User(name="Ada")
+    view display = name(user)
+    print(display)
+    print(name(user))
+
+    mut counter = Counter(value=0)
+    bump(value_mut(counter))
+    print(counter.value)
+```
+
+The origin after `from` is part of the function type. The caller must supply
+an addressable place. Binding the result with matching `view` or `view mut`
+syntax is one option. A shared result may also be read directly within one
+containing expression, and a mutable result may be immediately reborrowed into
+a `mut` call. A returned view cannot be stored as an ordinary owned value or
+inside an aggregate.
 
 ## Generic Functions
 

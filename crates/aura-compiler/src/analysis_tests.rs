@@ -5304,7 +5304,7 @@ def main() -> int32:
             .contains("binding imported: remote.Holder[str]")
     }));
     assert!(analysis.occurrences.iter().any(|occurrence| {
-        occurrence.hover.contains("field value: T")
+        occurrence.hover.contains("field value: str")
             && occurrence
                 .definition
                 .as_ref()
@@ -6569,13 +6569,350 @@ def main():
     let display = analysis
         .occurrences
         .iter()
-        .find(|occurrence| occurrence.hover.contains("view display: str from <place>"))
+        .find(|occurrence| occurrence.hover.contains("view display: str from user"))
         .expect("view hover should expose its kind, pointee type, and returned source");
-    assert!(display.definition.is_some());
+    let definition = display
+        .definition
+        .as_ref()
+        .expect("returned-view provenance should resolve to its caller origin");
+    assert_eq!(definition.line, 8);
+    assert_eq!(definition.start_character, 4);
     assert!(analysis
         .symbols
         .iter()
         .any(|symbol| { symbol.name == "name" && symbol.detail == "view str from user" }));
+}
+
+#[test]
+fn adr0038_analysis_traces_grouped_and_forwarded_view_origins() {
+    let source = r#"
+class User:
+    name: str
+
+def name(user: User) -> view str from user:
+    return view user.name
+
+def identity(user: User) -> view str from user:
+    return view name(user)
+
+def main():
+    user = User(name="Ada")
+    view grouped = (name(user))
+    view forwarded = identity(user)
+    print(grouped)
+    print(forwarded)
+"#;
+    let analysis = analyze_source(source);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
+    for name in ["grouped", "forwarded"] {
+        let occurrence = analysis
+            .occurrences
+            .iter()
+            .find(|occurrence| {
+                occurrence
+                    .hover
+                    .contains(&format!("view {name}: str from user"))
+            })
+            .unwrap_or_else(|| panic!("missing precise provenance for {name}"));
+        let definition = occurrence.definition.as_ref().expect("origin definition");
+        assert_eq!(definition.line, 11);
+        assert_eq!(definition.start_character, 4);
+    }
+}
+
+#[test]
+fn adr0038_completion_recovers_multiline_lambda_capture_lists() {
+    let source = [
+        "def main():",
+        "    values = [1]",
+        "    callback: def() -> int64 = lambda [",
+        "        val",
+        "    ]: values.len()",
+    ]
+    .join("\n");
+    let completions = complete_source(&source, 3, 11, None)
+        .expect("completion should recover across a multiline capture list");
+    assert!(
+        completions
+            .iter()
+            .any(|completion| completion.name == "values"),
+        "{completions:?}"
+    );
+}
+
+#[test]
+fn adr0038_completion_recovers_multiline_capture_list_boundaries() {
+    let lines = [
+        "def main():",
+        "    values = [1]",
+        "    callback: def() -> int64 = lambda [",
+        "    ]: values.len()",
+    ];
+    let source = lines.join("\n");
+
+    for (line, character, boundary) in [
+        (2, lines[2].len(), "immediately after the capture opener"),
+        (
+            3,
+            lines[3].find(']').expect("closing capture delimiter"),
+            "immediately before the capture closer",
+        ),
+    ] {
+        let completions = complete_source(&source, line, character, None)
+            .unwrap_or_else(|error| panic!("completion failed {boundary}: {error:?}"));
+        assert!(
+            completions
+                .iter()
+                .any(|completion| completion.name == "values"),
+            "missing enclosing value {boundary}: {completions:?}"
+        );
+    }
+
+    let eof_source = format!("{}\n", lines[..3].join("\n"));
+    let completions = complete_source(&eof_source, 3, 0, None)
+        .expect("completion should recover on the empty EOF line after a capture opener");
+    assert!(
+        completions
+            .iter()
+            .any(|completion| completion.name == "values"),
+        "missing enclosing value on the empty EOF line: {completions:?}"
+    );
+}
+
+#[test]
+fn adr0038_analysis_resolves_unambiguous_bounded_trait_returned_view_methods() {
+    let lines = [
+        "trait Project:",
+        "    def get(self) -> view int64 from self",
+        "",
+        "def borrow[T: Project](value: T) -> view int64 from value:",
+        "    return view value.get()",
+    ];
+    let source = lines.join("\n");
+    let analysis = analyze_source(&source);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
+
+    let use_start = lines[4].rfind("get").expect("method use");
+    let occurrence = analysis
+        .occurrences
+        .iter()
+        .find(|occurrence| {
+            occurrence.line == 4
+                && occurrence.start_character == use_start
+                && occurrence.end_character == use_start + "get".len()
+        })
+        .expect("bounded trait method use should be an analysis occurrence");
+    assert_eq!(
+        occurrence.hover,
+        "```aura\nmethod get(self) -> view int64 from self\n```"
+    );
+    let definition = occurrence
+        .definition
+        .as_ref()
+        .expect("bounded trait method use should navigate to its declaration");
+    assert_eq!(definition.line, 1);
+    assert_eq!(
+        definition.start_character,
+        lines[1].find("def").expect("method declaration")
+    );
+    assert_eq!(definition.end_character, definition.start_character + 3);
+}
+
+#[test]
+fn adr0038_analysis_substitutes_trait_arguments_and_grouped_specialized_callees() {
+    let bounded = r#"
+trait Project[Item]:
+    def get(self) -> view Item from self
+
+def inspect[T: Project[int64]](value: T):
+    view result = value.get()
+    print(result)
+"#;
+    let analysis = analyze_source(bounded);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
+    assert!(
+        analysis
+            .occurrences
+            .iter()
+            .any(|occurrence| occurrence.hover.contains("view result: int64 from value")),
+        "{:?}",
+        analysis.occurrences
+    );
+
+    let grouped = r#"
+class Box[T]:
+    value: T
+
+def borrow[T](box: Box[T]) -> view T from box:
+    return view box.value
+
+def main():
+    box = Box[int64](value=7)
+    view result = (borrow[int64])(box)
+    view inferred = borrow(box)
+    print(result)
+    print(inferred)
+"#;
+    let analysis = analyze_source(grouped);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
+    let result = analysis
+        .occurrences
+        .iter()
+        .find(|occurrence| occurrence.hover.contains("view result:"))
+        .expect("grouped specialized returned view binding");
+    assert!(
+        result.hover.contains("view result: int64 from box"),
+        "{result:?}"
+    );
+    assert!(
+        analysis
+            .occurrences
+            .iter()
+            .any(|occurrence| { occurrence.hover.contains("view inferred: int64 from box") }),
+        "{:?}",
+        analysis.occurrences
+    );
+}
+
+#[test]
+fn adr0038_analysis_specializes_returned_view_methods_and_preserves_origins() {
+    let source = r#"
+class InstanceBorrower:
+    marker: int64
+
+    def borrow[T](self, value: T) -> view T from value:
+        return view value
+
+class AssociatedBorrower:
+    marker: int64
+
+    def borrow[T](value: T) -> view T from value:
+        return view value
+
+trait Project:
+    def borrow[T](self, value: T) -> view T from value
+
+class TraitBorrower:
+    marker: int64
+
+impl Project for TraitBorrower:
+    def borrow[T](self, value: T) -> view T from value:
+        return view value
+
+def main():
+    instance = InstanceBorrower(marker=0)
+    associated = 2
+    projected = TraitBorrower(marker=0)
+    instance_value = 1
+    trait_value = 3
+    grouped_value = 4
+    view instance_view = instance.borrow(instance_value)
+    view associated_view = AssociatedBorrower.borrow(associated)
+    view trait_view = projected.borrow(trait_value)
+    view grouped_view = (instance.borrow[int64])(grouped_value)
+    print(instance_view)
+    print(associated_view)
+    print(trait_view)
+    print(grouped_view)
+"#;
+    let analysis = analyze_source(source);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
+
+    for (view, origin) in [
+        ("instance_view", "instance_value"),
+        ("associated_view", "associated"),
+        ("trait_view", "trait_value"),
+        ("grouped_view", "grouped_value"),
+    ] {
+        let occurrence = analysis
+            .occurrences
+            .iter()
+            .find(|occurrence| occurrence.hover.contains(&format!("view {view}:")))
+            .unwrap_or_else(|| panic!("missing returned-view binding {view}"));
+        assert_eq!(
+            occurrence.hover,
+            format!("```aura\nview {view}: int64 from {origin}\n```"),
+            "{view} should retain its concrete pointee type and caller origin"
+        );
+        let definition = occurrence
+            .definition
+            .as_ref()
+            .unwrap_or_else(|| panic!("missing caller-origin definition for {view}"));
+        let (origin_line, origin_source) = source
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.trim_start().starts_with(&format!("{origin} =")))
+            .unwrap_or_else(|| panic!("missing source binding {origin}"));
+        assert_eq!(definition.line, origin_line, "{view} provenance line");
+        assert_eq!(
+            definition.start_character,
+            origin_source.find(origin).expect("origin column"),
+            "{view} provenance column"
+        );
+    }
+}
+
+#[test]
+fn adr0038_analysis_tracks_capture_identifiers_and_recovers_partial_capture_completion() {
+    let source = r#"
+def main():
+    mut values = [1]
+    mut update: def(int64) -> None = lambda [mut values] item: values.append(item)
+    update(2)
+"#;
+    let analysis = analyze_source(source);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
+    let capture = analysis
+        .occurrences
+        .iter()
+        .find(|occurrence| occurrence.line == 3 && occurrence.start_character == 49)
+        .expect("the explicit capture-list identifier should be an occurrence");
+    let definition = capture
+        .definition
+        .as_ref()
+        .expect("a capture-list identifier should resolve to its outer binding");
+    assert_eq!(definition.line, 2);
+    assert!(capture.hover.contains("values"));
+
+    for partial in [
+        "def main():\n    mut values = [1]\n    callback = lambda [mut ] item: item\n",
+        "def main():\n    mut values = [1]\n    callback = lambda [val] item: item\n",
+    ] {
+        let line = partial.lines().nth(2).expect("capture line");
+        let cursor = line.find(']').expect("capture list should close");
+        let completions = complete_source(partial, 2, cursor, None)
+            .expect("completion should recover while a capture entry is incomplete");
+        assert!(
+            completions
+                .iter()
+                .any(|completion| completion.name == "values"),
+            "{partial}: {completions:?}"
+        );
+    }
 }
 
 #[test]
@@ -6612,10 +6949,10 @@ fn adr0038_completion_scope_retains_view_bindings_and_sources() {
         "def main():",
         "    mut pair = (1, 2)",
         "    view mut selected = pair[0]",
-        "    selected",
+        "    print(selected)",
     ]
     .join("\n");
-    let completions = complete_source(&source, 3, 12, None)
+    let completions = complete_source(&source, 3, source.lines().nth(3).unwrap().len(), None)
         .expect("completion after a view declaration should recover the function scope");
     for name in ["pair", "selected"] {
         assert!(

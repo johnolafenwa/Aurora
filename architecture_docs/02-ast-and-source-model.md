@@ -38,7 +38,7 @@ Aura's most important AST types are:
 | --- | --- |
 | `Module` | One source file: imports, items, top-level statements |
 | `Item` | A top-level declaration such as `Class`, `Enum`, `Function`, `Trait`, or `Impl` |
-| `Stmt` | A statement such as assignment, `if`, `match`, `for`, `with`, `while`, `return`, or `break` |
+| `Stmt` | A statement such as assignment, local `view`, `if`, `match`, `for`, `with`, `while`, `return`, or `break` |
 | `Expr` | An expression such as a name, literal, call, member access, `match`, or `try` |
 | `Pattern` | A `match` pattern such as a binding, wildcard, literal, or enum variant pattern |
 | `TypeRef` | A syntactic type reference before semantic lowering |
@@ -121,9 +121,13 @@ There are a few choices worth calling out because they affect later stages:
   modifier, `own`, or `mut`. Bare is logical shared access for every type;
   the eventual ABI may still pass copy bits directly. Receiver syntax is
   normalized to shared `self`, consuming `own self`, or mutable `mut self`.
-- owned return types
-  Function declarations carry one `return_type`, and every result is an owned
-  value.
+- return contracts and local views
+  `FunctionDecl` carries one `return_type` plus an optional `view_return`.
+  When present, `view_return` records whether the returned view is mutable and
+  names its receiver or parameter origin; otherwise the result is owned.
+  `Stmt::View` separately records a local view binding's name, mutability, and
+  source expression. A `ReturnStmt` records whether `return view` or
+  `return view mut` was written.
 - ownership modes on `match` and `for`
   A `for` statement preserves its bare, `own`, or `mut` capability so
   iterable-specific checking can resolve it. A `match` statement always has a
@@ -210,7 +214,9 @@ Aura's real AST adds:
 - `match`, `with`, and shared/mutable control-flow forms
 - generics and trait bounds
 - f-strings and map/set/list literals
-- bare shared, `mut`, and `own` callable capabilities plus owned returns
+- bare shared, `mut`, and `own` callable capabilities plus owned and
+  `-> view [mut] T from origin` return contracts
+- local `Stmt::View` bindings and `FunctionDecl.view_return` provenance
 
 ## How this stage connects to the next one
 

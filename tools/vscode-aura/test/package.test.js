@@ -6,6 +6,61 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { computeAuraNewlineIndent } = require("../src/indentation");
 
+async function tokenizeAura(source) {
+  const extensionRoot = path.resolve(__dirname, "..");
+  const grammar = JSON.parse(
+    fs.readFileSync(path.join(extensionRoot, "syntaxes", "aura.tmLanguage.json"), "utf8")
+  );
+  const { createHighlighter } = await import("shiki");
+  const highlighter = await createHighlighter({
+    themes: ["github-dark"],
+    langs: [grammar]
+  });
+
+  try {
+    const result = highlighter.codeToTokens(source, {
+      lang: grammar.name,
+      theme: "github-dark",
+      includeExplanation: true
+    });
+    const sourceLines = source.split("\n");
+    const lines = result.tokens.map((tokens) => {
+      let column = 0;
+      return tokens.flatMap((token) =>
+        token.explanation.map((explanation) => {
+          const start = column;
+          column += explanation.content.length;
+          return {
+            start,
+            end: column,
+            scopes: explanation.scopes.map((scope) => scope.scopeName)
+          };
+        })
+      );
+    });
+    return { sourceLines, lines };
+  } finally {
+    highlighter.dispose();
+  }
+}
+
+function scopesAt(tokenized, lineIndex, text, occurrence = 0) {
+  const sourceLine = tokenized.sourceLines[lineIndex];
+  let start = -1;
+  let fromIndex = 0;
+  for (let index = 0; index <= occurrence; index += 1) {
+    start = sourceLine.indexOf(text, fromIndex);
+    assert.notEqual(start, -1, `${JSON.stringify(text)} should occur on line ${lineIndex + 1}`);
+    fromIndex = start + text.length;
+  }
+  const end = start + text.length;
+  const fragment = tokenized.lines[lineIndex].find(
+    (candidate) => candidate.start <= start && candidate.end >= end
+  );
+  assert.ok(fragment, `${JSON.stringify(text)} should be covered by one TextMate token`);
+  return fragment.scopes;
+}
+
 test("extension bundle contains built extension and language server files", () => {
   const extensionRoot = path.resolve(__dirname, "..");
   const distFiles = ["extension.js", "server.js"];
@@ -158,27 +213,123 @@ test("extension packages an expression-lambda snippet", () => {
   assert.match(snippets.Lambda.description, /expression/i);
 });
 
-test("extension highlights and snippets ADR-0038 views and loan captures", () => {
+test("extension snippets cover ADR-0038 views and loan captures", () => {
   const extensionRoot = path.resolve(__dirname, "..");
-  const grammar = JSON.parse(
-    fs.readFileSync(path.join(extensionRoot, "syntaxes", "aura.tmLanguage.json"), "utf8")
-  );
   const snippets = JSON.parse(
     fs.readFileSync(path.join(extensionRoot, "snippets", "aura.json"), "utf8")
   );
-  const viewRule = grammar.repository.keywords.patterns.find(
-    (pattern) => pattern.name === "keyword.declaration.view.aura"
-  );
-
-  assert.ok(viewRule);
-  assert.equal(new RegExp(viewRule.match).test("view"), true);
-  assert.equal(new RegExp(viewRule.match).test("from"), true);
   assert.deepEqual(snippets["Shared view"].body, ["view ${1:name} = ${2:place}"]);
   assert.deepEqual(snippets["Mutable view"].body, [
     "view mut ${1:name} = ${2:place}"
   ]);
   assert.match(snippets["Loan capture lambda"].body[0], /lambda \[.*mut.*own/);
   assert.match(snippets["Returned view function"].body[0], /-> view.*from/);
+});
+
+test("TextMate tokenization preserves ADR-0038 view and contextual import scopes", async () => {
+  const source = [
+    "def borrow(item: Box) -> view mut int64 from item:",
+    "    view mut alias = item.value",
+    "    return view mut alias",
+    "trait Borrower:",
+    "    def borrow(self) -> view int64 from self",
+    "from math import abs",
+    "view = 1",
+    "from = 2",
+    "return view",
+    "def value() -> view:",
+    "def shared(box: Box) -> view list[",
+    "    int64",
+    "] from box:",
+    "    return view (box.values)",
+    "def mutable(box: Box) -> view mut list[",
+    "    int64",
+    "] from box:",
+    "    return view mut (box.values)",
+    "    return view and other"
+  ].join("\n");
+  const tokenized = await tokenizeAura(source);
+
+  assert.ok(scopesAt(tokenized, 0, "->").includes("keyword.operator.aura"));
+  assert.ok(scopesAt(tokenized, 0, "view").includes("keyword.declaration.view.aura"));
+  assert.ok(scopesAt(tokenized, 0, "mut").includes("storage.modifier.aura"));
+  assert.ok(scopesAt(tokenized, 0, "int64").includes("support.type.primitive.aura"));
+  assert.ok(scopesAt(tokenized, 0, "from").includes("keyword.declaration.view.aura"));
+
+  assert.ok(scopesAt(tokenized, 1, "view").includes("keyword.declaration.view.aura"));
+  assert.ok(scopesAt(tokenized, 1, "mut").includes("storage.modifier.aura"));
+  assert.ok(scopesAt(tokenized, 1, "=").includes("keyword.operator.aura"));
+  assert.ok(scopesAt(tokenized, 1, ".").includes("keyword.operator.aura"));
+
+  assert.ok(scopesAt(tokenized, 2, "return").includes("keyword.control.aura"));
+  assert.ok(scopesAt(tokenized, 2, "view").includes("keyword.declaration.view.aura"));
+  assert.ok(scopesAt(tokenized, 2, "mut").includes("storage.modifier.aura"));
+
+  assert.ok(scopesAt(tokenized, 4, "->").includes("keyword.operator.aura"));
+  assert.ok(scopesAt(tokenized, 4, "view").includes("keyword.declaration.view.aura"));
+  assert.ok(scopesAt(tokenized, 4, "int64").includes("support.type.primitive.aura"));
+  assert.ok(scopesAt(tokenized, 4, "from").includes("keyword.declaration.view.aura"));
+
+  assert.ok(scopesAt(tokenized, 5, "from").includes("keyword.control.aura"));
+  assert.ok(scopesAt(tokenized, 5, "import").includes("keyword.control.aura"));
+
+  assert.equal(scopesAt(tokenized, 6, "view").includes("keyword.declaration.view.aura"), false);
+  assert.equal(scopesAt(tokenized, 7, "from").includes("keyword.control.aura"), false);
+  assert.equal(scopesAt(tokenized, 8, "view").includes("keyword.declaration.view.aura"), false);
+  assert.equal(scopesAt(tokenized, 9, "view").includes("keyword.declaration.view.aura"), false);
+
+  assert.ok(scopesAt(tokenized, 10, "view").includes("keyword.declaration.view.aura"));
+  assert.ok(scopesAt(tokenized, 12, "from").includes("keyword.declaration.view.aura"));
+  assert.ok(scopesAt(tokenized, 13, "view").includes("keyword.declaration.view.aura"));
+  assert.ok(scopesAt(tokenized, 14, "view").includes("keyword.declaration.view.aura"));
+  assert.ok(scopesAt(tokenized, 14, "mut", 1).includes("storage.modifier.aura"));
+  assert.ok(scopesAt(tokenized, 16, "from").includes("keyword.declaration.view.aura"));
+  assert.ok(scopesAt(tokenized, 17, "view").includes("keyword.declaration.view.aura"));
+  assert.ok(scopesAt(tokenized, 17, "mut").includes("storage.modifier.aura"));
+  assert.equal(
+    scopesAt(tokenized, 18, "view").includes("keyword.declaration.view.aura"),
+    false
+  );
+});
+
+test("TextMate tokenization distinguishes returned-view contracts from calls named view", async () => {
+  const source = [
+    "def expose(pair: (int64, int64)) -> view (int64, int64) from pair:",
+    "    return view (pair)",
+    "def ordinary(view: def(int64) -> int64, item: int64) -> int64:",
+    "    return view (item)",
+    "def grouped(box: Box) -> view int64 from box:",
+    "    return view (box.value)",
+    "def multiline(box: Box) -> view list[",
+    "    int64",
+    "] from box:",
+    "    return view box.values",
+    "def logical(box: Box) -> view bool from box:",
+    "    return view and other"
+  ].join("\n");
+  const tokenized = await tokenizeAura(source);
+
+  assert.ok(scopesAt(tokenized, 0, "view").includes("keyword.declaration.view.aura"));
+  assert.ok(scopesAt(tokenized, 0, "from").includes("keyword.declaration.view.aura"));
+  assert.ok(scopesAt(tokenized, 1, "view").includes("keyword.declaration.view.aura"));
+
+  assert.equal(
+    scopesAt(tokenized, 2, "view").includes("keyword.declaration.view.aura"),
+    false
+  );
+  assert.equal(
+    scopesAt(tokenized, 3, "view").includes("keyword.declaration.view.aura"),
+    false
+  );
+
+  assert.ok(scopesAt(tokenized, 5, "view").includes("keyword.declaration.view.aura"));
+  assert.ok(scopesAt(tokenized, 6, "view").includes("keyword.declaration.view.aura"));
+  assert.ok(scopesAt(tokenized, 8, "from").includes("keyword.declaration.view.aura"));
+  assert.ok(scopesAt(tokenized, 9, "view").includes("keyword.declaration.view.aura"));
+  assert.equal(
+    scopesAt(tokenized, 11, "view").includes("keyword.declaration.view.aura"),
+    false
+  );
 });
 
 test("extension highlights and snippets the maintained extern C surface", () => {

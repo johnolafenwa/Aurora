@@ -440,7 +440,36 @@ struct DirectTaskRuntimeState {
     call_frames: DirectCallFrameStorage,
     task_ancestry: DirectTaskAncestry,
     fallback_cancellation: CancellationContext,
-    returned_view_projection: Option<String>,
+    returned_view_frames: Vec<DirectReturnedViewFrame>,
+    pending_mutable_sinks: Option<DirectPendingMutableSinks>,
+    mutable_sinks: HashMap<i64, DirectMutableWritebackSink>,
+    next_mutable_sink_id: i64,
+}
+
+#[derive(Default)]
+struct DirectReturnedViewFrame {
+    returned: Option<String>,
+    pending_child: Option<String>,
+    mutable_sinks: Vec<i64>,
+}
+
+enum DirectPendingMutableSinks {
+    Direct(Vec<i64>),
+    Indirect {
+        public: Vec<i64>,
+        captures: Vec<(usize, i64)>,
+    },
+}
+
+#[derive(Clone)]
+struct DirectMutableWritebackSink {
+    slot: Arc<Mutex<DirectMutableWritebackSlot>>,
+    projection: String,
+}
+
+struct DirectMutableWritebackSlot {
+    root: Value,
+    cleanup_registration_id: i64,
 }
 
 impl Default for DirectTaskRuntimeState {
@@ -457,7 +486,10 @@ impl Default for DirectTaskRuntimeState {
             call_frames: DirectCallFrameStorage::Empty,
             task_ancestry: DirectTaskAncestry::default(),
             fallback_cancellation: CancellationContext::default(),
-            returned_view_projection: None,
+            returned_view_frames: Vec::new(),
+            pending_mutable_sinks: None,
+            mutable_sinks: HashMap::new(),
+            next_mutable_sink_id: 1,
         }
     }
 }
@@ -754,6 +786,20 @@ fn next_direct_cleanup_id(state: &mut DirectTaskRuntimeState) -> i64 {
     }
     state.next_cleanup_id = next_id;
     id
+}
+
+fn next_direct_mutable_sink_id(state: &mut DirectTaskRuntimeState) -> i64 {
+    loop {
+        let id = state.next_mutable_sink_id;
+        let mut next_id = id.checked_add(1).unwrap_or(1);
+        if next_id == 0 {
+            next_id = 1;
+        }
+        state.next_mutable_sink_id = next_id;
+        if id != 0 && !state.mutable_sinks.contains_key(&id) {
+            return id;
+        }
+    }
 }
 
 fn push_direct_cleanup_registration(thunk_ptr: i64, args: *mut i64, arg_count: usize) -> i64 {
@@ -3661,15 +3707,27 @@ pub unsafe extern "C-unwind" fn aura_direct_enter_call_with_frame(
         function: function.clone(),
         span: DirectRuntimeSourceSpan::point(path, start),
     };
-    let depth_exceeded = with_direct_task_runtime_state(|state| {
+    let (depth_exceeded, invalid_pending_sinks) = with_direct_task_runtime_state(|state| {
         if state.call_depth >= DIRECT_MAX_CALL_DEPTH {
-            true
+            (true, false)
         } else {
+            let mutable_sinks = match state.pending_mutable_sinks.take() {
+                Some(DirectPendingMutableSinks::Direct(sinks)) => sinks,
+                Some(DirectPendingMutableSinks::Indirect { .. }) => return (false, true),
+                None => Vec::new(),
+            };
             state.call_depth += 1;
             state.call_frames.push(frame);
-            false
+            state.returned_view_frames.push(DirectReturnedViewFrame {
+                mutable_sinks,
+                ..DirectReturnedViewFrame::default()
+            });
+            (false, false)
         }
     });
+    if invalid_pending_sinks {
+        runtime_error("direct mutable write-through sinks were not prepared for a concrete call");
+    }
     if depth_exceeded {
         reject_direct_call_depth(line, column, &function);
     }
@@ -3681,6 +3739,13 @@ pub unsafe extern "C-unwind" fn aura_direct_exit_call() {
         if state.call_depth > 0 {
             state.call_depth -= 1;
             let _ = state.call_frames.pop();
+            let returned = state
+                .returned_view_frames
+                .pop()
+                .and_then(|frame| frame.returned);
+            if let Some(parent) = state.returned_view_frames.last_mut() {
+                parent.pending_child = returned;
+            }
         }
     });
 }
@@ -3954,6 +4019,7 @@ pub extern "C-unwind" fn aura_direct_function_call(
         let arg_count = usize::try_from(arg_count)
             .unwrap_or_else(|_| runtime_error("invalid indirect-call arg count"));
         let Some(environment) = &function.closure_environment else {
+            prepare_indirect_direct_mutable_sinks(0);
             return unsafe { thunk(args, arg_count) };
         };
         let captures = environment
@@ -3982,6 +4048,7 @@ pub extern "C-unwind" fn aura_direct_function_call(
             buffer.handles.push(value);
             unsafe { *args.add(index) = 0 };
         }
+        prepare_indirect_direct_mutable_sinks(capture_count);
         let result = unsafe { thunk(buffer.handles.as_mut_ptr(), buffer.handles.len()) };
         for index in mutable_capture_indices {
             let handle = buffer.handles[index] as *mut OpaqueValue;
@@ -7480,6 +7547,290 @@ pub extern "C-unwind" fn aura_direct_arg_buffer_store_owned(
     })
 }
 
+fn direct_mutable_sink_projection(path: String) -> String {
+    if !path.is_empty() && path.split('.').any(str::is_empty) {
+        runtime_error(format!(
+            "invalid direct mutable write-through projection `{path}`"
+        ));
+    }
+    path
+}
+
+fn replace_direct_cleanup_registration_value(id: i64, root: &Value) {
+    if id == 0 {
+        return;
+    }
+    let root = try_clone_array_containing_value(root)
+        .unwrap_or_else(|error| runtime_diagnostic_error(error));
+    let replacement = boxed_value(root);
+    unregister_direct_owned_value(replacement);
+    let replaced = with_direct_task_runtime_state(|state| {
+        let Some(registration) = state
+            .cleanup_stack
+            .iter_mut()
+            .find(|registration| registration.id == id)
+        else {
+            return Ok(None);
+        };
+        if registration.arg_count != 1 || registration.args.is_null() {
+            return Err(format!(
+                "direct mutable write-through sink `{id}` targets an invalid cleanup registration"
+            ));
+        }
+        let previous = unsafe { *registration.args } as *mut OpaqueValue;
+        unsafe {
+            *registration.args = replacement as i64;
+        }
+        Ok(Some(previous))
+    });
+    match replaced {
+        Ok(Some(previous)) => unsafe {
+            release_untracked_value(previous);
+        },
+        Ok(None) => unsafe {
+            release_untracked_value(replacement);
+        },
+        Err(message) => {
+            unsafe {
+                release_untracked_value(replacement);
+            }
+            runtime_error(message);
+        }
+    }
+}
+
+fn install_pending_direct_mutable_sinks(pending: DirectPendingMutableSinks) {
+    let replaced = with_direct_task_runtime_state(|state| {
+        state.pending_mutable_sinks.replace(pending).is_some()
+    });
+    if replaced {
+        runtime_error("direct mutable write-through sink handoff was overwritten before use");
+    }
+}
+
+fn prepare_indirect_direct_mutable_sinks(capture_count: usize) {
+    let pending = with_direct_task_runtime_state(|state| state.pending_mutable_sinks.take());
+    let Some(pending) = pending else {
+        return;
+    };
+    let DirectPendingMutableSinks::Indirect { public, captures } = pending else {
+        runtime_error("direct function-value call received a concrete mutable sink handoff");
+    };
+    let total = capture_count
+        .checked_add(public.len())
+        .unwrap_or_else(|| runtime_error("direct mutable sink buffer is too large"));
+    let mut combined = vec![0; total];
+    for (index, sink) in captures {
+        let Some(slot) = combined.get_mut(index) else {
+            runtime_error(format!(
+                "direct closure mutable sink index {index} is out of bounds for {capture_count} captures"
+            ));
+        };
+        if index >= capture_count {
+            runtime_error(format!(
+                "direct closure mutable sink index {index} is out of bounds for {capture_count} captures"
+            ));
+        }
+        *slot = sink;
+    }
+    combined[capture_count..].copy_from_slice(&public);
+    install_pending_direct_mutable_sinks(DirectPendingMutableSinks::Direct(combined));
+}
+
+#[cfg_attr(not(coverage), no_mangle)]
+pub extern "C-unwind" fn aura_direct_set_next_mutable_sinks(
+    sinks_ptr: *const i64,
+    sink_count: i64,
+) {
+    task_runtime_boundary(|| {
+        let sink_count = usize::try_from(sink_count)
+            .unwrap_or_else(|_| runtime_error("invalid direct mutable sink count"));
+        let sinks = if sink_count == 0 {
+            Vec::new()
+        } else {
+            if sinks_ptr.is_null() {
+                runtime_error("direct mutable sink buffer is null");
+            }
+            unsafe { slice::from_raw_parts(sinks_ptr, sink_count) }.to_vec()
+        };
+        install_pending_direct_mutable_sinks(DirectPendingMutableSinks::Direct(sinks));
+    })
+}
+
+#[cfg_attr(not(coverage), no_mangle)]
+pub extern "C-unwind" fn aura_direct_set_next_indirect_mutable_sinks(
+    public_sinks_ptr: *const i64,
+    public_sink_count: i64,
+    capture_indices_ptr: *const i64,
+    capture_sinks_ptr: *const i64,
+    capture_sink_count: i64,
+) {
+    task_runtime_boundary(|| {
+        let public_sink_count = usize::try_from(public_sink_count)
+            .unwrap_or_else(|_| runtime_error("invalid direct public mutable sink count"));
+        let capture_sink_count = usize::try_from(capture_sink_count)
+            .unwrap_or_else(|_| runtime_error("invalid direct capture mutable sink count"));
+        let public = if public_sink_count == 0 {
+            Vec::new()
+        } else {
+            if public_sinks_ptr.is_null() {
+                runtime_error("direct public mutable sink buffer is null");
+            }
+            unsafe { slice::from_raw_parts(public_sinks_ptr, public_sink_count) }.to_vec()
+        };
+        let captures = if capture_sink_count == 0 {
+            Vec::new()
+        } else {
+            if capture_indices_ptr.is_null() || capture_sinks_ptr.is_null() {
+                runtime_error("direct capture mutable sink buffer is null");
+            }
+            let indices = unsafe { slice::from_raw_parts(capture_indices_ptr, capture_sink_count) };
+            let sinks = unsafe { slice::from_raw_parts(capture_sinks_ptr, capture_sink_count) };
+            indices
+                .iter()
+                .zip(sinks)
+                .map(|(index, sink)| {
+                    (
+                        usize::try_from(*index).unwrap_or_else(|_| {
+                            runtime_error("invalid direct capture mutable sink index")
+                        }),
+                        *sink,
+                    )
+                })
+                .collect()
+        };
+        install_pending_direct_mutable_sinks(DirectPendingMutableSinks::Indirect {
+            public,
+            captures,
+        });
+    })
+}
+
+#[cfg_attr(not(coverage), no_mangle)]
+pub extern "C-unwind" fn aura_direct_current_mutable_sink(index: i64) -> i64 {
+    task_runtime_boundary(|| {
+        let index = usize::try_from(index)
+            .unwrap_or_else(|_| runtime_error("invalid direct mutable sink index"));
+        with_direct_task_runtime_state(|state| {
+            state
+                .returned_view_frames
+                .last()
+                .and_then(|frame| frame.mutable_sinks.get(index))
+                .copied()
+                .unwrap_or(0)
+        })
+    })
+}
+
+#[cfg_attr(not(coverage), no_mangle)]
+pub extern "C-unwind" fn aura_direct_mutable_sink_new(
+    cleanup_registration_id: i64,
+    root: *mut OpaqueValue,
+    projection_ptr: *const u8,
+    projection_len: usize,
+) -> i64 {
+    task_runtime_boundary(|| {
+        let root = unsafe { consume_owned_value(root) };
+        if cleanup_registration_id == 0 {
+            return 0;
+        }
+        let projection =
+            direct_mutable_sink_projection(decode_bytes(projection_ptr, projection_len));
+        with_direct_task_runtime_state(|state| {
+            let id = next_direct_mutable_sink_id(state);
+            state.mutable_sinks.insert(
+                id,
+                DirectMutableWritebackSink {
+                    slot: Arc::new(Mutex::new(DirectMutableWritebackSlot {
+                        root,
+                        cleanup_registration_id,
+                    })),
+                    projection,
+                },
+            );
+            id
+        })
+    })
+}
+
+#[cfg_attr(not(coverage), no_mangle)]
+pub extern "C-unwind" fn aura_direct_mutable_sink_project(
+    parent_id: i64,
+    projection_ptr: *const u8,
+    projection_len: usize,
+) -> i64 {
+    task_runtime_boundary(|| {
+        if parent_id == 0 {
+            return 0;
+        }
+        let projection =
+            direct_mutable_sink_projection(decode_bytes(projection_ptr, projection_len));
+        let parent =
+            with_direct_task_runtime_state(|state| state.mutable_sinks.get(&parent_id).cloned())
+                .unwrap_or_else(|| runtime_error("unknown direct mutable write-through sink"));
+        let projection = match (parent.projection.is_empty(), projection.is_empty()) {
+            (true, _) => projection,
+            (_, true) => parent.projection,
+            (false, false) => format!("{}.{}", parent.projection, projection),
+        };
+        with_direct_task_runtime_state(|state| {
+            let id = next_direct_mutable_sink_id(state);
+            state.mutable_sinks.insert(
+                id,
+                DirectMutableWritebackSink {
+                    slot: parent.slot,
+                    projection,
+                },
+            );
+            id
+        })
+    })
+}
+
+#[cfg_attr(not(coverage), no_mangle)]
+pub extern "C-unwind" fn aura_direct_mutable_sink_store_owned(
+    sink_id: i64,
+    value: *mut OpaqueValue,
+) {
+    task_runtime_boundary(|| {
+        let value = unsafe { consume_owned_value(value) };
+        if sink_id == 0 {
+            return;
+        }
+        let sink =
+            with_direct_task_runtime_state(|state| state.mutable_sinks.get(&sink_id).cloned())
+                .unwrap_or_else(|| runtime_error("unknown direct mutable write-through sink"));
+        let (root, cleanup_registration_id) = {
+            let mut slot = sink
+                .slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if sink.projection.is_empty() {
+                slot.root = value;
+            } else {
+                let segments = sink.projection.split('.').collect::<Vec<_>>();
+                set_direct_instance_field_owned(&mut slot.root, &segments, &sink.projection, value)
+                    .unwrap_or_else(|message| runtime_error(message));
+            }
+            let root = try_clone_array_containing_value(&slot.root)
+                .unwrap_or_else(|error| runtime_diagnostic_error(error));
+            (root, slot.cleanup_registration_id)
+        };
+        replace_direct_cleanup_registration_value(cleanup_registration_id, &root);
+    })
+}
+
+#[cfg_attr(not(coverage), no_mangle)]
+pub extern "C-unwind" fn aura_direct_mutable_sink_release(sink_id: i64) {
+    task_runtime_boundary(|| {
+        if sink_id != 0 {
+            with_direct_task_runtime_state(|state| {
+                state.mutable_sinks.remove(&sink_id);
+            });
+        }
+    })
+}
+
 #[cfg_attr(not(coverage), no_mangle)]
 pub extern "C-unwind" fn aura_direct_register_cleanup(
     thunk_ptr: i64,
@@ -7592,7 +7943,10 @@ pub extern "C-unwind" fn aura_direct_set_returned_view_projection(
     task_runtime_boundary(|| {
         let projection = decode_bytes(projection_ptr, projection_len);
         with_direct_task_runtime_state(|state| {
-            state.returned_view_projection = Some(projection);
+            let frame = state.returned_view_frames.last_mut().unwrap_or_else(|| {
+                runtime_error("direct returned-view handoff has no active call frame")
+            });
+            frame.returned = Some(projection);
         });
     })
 }
@@ -7604,11 +7958,13 @@ pub extern "C-unwind" fn aura_direct_take_returned_view_projection(
 ) -> i64 {
     task_runtime_boundary(|| {
         let projections = unsafe { slice::from_raw_parts(projections_ptr, projections_len) };
-        let selected =
-            with_direct_task_runtime_state(|state| state.returned_view_projection.take())
-                .unwrap_or_else(|| {
-                    runtime_error("direct returned view has no transferred projection")
-                });
+        let selected = with_direct_task_runtime_state(|state| {
+            state
+                .returned_view_frames
+                .last_mut()
+                .and_then(|frame| frame.pending_child.take())
+        })
+        .unwrap_or_else(|| runtime_error("direct returned view has no transferred projection"));
         projections
             .split(|byte| *byte == 0)
             .position(|projection| projection == selected.as_bytes())

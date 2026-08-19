@@ -1,6 +1,6 @@
 # Task Board
 
-Last updated: 2026-08-16
+Last updated: 2026-08-19
 
 ## ADR-0038 loans and views (complete)
 
@@ -23,18 +23,56 @@ Last updated: 2026-08-16
 - The ADR is ratified. The Manual, tutorials, maintained example, generated
   agent documentation, language server, and editor tooling are updated in the
   same change family.
-- Verification is green: 365 CLI tests, 1,707 compiler library tests, all
-  integration and fixture suites, the forced MIR/direct fixture matrix (1
-  aggregate, 0 mismatches), 110 LSP tests, 25 extension tests, and 100% LSP
-  coverage. Compiler coverage is 94.78% regions, 97.23% functions, and 96.37%
-  lines. Reference integrity, 339 tutorial fences, the production docs build,
-  formatting, Clippy, npm/Cargo audit, and hygiene pass.
-- The live npm audit disclosed a transitive `nanoid <3.3.18` advisory during
-  final verification. The lockfile now resolves the compatible patched 3.3.18
-  release and npm reports zero vulnerabilities.
-- Protected user files remain untouched: `personal/file_ops.au` and the
-  untracked ADR-0022 draft.
-- Work note: `work/2026-08-16-adr0038-loans-and-views.md`.
+- Independent implementation reviews, a final Sol Max review, and a Daybreak
+  vulnerability review are closed. Review fixes cover returned-view ownership/storage, exact nested
+  last use, reborrow suspension, trait and module-qualified contracts, precise
+  footprints, closure-loan moves/aggregate escape/canonical capture sources,
+  capture acquisition order, MIR authority validation, returned-view
+  forwarding, direct control-flow parity, LSP provenance/completion, contextual
+  TextMate scopes, and maintained documentation drift. Follow-up fixes also
+  cover selected-path cleanup in nested control flow, outgoing-return cleanup,
+  grouped closures, closure-held child suspension, tuple-index reborrowing,
+  non-consuming non-Copy tuple views, multi-alternative forwarding, wrapped
+  aggregate escape, canonical mutable-view capture writeback, call-frame-scoped
+  projection handoff, dynamic capture descriptors, lexical-local-first callee
+  resolution, Copy-view escape, loan-bearing closure flow, and path-local
+  branch expiry.
+- The checked-source forwarding panic is repaired as a correctness defect. A
+  follow-up availability finding in adversarial serialized-MIR loan-path
+  expansion is fixed by deduplicating projections and enforcing a 4 MiB
+  cumulative expanded-path ceiling, including chained reborrows and active CFG
+  state, before allocation in both validation and execution. A compact
+  serialized regression under 64 KiB proves rejection while an ordinary
+  serialized control still executes.
+- Whole-function MIR validation now covers duplicate labels, every successor,
+  canonical/type-valid projections, and unreachable blocks. Direct lowering
+  uses reachable CFG-propagated view state instead of storage-order-global
+  metadata, and returned-view handoff is scoped to the active call frame.
+- Final review-fix verification is green: 137 focused ADR-0038 compiler tests,
+  all 1,819 compiler library tests, CLI integration coverage with 371/374
+  passing under parallel load and all three timing-sensitive cases passing
+  exact isolated reruns, 31/31 CLI unit tests, native-codegen acceptance,
+  111 LSP tests, and 27 extension tests. The two subsequently added CLI
+  regressions for trait-order identity and projected operator writeback pass on
+  both backends. The complete forced MIR/direct runtime-fixture matrix passes
+  with fallback disabled and local loopback enabled (1/1 aggregate,
+  1,186.97 seconds). Reference integrity, all 340 tutorial fences, all 129
+  verified Aura Manual blocks, generated LLM-document freshness, the
+  production docs build, formatting, and Clippy with warnings denied pass.
+- The earlier implementation baseline also recorded a green forced MIR/direct
+  fixture matrix, 100% LSP coverage, compiler coverage of 94.78% regions,
+  97.23% functions, and 96.37% lines, plus zero npm vulnerabilities after the
+  compatible `nanoid` update. Coverage was not repeated for this review-fix
+  pass; the full forced-backend matrix was repeated and passed.
+- Fresh independent post-fix semantic, returned-view, public-MIR,
+  native-parity, and TextMate audits confirm their original repros are closed;
+  the one order-sensitive trait-summary residual found during recheck and the
+  projected `BorrowMut` operator mismatch exposed by the exhaustive parity
+  matrix were fixed and regressed before completion.
+- Protected user files remain untouched: `personal/file_ops.au`, the untracked
+  ADR-0022 draft, and the untracked `.swp` file.
+- Work notes: `work/2026-08-16-adr0038-loans-and-views.md` and
+  `work/2026-08-17-adr0038-review-fixes.md`.
 
 ## ADR-0045/ADR-0049 checkpoint cleanup (complete)
 

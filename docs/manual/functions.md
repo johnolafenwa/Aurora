@@ -243,11 +243,17 @@ parameter origin:
     class User:
         name: str
 
+    class Counter:
+        value: int64
+
     def name(user: User) -> view str from user:
         return view user.name
 
-    def name_mut(user: mut User) -> view mut str from user:
-        return view mut user.name
+    def value_mut(counter: mut Counter) -> view mut int64 from counter:
+        return view mut counter.value
+
+    def bump(value: mut int64):
+        value += 1
 
 The `from` origin is mandatory and belongs to the signature. It is encoded by
 receiver/parameter slot across modules and trait conformance, so an
@@ -258,14 +264,23 @@ shared result may use a bare or `mut` origin. A mutable result requires a
 Every reachable `return view` must trace to the origin or one of its supported
 fixed field or tuple projections. Locals, temporaries, enum arm payloads, and
 newly allocated values cannot escape. At a call, the origin argument must be
-an addressable place and the result must initialize a matching local view:
+an addressable place. A returned view may initialize a matching local `view`
+or `view mut` binding. A shared result may instead be read directly within one
+containing expression, and a mutable result may be immediately reborrowed into
+a `mut` call. A returned view cannot initialize an ordinary owned binding or
+be stored inside an aggregate.
 
-    mut user = User(name="Ada")
+    user = User(name="Ada")
     view current = name(user)
     print(current)
+    print(name(user))
 
-    view mut editable = name_mut(user)
-    editable = "Grace"
+    mut counter = Counter(value=0)
+    view mut editable = value_mut(counter)
+    editable += 1
+    print(counter.value)
+    bump(value_mut(counter))
+    print(counter.value)
 
 Return paths may select different fixed projections of the one declared
 origin. The caller locks that origin conservatively and execution retains the
@@ -480,14 +495,15 @@ implementation-defined.
 ## Status
 
 The function, method, generic, capture-free function-value, default-argument,
-named-argument, owned-return, inferred clone-safety, task-target, and
-entrypoint contracts described above are implemented. Supplied/default
+named-argument, ordinary owned-return, returned-view, inferred clone-safety,
+task-target, and entrypoint contracts described above are implemented. Supplied/default
 evaluation and argument capture follow
 `architecture_docs/decisions/0015-explicit-and-default-argument-order.md`,
 which is **Accepted**. The rules are pinned
 by
 `crates/aura-compiler/tests/fixtures/run-pass/explicit_and_default_argument_order.au`
-on both backends. Return values are owned. By-value expression closures are
-implemented under Accepted ADR-0037. FFI v0 adds bodyless direct-call-only
+on both backends. Ordinary `-> T` return values are owned; only an explicit
+`-> view [mut] T from origin` contract returns non-owning access. By-value
+expression closures are implemented under Accepted ADR-0037. FFI v0 adds bodyless direct-call-only
 `extern "C" def` declarations; they are not function values and their
 restricted signatures are specified by [FFI v0](/manual/ffi).

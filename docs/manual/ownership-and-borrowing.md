@@ -246,7 +246,7 @@ Block-local bindings do not escape their branch, arm, loop, or `with` body. See 
 
 ## Owned Returns
 
-Every function return transfers an owned value to its caller. Copy values are
+Every ordinary `-> T` function return transfers an owned value to its caller. Copy values are
 ordinary independent copies. A non-copy return must come from an owned source:
 
 ```aura
@@ -281,19 +281,41 @@ ordinary parameter:
     class User:
         name: str
 
+    class Counter:
+        value: int64
+
     def name(user: User) -> view str from user:
         return view user.name
 
-    def name_mut(user: mut User) -> view mut str from user:
-        return view mut user.name
+    def value_mut(counter: mut Counter) -> view mut int64 from counter:
+        return view mut counter.value
+
+    def bump(value: mut int64):
+        value += 1
+
+    def main():
+        user = User(name="Ada")
+        view current = name(user)
+        print(current)
+        print(name(user))
+
+        mut counter = Counter(value=0)
+        view mut editable = value_mut(counter)
+        editable += 1
+        print(counter.value)
+        bump(value_mut(counter))
+        print(counter.value)
 
 The origin is part of the callable contract. A shared result may originate
 from bare or mutable access; a mutable result requires a `mut` origin. An
 `own` or defaulted parameter, callee local, temporary, or newly allocated
-value cannot be an origin. A caller must supply an addressable origin and bind
-the result with a matching `view` form. Trait implementations must use the
-same receiver or parameter slot as the trait declaration even if parameter
-names differ.
+value cannot be an origin. A caller must supply an addressable origin. The
+result may initialize a matching `view` or `view mut` binding; alternatively,
+a shared result may be read directly within one containing expression and a
+mutable result may be immediately reborrowed into a `mut` call. Ordinary owned
+bindings and aggregate storage cannot receive a returned view. Trait
+implementations must use the same receiver or parameter slot as the trait
+declaration even if parameter names differ.
 
 Different return paths may select different fixed projections of the declared
 origin; the caller locks that origin conservatively while execution retains the

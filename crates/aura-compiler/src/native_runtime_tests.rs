@@ -57,22 +57,62 @@ fn bool_value(value: bool) -> *mut OpaqueValue {
 
 #[test]
 fn adr0038_direct_returned_view_projection_handoff_is_exact_and_consuming() {
+    unsafe {
+        super::aura_direct_enter_call(1, 1, b"caller".as_ptr(), b"caller".len());
+        super::aura_direct_enter_call(1, 1, b"callee".as_ptr(), b"callee".len());
+    }
     let selected = b"right";
     super::aura_direct_set_returned_view_projection(selected.as_ptr(), selected.len());
+    unsafe {
+        super::aura_direct_exit_call();
+    }
     let projections = b"left\0right";
     assert_eq!(
         super::aura_direct_take_returned_view_projection(projections.as_ptr(), projections.len()),
         1
     );
-    assert!(super::with_direct_task_runtime_state(|state| state
-        .returned_view_projection
-        .is_none()));
+    unsafe {
+        super::aura_direct_exit_call();
+    }
+}
+
+#[test]
+fn adr0038_direct_returned_view_handoffs_are_call_frame_scoped() {
+    unsafe {
+        super::aura_direct_enter_call(1, 1, b"caller".as_ptr(), b"caller".len());
+        super::aura_direct_enter_call(1, 1, b"outer".as_ptr(), b"outer".len());
+    }
+    super::aura_direct_set_returned_view_projection(b"right".as_ptr(), b"right".len());
+
+    unsafe {
+        super::aura_direct_enter_call(1, 1, b"cleanup".as_ptr(), b"cleanup".len());
+        super::aura_direct_enter_call(1, 1, b"nested".as_ptr(), b"nested".len());
+    }
+    super::aura_direct_set_returned_view_projection(b"left".as_ptr(), b"left".len());
+    unsafe {
+        super::aura_direct_exit_call();
+        super::aura_direct_exit_call();
+        super::aura_direct_exit_call();
+    }
+
+    let projections = b"left\0right";
+    assert_eq!(
+        super::aura_direct_take_returned_view_projection(projections.as_ptr(), projections.len()),
+        1,
+        "the cleanup call's returned projection must not replace the outer return"
+    );
+    unsafe {
+        super::aura_direct_exit_call();
+    }
 }
 
 #[test]
 fn adr0038_direct_returned_view_projection_handoff_reports_invalid_state() {
     assert_eq!(
         capture_direct_boundary_error_message(|| {
+            unsafe {
+                super::aura_direct_enter_call(1, 1, b"caller".as_ptr(), b"caller".len());
+            }
             let projections = b"left\0right";
             super::aura_direct_take_returned_view_projection(
                 projections.as_ptr(),
@@ -84,7 +124,14 @@ fn adr0038_direct_returned_view_projection_handoff_reports_invalid_state() {
     assert_eq!(
         capture_direct_boundary_error_message(|| {
             let selected = b"middle";
+            unsafe {
+                super::aura_direct_enter_call(1, 1, b"caller".as_ptr(), b"caller".len());
+                super::aura_direct_enter_call(1, 1, b"callee".as_ptr(), b"callee".len());
+            }
             super::aura_direct_set_returned_view_projection(selected.as_ptr(), selected.len());
+            unsafe {
+                super::aura_direct_exit_call();
+            }
             let projections = b"left\0right";
             super::aura_direct_take_returned_view_projection(
                 projections.as_ptr(),
@@ -168,6 +215,68 @@ fn adr0038_direct_nested_place_assignment_helper_covers_tuple_and_class_paths() 
             .expect_err("scalar values cannot receive projected assignment")
             .contains("cannot assign field `value` on non-instance")
     );
+}
+
+#[test]
+fn adr0038_direct_mutable_sink_updates_projected_cleanup_snapshot_before_return() {
+    super::with_direct_task_runtime_scope(|| {
+        let initial = Value::Instance(InstanceValue {
+            class_name: "Outer".to_string(),
+            fields: BTreeMap::from([(
+                "inner".to_string(),
+                Value::Instance(InstanceValue {
+                    class_name: "Inner".to_string(),
+                    fields: BTreeMap::from([(
+                        "value".to_string(),
+                        Value::Int(IntegerValue::from_signed(1)),
+                    )]),
+                }),
+            )]),
+        });
+        let cleanup_args = super::aura_direct_arg_buffer_new(1);
+        super::aura_direct_arg_buffer_store_owned(
+            cleanup_args,
+            0,
+            boxed_value(initial.clone()) as i64,
+        );
+        let cleanup_id = super::push_direct_cleanup_registration(1, cleanup_args, 1);
+
+        let parent = super::aura_direct_mutable_sink_new(
+            cleanup_id,
+            boxed_value(initial),
+            b"inner".as_ptr(),
+            b"inner".len(),
+        );
+        let sink =
+            super::aura_direct_mutable_sink_project(parent, b"value".as_ptr(), b"value".len());
+        super::aura_direct_set_next_mutable_sinks(&sink, 1);
+        unsafe {
+            super::aura_direct_enter_call(1, 1, b"mutate".as_ptr(), b"mutate".len());
+        }
+        assert_eq!(super::aura_direct_current_mutable_sink(0), sink);
+        super::aura_direct_mutable_sink_store_owned(sink, int_value(9));
+
+        let snapshot = super::with_direct_task_runtime_state(|state| {
+            let registration = state
+                .cleanup_stack
+                .iter()
+                .find(|registration| registration.id == cleanup_id)
+                .expect("the outer cleanup registration should remain in place");
+            unsafe { value_ref(*registration.args as *mut OpaqueValue) }
+        });
+        assert_eq!(snapshot.render(), "Outer(inner=Inner(value=9))");
+
+        unsafe {
+            super::aura_direct_exit_call();
+        }
+        super::aura_direct_mutable_sink_release(sink);
+        super::aura_direct_mutable_sink_release(parent);
+        drop(super::take_direct_cleanup_registration(cleanup_id));
+        super::with_direct_task_runtime_state(|state| {
+            assert!(state.mutable_sinks.is_empty());
+            assert!(state.pending_mutable_sinks.is_none());
+        });
+    });
 }
 
 #[test]

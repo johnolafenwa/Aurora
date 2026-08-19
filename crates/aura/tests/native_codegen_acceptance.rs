@@ -31,11 +31,11 @@ fn public_object_codegen_infers_host_and_wait_result_types() {
                     ty: tasks_type,
                 },
                 MirLocalType {
-                    name: "%host".to_string(),
+                    name: "host_result".to_string(),
                     ty: Type::named("Unknown"),
                 },
                 MirLocalType {
-                    name: "%wait".to_string(),
+                    name: "wait_result".to_string(),
                     ty: Type::named("Unknown"),
                 },
             ],
@@ -52,14 +52,14 @@ fn public_object_codegen_infers_host_and_wait_result_types() {
                         },
                     },
                     Instruction::Assign {
-                        target: "%host".to_string(),
+                        target: "host_result".to_string(),
                         value: Rvalue::Call {
                             callee: CallTarget::Name("sys::args".to_string()),
                             args: Vec::new(),
                         },
                     },
                     Instruction::Assign {
-                        target: "%wait".to_string(),
+                        target: "wait_result".to_string(),
                         value: Rvalue::Call {
                             callee: CallTarget::Name("wait_any".to_string()),
                             args: vec![MirArg {

@@ -95,6 +95,7 @@ printed-output order unless they explicitly coordinate that order.
     - `2`
     - `9`
     - `(10, 21)`
+    - `(11, 32)`
 - `borrow_parameters.au`
   - free-function bare shared and `mut` parameters with caller-visible mutation
   - prints:

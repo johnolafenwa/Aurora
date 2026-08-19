@@ -8,10 +8,94 @@ use crate::integer::IntegerValue;
 use crate::sema::{binary_operator_trait, unary_operator_trait, ModuleNamespace, TraitBound};
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn checked_program(source: &str) -> Program {
     crate::check_source(source).expect("source should type check")
+}
+
+fn assert_public_boundaries_reject(module: &MirModule, expected: &str) {
+    let runtime =
+        crate::run_mir(module).expect_err("in-memory public MIR execution must reject invalid MIR");
+    assert!(runtime.message.contains(expected), "{}", runtime.message);
+
+    let serialized = serde_json::to_vec(module).expect("invalid MIR should serialize");
+    let runtime = crate::run_serialized_mir(&serialized, "<forged>", "")
+        .expect_err("serialized public MIR execution must reject invalid MIR");
+    assert!(runtime.message.contains(expected), "{}", runtime.message);
+
+    let direct = crate::native_codegen::emit_host_object(module)
+        .expect_err("the direct backend must use the common MIR validator");
+    assert!(direct.contains(expected), "{direct}");
+}
+
+fn add_test_returned_view_callee(
+    module: &mut MirModule,
+    name: &str,
+    origin_ty: Type,
+    projections: &[String],
+    mutable: bool,
+) {
+    assert!(!projections.is_empty());
+    let return_labels = (0..projections.len())
+        .map(|index| format!("{name}_return_{index}"))
+        .collect::<Vec<_>>();
+    let mut blocks = vec![BasicBlock {
+        label: format!("{name}_entry"),
+        instructions: Vec::new(),
+        terminator: Terminator::Match {
+            scrutinee: Operand::Bool(true),
+            arms: return_labels
+                .iter()
+                .map(|label| MirMatchArm {
+                    enum_name: None,
+                    variant_name: None,
+                    wildcard: true,
+                    label: label.clone(),
+                })
+                .collect(),
+            otherwise: return_labels[0].clone(),
+        },
+    }];
+    blocks.extend(
+        return_labels
+            .into_iter()
+            .zip(projections)
+            .map(|(label, projection)| BasicBlock {
+                label,
+                instructions: vec![Instruction::ReturnLoan {
+                    loan: if projection.is_empty() {
+                        "origin".to_string()
+                    } else {
+                        format!("origin.{projection}")
+                    },
+                    origin: "origin".to_string(),
+                }],
+                terminator: Terminator::Return(Operand::Unit),
+            }),
+    );
+    module.functions.push(MirFunction {
+        name: name.to_string(),
+        module_name: "<test>".to_string(),
+        source_path: None,
+        span: Span::new(1, 1),
+        receiver: None,
+        params: vec![MirParam {
+            name: "origin".to_string(),
+            passing: if mutable {
+                MirReceiverKind::BorrowMut
+            } else {
+                MirReceiverKind::Borrow
+            },
+            ty: origin_ty.clone(),
+            default_function: None,
+        }],
+        local_types: Vec::new(),
+        return_type: origin_ty,
+        entry: format!("{name}_entry"),
+        blocks,
+    });
 }
 
 #[test]
@@ -45,6 +129,2110 @@ def main():
 }
 
 #[test]
+fn adr0038_recursive_returned_view_cycles_use_a_conservative_root_descriptor() {
+    let module = crate::lower_source_to_mir(
+        r#"
+def recurse(value: int64) -> view int64 from value:
+    return view recurse(value)
+
+def main():
+    value = 1
+    view selected = recurse(value)
+    print(selected)
+"#,
+    )
+    .expect("a checked recursive returned-view SCC must still lower valid descriptors");
+    let returned_loans = module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction {
+            Instruction::BeginReturnedLoan { projections, .. } => Some(projections),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!returned_loans.is_empty());
+    assert!(
+        returned_loans
+            .iter()
+            .all(|projections| projections == &&vec![String::new()]),
+        "recursive projection-less forwarding should conservatively use the origin root: {returned_loans:?}"
+    );
+}
+
+#[test]
+fn adr0038_loan_validator_rejects_capability_forgery_and_unbalanced_paths() {
+    let module = crate::lower_source_to_mir(
+        r#"
+def main():
+    value = 1
+    view parent = value
+    view child = parent
+    print(child)
+"#,
+    )
+    .expect("valid shared reborrow source should lower");
+    validate_loan_flow(&module).expect("source-produced loan flow should validate");
+
+    let mut escalated = module.clone();
+    let reborrow = escalated
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match instruction {
+            Instruction::Reborrow { mutable, .. } => Some(mutable),
+            _ => None,
+        })
+        .expect("the child view should lower as a reborrow");
+    *reborrow = true;
+    let error = validate_loan_flow(&escalated)
+        .expect_err("serialized MIR cannot escalate a shared parent loan");
+    assert!(error.contains("escalates shared parent"), "{error}");
+
+    let mut unterminated = module;
+    let block = unterminated
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .find(|block| {
+            block
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::EndLoan { .. }))
+        })
+        .expect("the lowered source should end its loans");
+    block
+        .instructions
+        .retain(|instruction| !matches!(instruction, Instruction::EndLoan { .. }));
+    let error = validate_loan_flow(&unterminated)
+        .expect_err("every ordinary return path must end its live loans");
+    assert!(error.contains("returns with active loans"), "{error}");
+
+    let mut forged_capture = crate::lower_source_to_mir(
+        r#"
+def main():
+    mut left = [1]
+    mut right = [2]
+    mut update: def(int64) -> None = lambda [mut left] item: left.append(item)
+    update(3)
+"#,
+    )
+    .expect("ordinary mutable closure capture should lower");
+    let mut forged_dynamic_capture = forged_capture.clone();
+    let resolve_source_at_capture = forged_dynamic_capture
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match instruction {
+            Instruction::Assign {
+                value: Rvalue::Closure { captures, .. },
+                ..
+            } => captures
+                .first_mut()
+                .map(|capture| &mut capture.resolve_source_at_capture),
+            _ => None,
+        })
+        .expect("mutable closure capture should retain resolution metadata");
+    *resolve_source_at_capture = true;
+    let error = validate_loan_flow(&forged_dynamic_capture)
+        .expect_err("ordinary captures cannot forge dynamic returned-view resolution");
+    assert!(error.contains("active returned-view descriptor"), "{error}");
+
+    let capture = forged_dynamic_capture
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match instruction {
+            Instruction::Assign {
+                value: Rvalue::Closure { captures, .. },
+                ..
+            } => captures.first_mut(),
+            _ => None,
+        })
+        .expect("the forged closure capture should remain available");
+    capture.passing = MirReceiverKind::Value;
+    capture.source_place = None;
+    let error = validate_loan_flow(&forged_dynamic_capture)
+        .expect_err("owned captures cannot request returned-view source resolution");
+    assert!(error.contains("value closure capture"), "{error}");
+
+    let source = forged_capture
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match instruction {
+            Instruction::Assign {
+                value: Rvalue::Closure { captures, .. },
+                ..
+            } => captures
+                .first_mut()
+                .and_then(|capture| capture.source_place.as_mut()),
+            _ => None,
+        })
+        .expect("mutable closure capture should retain its source");
+    *source = "right".to_string();
+    let error = validate_loan_flow(&forged_capture)
+        .expect_err("serialized MIR cannot redirect a borrowed closure capture");
+    assert!(error.contains("has unrelated source `right`"), "{error}");
+}
+
+#[test]
+fn adr0038_public_mir_rejects_named_function_signature_forgery() {
+    let mut forged = crate::lower_source_to_mir(
+        r#"
+class Pair:
+    left: int64
+
+def borrow_pair(origin: Pair, fallback: int64 = 0) -> view int64 from origin:
+    return view origin.left
+
+def main():
+    pair = Pair(left=1)
+    view selected = borrow_pair(pair)
+    print(selected)
+"#,
+    )
+    .expect("returned-view function-value fixture should lower");
+
+    let call = forged
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .into_iter()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match instruction {
+            Instruction::Assign {
+                value: Rvalue::Call { callee, args },
+                ..
+            } if matches!(&*callee, CallTarget::Name(name) if name == "borrow_pair") => {
+                Some((callee, args))
+            }
+            _ => None,
+        })
+        .expect("the returned-view call should lower");
+    call.1.truncate(1);
+    *call.0 = CallTarget::Value(Operand::Function {
+        name: "borrow_pair".to_string(),
+        signature: Box::new(Type::Function {
+            params: vec![crate::sema::FunctionParamContract {
+                name: "origin".to_string(),
+                ty: Type::named("Pair"),
+                passing: crate::ast::ReceiverKind::Borrow,
+                has_default: false,
+                default_erased: false,
+            }],
+            return_type: Box::new(Type::named("int64")),
+        }),
+    });
+
+    assert_public_boundaries_reject(&forged, "does not match declaration");
+}
+
+#[test]
+fn adr0038_public_mir_rejects_mutable_argument_writeback_forgery() {
+    let source = r#"
+class Pair:
+    left: int64
+
+def inspect(origin: Pair, scratch: mut Pair) -> view int64 from origin:
+    scratch.left = scratch.left
+    return view origin.left
+
+def main():
+    origin = Pair(left=1)
+    mut scratch = Pair(left=2)
+    mut redirect = Pair(left=3)
+    view selected = inspect(origin, scratch)
+    print(selected)
+"#;
+    let baseline = crate::lower_source_to_mir(source)
+        .expect("mutable returned-view argument fixture should lower");
+    validate_loan_flow(&baseline).expect("source-produced mutable writeback should validate");
+
+    let mutate_call =
+        |module: &mut MirModule, update: &mut dyn FnMut(&mut CallTarget, &mut Vec<MirArg>)| {
+            let (callee, args) = module
+                .functions
+                .iter_mut()
+                .find(|function| function.name == "main")
+                .into_iter()
+                .flat_map(|function| &mut function.blocks)
+                .flat_map(|block| &mut block.instructions)
+                .find_map(|instruction| match instruction {
+                    Instruction::Assign {
+                        value: Rvalue::Call { callee, args },
+                        ..
+                    } if matches!(&*callee, CallTarget::Name(name) if name == "inspect") => {
+                        Some((callee, args))
+                    }
+                    _ => None,
+                })
+                .expect("inspect call should lower");
+            update(callee, args);
+        };
+
+    let mut redirected = baseline.clone();
+    mutate_call(&mut redirected, &mut |_, args| {
+        args[1].writeback_place = Some("redirect".to_string())
+    });
+    assert_public_boundaries_reject(&redirected, "unrelated mutable writeback place");
+
+    let mut missing = baseline.clone();
+    mutate_call(&mut missing, &mut |_, args| args[1].writeback_place = None);
+    assert_public_boundaries_reject(&missing, "requires a mutable writeback place");
+
+    let mut non_mutable = baseline.clone();
+    mutate_call(&mut non_mutable, &mut |_, args| {
+        args[0].writeback_place = Some("origin".to_string())
+    });
+    assert_public_boundaries_reject(&non_mutable, "writeback for non-mutable parameter");
+
+    let mut omitted = baseline.clone();
+    mutate_call(&mut omitted, &mut |_, args| {
+        args.truncate(1);
+    });
+    assert_public_boundaries_reject(&omitted, "omits required parameter `scratch`");
+
+    let inspect = baseline
+        .functions
+        .iter()
+        .find(|function| function.name == "inspect")
+        .expect("inspect declaration should lower");
+    let signature = Type::Function {
+        params: inspect
+            .params
+            .iter()
+            .map(|param| crate::sema::FunctionParamContract {
+                name: param.name.clone(),
+                ty: param.ty.clone(),
+                passing: match param.passing {
+                    MirReceiverKind::Value => crate::ast::ReceiverKind::Value,
+                    MirReceiverKind::Borrow => crate::ast::ReceiverKind::Borrow,
+                    MirReceiverKind::BorrowMut => crate::ast::ReceiverKind::BorrowMut,
+                },
+                has_default: param.default_function.is_some(),
+                default_erased: false,
+            })
+            .collect(),
+        return_type: Box::new(inspect.return_type.clone()),
+    };
+    let mut exact_function = baseline;
+    mutate_call(&mut exact_function, &mut |callee, args| {
+        *callee = CallTarget::Value(Operand::Function {
+            name: "inspect".to_string(),
+            signature: Box::new(signature.clone()),
+        });
+        args[1].writeback_place = Some("redirect".to_string());
+    });
+    assert_public_boundaries_reject(&exact_function, "unrelated mutable writeback place");
+
+    let mut member = crate::lower_source_to_mir(
+        r#"
+class Pair:
+    left: int64
+
+class Holder:
+    value: int64
+
+    def inspect(self, scratch: mut Pair) -> view int64 from self:
+        scratch.left = scratch.left
+        return view self.value
+
+def main():
+    holder = Holder(value=1)
+    mut scratch = Pair(left=2)
+    mut redirect = Pair(left=3)
+    view selected = holder.inspect(scratch)
+    print(selected)
+"#,
+    )
+    .expect("returned-view member argument fixture should lower");
+    let args = member
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .into_iter()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match instruction {
+            Instruction::Assign {
+                value:
+                    Rvalue::Call {
+                        callee: CallTarget::Member { field, .. },
+                        args,
+                    },
+                ..
+            } if field == "inspect" => Some(args),
+            _ => None,
+        })
+        .expect("returned-view member call should lower");
+    args[0].writeback_place = Some("redirect".to_string());
+    assert_public_boundaries_reject(&member, "unrelated mutable writeback place");
+}
+
+#[test]
+fn adr0038_public_mir_rejects_mutable_capture_escalation_from_shared_input() {
+    let mut forged = crate::lower_source_to_mir(
+        r#"
+def make(source: list[int64]):
+    mut local = [1]
+    mut update: def(int64) -> None = lambda [mut local] item: local.append(item)
+    update(2)
+    print(source.len())
+
+def main():
+    make([1])
+"#,
+    )
+    .expect("ordinary mutable local capture should lower");
+    let capture = forged
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "make")
+        .into_iter()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match instruction {
+            Instruction::Assign {
+                value: Rvalue::Closure { captures, .. },
+                ..
+            } => captures
+                .iter_mut()
+                .find(|capture| capture.passing == MirReceiverKind::BorrowMut),
+            _ => None,
+        })
+        .expect("mutable local capture should lower");
+    capture.value = Operand::Place("source".to_string());
+    capture.source_place = Some("source".to_string());
+
+    assert_public_boundaries_reject(&forged, "escalates shared input `source`");
+
+    let mut forged_unbound_self = forged;
+    let capture = forged_unbound_self
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "make")
+        .into_iter()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match instruction {
+            Instruction::Assign {
+                value: Rvalue::Closure { captures, .. },
+                ..
+            } => captures
+                .iter_mut()
+                .find(|capture| capture.passing == MirReceiverKind::BorrowMut),
+            _ => None,
+        })
+        .expect("mutable capture should remain available");
+    capture.value = Operand::Place("self".to_string());
+    capture.source_place = Some("self".to_string());
+    assert_public_boundaries_reject(&forged_unbound_self, "escalates shared input `self`");
+}
+
+#[test]
+fn adr0038_deep_symbolic_returned_view_contracts_fail_closed_without_stack_overflow() {
+    const HELPER: &str = "AURA_ADR0038_DEEP_CONTRACT_HELPER";
+    const TEST_NAME: &str =
+        "mir::tests::adr0038_deep_symbolic_returned_view_contracts_fail_closed_without_stack_overflow";
+    if std::env::var_os(HELPER).is_none() {
+        for mode in ["mir", "direct"] {
+            let output = Command::new(std::env::current_exe().expect("test binary should exist"))
+                .arg("--exact")
+                .arg(TEST_NAME)
+                .arg("--nocapture")
+                .env(HELPER, mode)
+                .output()
+                .expect("isolated deep-contract validation should run");
+            assert!(
+                output.status.success(),
+                "{mode} deep-contract validation crashed or failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    }
+
+    let mut module = crate::lower_source_to_mir(
+        r#"
+def borrow(origin: int64) -> view int64 from origin:
+    return view origin
+
+def main():
+    value = 1
+    view selected = borrow(value)
+    print(selected)
+"#,
+    )
+    .expect("deep-contract baseline should lower");
+    let function = module
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "borrow")
+        .expect("borrow function should lower");
+    let block = function
+        .blocks
+        .iter_mut()
+        .find(|block| {
+            block
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::ReturnLoan { .. }))
+        })
+        .expect("borrow return block should lower");
+    let return_loan = block
+        .instructions
+        .iter_mut()
+        .find_map(|instruction| match instruction {
+            Instruction::ReturnLoan { loan, .. } => Some(loan),
+            _ => None,
+        })
+        .expect("borrow should retain a ReturnLoan");
+    *return_loan = "loan19999".to_string();
+    let mut chain = Vec::with_capacity(20_000);
+    chain.push(Instruction::BeginLoan {
+        loan: "loan0".to_string(),
+        source: "origin".to_string(),
+        mutable: false,
+    });
+    for index in 1..20_000 {
+        chain.push(Instruction::Reborrow {
+            loan: format!("loan{index}"),
+            parent: format!("loan{}", index - 1),
+            projection: String::new(),
+            mutable: false,
+        });
+    }
+    block.instructions.splice(0..0, chain);
+
+    let expected = "symbolic loan descriptor depth limit";
+    match std::env::var(HELPER).as_deref() {
+        Ok("mir") => {
+            let error =
+                crate::run_mir(&module).expect_err("deep in-memory MIR contracts must fail closed");
+            assert!(error.message.contains(expected), "{}", error.message);
+        }
+        Ok("direct") => {
+            let error = crate::native_codegen::emit_host_object(&module)
+                .expect_err("deep direct MIR contracts must fail closed");
+            assert!(error.contains(expected), "{error}");
+        }
+        mode => panic!("unexpected deep-contract helper mode: {mode:?}"),
+    }
+}
+
+#[test]
+fn adr0038_unreachable_return_loans_cannot_expand_callee_authority() {
+    let mut forged = crate::lower_source_to_mir(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def left(origin: Pair) -> view int64 from origin:
+    return view origin.left
+
+def main():
+    pair = Pair(left=1, right=2)
+    view selected = left(pair)
+    print(selected)
+"#,
+    )
+    .expect("returned-view dead-block fixture should lower");
+    let callee = forged
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "left")
+        .expect("left should lower");
+    callee.blocks.push(BasicBlock {
+        label: "dead_forged_return".to_string(),
+        instructions: vec![Instruction::ReturnLoan {
+            loan: "origin.right".to_string(),
+            origin: "origin".to_string(),
+        }],
+        terminator: Terminator::Return(Operand::Unit),
+    });
+    let projections = forged
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .into_iter()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match instruction {
+            Instruction::BeginReturnedLoan { projections, .. } => Some(projections),
+            _ => None,
+        })
+        .expect("caller should bind the returned view");
+    *projections = vec!["right".to_string()];
+
+    assert_public_boundaries_reject(&forged, "projection contract");
+}
+
+#[test]
+fn adr0038_every_reachable_returned_view_path_requires_a_loan_handoff() {
+    let mut forged = crate::lower_source_to_mir(
+        r#"
+def borrow(origin: int64) -> view int64 from origin:
+    return view origin
+
+def main():
+    value = 1
+    view selected = borrow(value)
+    print(selected)
+"#,
+    )
+    .expect("returned-view path fixture should lower");
+    let callee = forged
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "borrow")
+        .expect("borrow should lower");
+    let original_entry = callee.entry.clone();
+    callee.entry = "forged_dispatch".to_string();
+    callee.blocks.push(BasicBlock {
+        label: "forged_dispatch".to_string(),
+        instructions: Vec::new(),
+        terminator: Terminator::Branch {
+            condition: Operand::Bool(true),
+            then_label: original_entry,
+            else_label: "forged_plain_return".to_string(),
+        },
+    });
+    callee.blocks.push(BasicBlock {
+        label: "forged_plain_return".to_string(),
+        instructions: Vec::new(),
+        terminator: Terminator::Return(Operand::Unit),
+    });
+
+    assert_public_boundaries_reject(&forged, "returns without a returned-loan handoff");
+}
+
+#[test]
+fn adr0038_generic_trait_member_calls_retain_authoritative_trait_identity() {
+    let source = r#"
+trait Other:
+    def get(self) -> view int64 from self
+
+trait Project:
+    def get(self) -> view int64 from self
+
+trait OwnedGet:
+    def get(self) -> int64
+
+trait Marker:
+    def marker(self) -> int64
+
+trait OtherMut:
+    def get_mut(mut self) -> view mut int64 from self
+
+trait ProjectMut:
+    def get_mut(mut self) -> view mut int64 from self
+
+class Box:
+    left: int64
+    right: int64
+
+impl Other for Box:
+    def get(self) -> view int64 from self:
+        return view self.right
+
+impl Project for Box:
+    def get(self) -> view int64 from self:
+        return view self.left
+
+impl OwnedGet for int64:
+    def get(self) -> int64:
+        return self
+
+impl Marker for Box:
+    def marker(self) -> int64:
+        return 0
+
+impl OtherMut for Box:
+    def get_mut(mut self) -> view mut int64 from self:
+        return view mut self.right
+
+impl ProjectMut for Box:
+    def get_mut(mut self) -> view mut int64 from self:
+        return view mut self.left
+
+def forward[T: Project](value: T) -> view int64 from value:
+    return view value.get()
+
+def forward_multi[T: Marker + Project](value: T) -> view int64 from value:
+    return view value.get()
+
+def update[T: ProjectMut](value: mut T):
+    view mut selected = value.get_mut()
+    selected = 9
+
+def main():
+    box = Box(left=1, right=2)
+    view selected = forward(box)
+    print(selected)
+    view multi = forward_multi(box)
+    print(multi)
+    mut mutable_box = Box(left=3, right=4)
+    update(mutable_box)
+    print(mutable_box.left)
+    print(mutable_box.right)
+"#;
+    let module = crate::lower_source_to_mir(source)
+        .expect("unambiguous bounded generic returned-view call should lower");
+    for (function_name, expected_trait) in [
+        ("forward", "Project"),
+        ("forward_multi", "Project"),
+        ("update", "ProjectMut"),
+    ] {
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name == function_name)
+            .unwrap_or_else(|| panic!("{function_name} should lower"));
+        assert!(
+            function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .any(|instruction| matches!(
+                    instruction,
+                    Instruction::Assign {
+                        value:
+                            Rvalue::Call {
+                                callee: CallTarget::TraitMember { trait_name, .. },
+                                ..
+                            },
+                        ..
+                    } if trait_name == expected_trait
+                )),
+            "{function_name} must retain the `{expected_trait}` bound identity in MIR"
+        );
+    }
+    validate_loan_flow(&module)
+        .expect("an unrelated same-name trait must not pollute returned-view authority");
+
+    let mut erased_identity = module.clone();
+    let callee = erased_identity
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "forward")
+        .into_iter()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match instruction {
+            Instruction::Assign {
+                value: Rvalue::Call { callee, .. },
+                ..
+            } if matches!(&*callee, CallTarget::TraitMember { .. }) => Some(callee),
+            _ => None,
+        })
+        .expect("forward should retain its trait member target");
+    let CallTarget::TraitMember {
+        object,
+        field,
+        receiver_place,
+        ..
+    } = callee.clone()
+    else {
+        unreachable!("the selected target was checked above")
+    };
+    *callee = CallTarget::Member {
+        object,
+        field,
+        receiver_place,
+    };
+    assert_public_boundaries_reject(&erased_identity, "requires an authoritative trait identity");
+
+    let output = crate::run_mir(&module)
+        .expect("MIR dispatch must select the trait named by the generic bound");
+    assert_eq!(output.stdout, "1\n1\n9\n4\n");
+    let serialized =
+        serde_json::to_vec(&module).expect("valid bounded-generic MIR should serialize");
+    let serialized = crate::run_serialized_mir(&serialized, "<trait-identity>", "")
+        .expect("serialized MIR must preserve bounded trait dispatch identity");
+    assert_eq!(serialized.stdout, output.stdout);
+    crate::native_codegen::emit_host_object(&module)
+        .expect("direct codegen must accept the same authoritative trait identity");
+}
+
+#[test]
+fn adr0038_specialized_generic_returned_views_ignore_same_named_impl_order() {
+    let declarations = r#"
+trait Project:
+    def get(self) -> view int64 from self
+
+trait Other:
+    def get(self) -> view int64 from self
+
+class Box:
+    left: int64
+    right: int64
+"#;
+    let project_impl = r#"
+impl Project for Box:
+    def get(self) -> view int64 from self:
+        return view self.left
+"#;
+    let other_impl = r#"
+impl Other for Box:
+    def get(self) -> view int64 from self:
+        return view self.right
+"#;
+    let program = r#"
+def forward[T: Project](item: T) -> view int64 from item:
+    return view item.get()
+
+def main():
+    box = Box(left=1, right=2)
+    view selected = forward[Box](box)
+    print(selected)
+"#;
+
+    for (order, first_impl, second_impl) in [
+        ("project-first", project_impl, other_impl),
+        ("other-first", other_impl, project_impl),
+    ] {
+        let source = format!("{declarations}{first_impl}{second_impl}{program}");
+        let module = crate::lower_source_to_mir(&source).unwrap_or_else(|error| {
+            panic!("{order} bounded returned-view specialization should lower: {error}")
+        });
+        validate_loan_flow(&module)
+            .unwrap_or_else(|error| panic!("{order} MIR should validate: {error}"));
+        let output = crate::run_mir(&module)
+            .unwrap_or_else(|error| panic!("{order} MIR execution should succeed: {error}"));
+        assert_eq!(output.stdout, "1\n", "{order} selected the wrong trait");
+
+        let serialized = serde_json::to_vec(&module).expect("valid MIR should serialize");
+        let serialized = crate::run_serialized_mir(&serialized, "<trait-order>", "")
+            .unwrap_or_else(|error| panic!("{order} serialized MIR should run: {error}"));
+        assert_eq!(serialized.stdout, "1\n", "{order} serialized drifted");
+        crate::native_codegen::emit_host_object(&module)
+            .unwrap_or_else(|error| panic!("{order} direct codegen should succeed: {error}"));
+    }
+}
+
+#[test]
+fn adr0038_returned_loan_handoffs_are_bound_to_the_exact_callee_contract() {
+    let baseline = crate::lower_source_to_mir(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def left(pair: Pair) -> view int64 from pair:
+    return view pair.left
+
+def main():
+    pair = Pair(left=1, right=2)
+    other = Pair(left=3, right=4)
+    view selected = left(pair)
+    print(selected)
+"#,
+    )
+    .expect("returned-view contract fixture should lower");
+    validate_loan_flow(&baseline).expect("source-produced returned-view MIR should validate");
+
+    let mutate_handoff =
+        |module: &mut MirModule,
+         mutate_call: &mut dyn FnMut(&mut CallTarget),
+         mutate_loan: &mut dyn FnMut(&mut String, &mut Vec<String>, &mut bool)| {
+            let main = module
+                .functions
+                .iter_mut()
+                .find(|function| function.name == "main")
+                .expect("main should lower");
+            for block in &mut main.blocks {
+                for index in 1..block.instructions.len() {
+                    let (before, after) = block.instructions.split_at_mut(index);
+                    let Instruction::Assign {
+                        value: Rvalue::Call { callee, .. },
+                        ..
+                    } = &mut before[index - 1]
+                    else {
+                        continue;
+                    };
+                    let Instruction::BeginReturnedLoan {
+                        origin,
+                        projections,
+                        mutable,
+                        ..
+                    } = &mut after[0]
+                    else {
+                        continue;
+                    };
+                    mutate_call(callee);
+                    mutate_loan(origin, projections, mutable);
+                    return;
+                }
+            }
+            panic!("fixture should contain an immediately bound returned-view handoff");
+        };
+
+    let mut wrong_callee = baseline.clone();
+    mutate_handoff(
+        &mut wrong_callee,
+        &mut |callee| *callee = CallTarget::Name("abs".to_string()),
+        &mut |_, _, _| {},
+    );
+    let error = validate_loan_flow(&wrong_callee)
+        .expect_err("a non-view call cannot authorize BeginReturnedLoan");
+    assert!(error.contains("does not return a view"), "{error}");
+    assert_public_boundaries_reject(&wrong_callee, "does not return a view");
+
+    let mut wrong_origin = baseline.clone();
+    mutate_handoff(&mut wrong_origin, &mut |_| {}, &mut |origin, _, _| {
+        *origin = "other".to_string()
+    });
+    let error = validate_loan_flow(&wrong_origin)
+        .expect_err("the caller cannot redirect a returned view to another origin");
+    assert!(error.contains("bound origin"), "{error}");
+    assert_public_boundaries_reject(&wrong_origin, "bound origin");
+
+    let mut escalated = baseline.clone();
+    mutate_handoff(&mut escalated, &mut |_| {}, &mut |_, _, mutable| {
+        *mutable = true
+    });
+    let error = validate_loan_flow(&escalated)
+        .expect_err("the caller cannot escalate a shared returned-view contract");
+    assert!(error.contains("mutable capability"), "{error}");
+    assert_public_boundaries_reject(&escalated, "mutable capability");
+
+    let mut redirected_projection = baseline;
+    mutate_handoff(
+        &mut redirected_projection,
+        &mut |_| {},
+        &mut |_, projections, _| *projections = vec!["right".to_string()],
+    );
+    let error = validate_loan_flow(&redirected_projection)
+        .expect_err("the caller cannot replace the callee projection footprint");
+    assert!(error.contains("projection contract"), "{error}");
+    assert_public_boundaries_reject(&redirected_projection, "projection contract");
+
+    let mut nul_projection = wrong_callee;
+    mutate_handoff(
+        &mut nul_projection,
+        &mut |callee| *callee = CallTarget::Name("left".to_string()),
+        &mut |_, projections, _| *projections = vec!["left\0right".to_string()],
+    );
+    let error = validate_loan_flow(&nul_projection)
+        .expect_err("NUL cannot alias projection whitelist entries in the direct backend");
+    assert!(error.contains("non-canonical MIR identifier"), "{error}");
+    assert_public_boundaries_reject(&nul_projection, "non-canonical MIR identifier");
+}
+
+#[test]
+fn adr0038_returned_loan_handoffs_may_narrow_authorized_projection_alternatives() {
+    let mut module =
+        crate::lower_source_to_mir("def main():\n    pass\n").expect("baseline MIR should lower");
+    add_test_returned_view_callee(
+        &mut module,
+        "test_choose_tuple_field",
+        Type::Tuple(vec![Type::named("int64"), Type::named("int64")]),
+        &["0".to_string(), "1".to_string()],
+        false,
+    );
+    let main = module
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .expect("main should exist");
+    main.local_types.extend([
+        MirLocalType {
+            name: "root".to_string(),
+            ty: Type::Tuple(vec![Type::named("int64"), Type::named("int64")]),
+        },
+        MirLocalType {
+            name: "handoff".to_string(),
+            ty: Type::named("int64"),
+        },
+        MirLocalType {
+            name: "selected".to_string(),
+            ty: Type::named("int64"),
+        },
+    ]);
+    main.blocks[0].instructions.extend([
+        Instruction::Assign {
+            target: "handoff".to_string(),
+            value: Rvalue::Call {
+                callee: CallTarget::Name("test_choose_tuple_field".to_string()),
+                args: vec![MirArg {
+                    name: None,
+                    value: Operand::Place("root".to_string()),
+                    writeback_place: None,
+                }],
+            },
+        },
+        Instruction::BeginReturnedLoan {
+            loan: "selected".to_string(),
+            origin: "root".to_string(),
+            projections: vec!["0".to_string()],
+            mutable: false,
+        },
+        Instruction::EndLoan {
+            loan: "selected".to_string(),
+        },
+    ]);
+
+    validate_loan_flow(&module)
+        .expect("a specialized caller may narrow the callee's conservative alternatives");
+
+    let main = module
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .expect("main should exist");
+    let projections = main.blocks[0]
+        .instructions
+        .iter_mut()
+        .find_map(|instruction| match instruction {
+            Instruction::BeginReturnedLoan { projections, .. } => Some(projections),
+            _ => None,
+        })
+        .expect("returned descriptor should exist");
+    *projections = vec!["2".to_string()];
+    let error = validate_loan_flow(&module)
+        .expect_err("narrowing cannot introduce a projection outside callee authority");
+    assert!(error.contains("projection contract"), "{error}");
+}
+
+#[test]
+fn adr0038_multi_alternative_returned_view_captures_resolve_the_selected_source() {
+    fn selected_capture(module: &mut MirModule) -> &mut MirClosureCapture {
+        module
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "main")
+            .into_iter()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.instructions)
+            .find_map(|instruction| match instruction {
+                Instruction::Assign {
+                    value: Rvalue::Closure { captures, .. },
+                    ..
+                } => captures
+                    .iter_mut()
+                    .find(|capture| capture.name == "selected"),
+                _ => None,
+            })
+            .expect("lambda should capture the returned-view descriptor")
+    }
+
+    let baseline = crate::lower_source_to_mir(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def choose(pair: mut Pair, left: bool) -> view mut int64 from pair:
+    if left:
+        return view mut pair.left
+    return view mut pair.right
+
+def assign(value: mut int64, next: int64):
+    value = next
+
+def main():
+    mut pair = Pair(left=1, right=2)
+    view mut selected = choose(pair, false)
+    mut update: def(int64) -> None = lambda [mut selected] next: assign(selected, next)
+    update(9)
+"#,
+    )
+    .expect("dynamic returned-view capture fixture should lower");
+    validate_loan_flow(&baseline).expect("source-produced dynamic capture should validate");
+
+    let mut unresolved = baseline.clone();
+    selected_capture(&mut unresolved).resolve_source_at_capture = false;
+    let error = validate_loan_flow(&unresolved)
+        .expect_err("multi-alternative descriptors must resolve at capture time");
+    assert!(error.contains("selected source at capture"), "{error}");
+
+    let mut statically_redirected = baseline;
+    let capture = selected_capture(&mut statically_redirected);
+    capture.resolve_source_at_capture = false;
+    capture.source_place = Some("pair.left".to_string());
+    let error = validate_loan_flow(&statically_redirected)
+        .expect_err("a capture cannot replace a dynamic descriptor with one static alternative");
+    assert!(error.contains("selected source at capture"), "{error}");
+}
+
+#[test]
+fn adr0038_returned_view_descendant_captures_resolve_the_selected_source() {
+    let module = crate::lower_source_to_mir(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def choose_mut(pair: mut Pair, left: bool) -> view mut int64 from pair:
+    if left:
+        return view mut pair.left
+    return view mut pair.right
+
+def choose_shared(pair: Pair, left: bool) -> view int64 from pair:
+    if left:
+        return view pair.left
+    return view pair.right
+
+def assign(value: mut int64, next: int64):
+    value = next
+
+def main():
+    mut mutable_pair = Pair(left=1, right=2)
+    view mut selected_mut = choose_mut(mutable_pair, false)
+    view mut child_mut = selected_mut
+    mut update: def(int64) -> None = lambda [mut child_mut] next: assign(child_mut, next)
+    update(9)
+
+    shared_pair = Pair(left=3, right=4)
+    view selected_shared = choose_shared(shared_pair, true)
+    view child_shared = selected_shared
+    read: def() -> int64 = lambda [child_shared]: child_shared
+    print(read())
+"#,
+    )
+    .expect("descendants of dynamic returned views should lower");
+
+    let main = module
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+        .expect("main should lower");
+    let captures = main
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction {
+            Instruction::Assign {
+                value: Rvalue::Closure { captures, .. },
+                ..
+            } => Some(captures),
+            _ => None,
+        })
+        .flatten()
+        .filter(|capture| matches!(capture.name.as_str(), "child_mut" | "child_shared"))
+        .collect::<Vec<_>>();
+    assert_eq!(captures.len(), 2, "both descendant captures should lower");
+    for capture in captures {
+        assert_eq!(capture.source_place.as_deref(), Some(capture.name.as_str()));
+        assert!(
+            capture.resolve_source_at_capture,
+            "{} must retain dynamic returned-view selection",
+            capture.name
+        );
+    }
+    validate_loan_flow(&module)
+        .expect("descendant captures must preserve their returned-descriptor ancestry");
+}
+
+#[test]
+fn adr0038_forwarded_returned_call_projections_use_composed_loans() {
+    let module = crate::lower_source_to_mir(
+        r#"
+class Cell:
+    value: int64
+
+class Pair:
+    left: Cell
+    right: Cell
+
+def left_cell(pair: mut Pair) -> view mut Cell from pair:
+    return view mut pair.left
+
+def choose_cell(pair: mut Pair, left: bool) -> view mut Cell from pair:
+    if left:
+        return view mut pair.left
+    return view mut pair.right
+
+def cell_value(cell: mut Cell) -> view mut int64 from cell:
+    return view mut cell.value
+
+def static_forward(pair: mut Pair) -> view mut int64 from pair:
+    return view mut left_cell(pair).value
+
+def dynamic_forward(pair: mut Pair, left: bool) -> view mut int64 from pair:
+    return view mut choose_cell(pair, left).value
+
+def nested_forward(pair: mut Pair, left: bool) -> view mut int64 from pair:
+    return view mut cell_value(choose_cell(pair, left))
+
+def main():
+    pass
+"#,
+    )
+    .expect("static, dynamic, and nested returned-view forwarding should lower");
+
+    validate_loan_flow(&module)
+        .expect("forwarded child projections must use an immediate call handoff and reborrow");
+    for function_name in ["static_forward", "dynamic_forward"] {
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name == function_name)
+            .expect("forwarding function should lower");
+        assert!(
+            function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .any(|instruction| matches!(instruction, Instruction::Reborrow { projection, .. } if projection == "value")),
+            "{function_name} should compose the returned descriptor with a child reborrow"
+        );
+    }
+}
+
+#[test]
+fn adr0038_returned_view_contracts_preserve_local_descriptor_suffixes() {
+    let module = crate::lower_source_to_mir(
+        r#"
+class Cell:
+    value: int64
+
+class CellPair:
+    left: Cell
+    right: Cell
+
+def choose_cell(pair: mut CellPair, left: bool) -> view mut Cell from pair:
+    if left:
+        return view mut pair.left
+    return view mut pair.right
+
+def class_child(pair: mut CellPair, left: bool) -> view mut int64 from pair:
+    view mut selected = choose_cell(pair, left)
+    return view mut selected.value
+
+class TuplePair:
+    left: (int64, int64)
+    right: (int64, int64)
+
+def choose_tuple(pair: mut TuplePair, left: bool) -> view mut (int64, int64) from pair:
+    if left:
+        return view mut pair.left
+    return view mut pair.right
+
+def tuple_child(pair: mut TuplePair, left: bool) -> view mut int64 from pair:
+    view mut selected = choose_tuple(pair, left)
+    return view mut selected[1]
+
+def main():
+    mut cells = CellPair(left=Cell(value=1), right=Cell(value=2))
+    view mut cell_value = class_child(cells, false)
+    cell_value = 9
+    print(cells)
+
+    mut tuples = TuplePair(left=(3, 4), right=(5, 6))
+    view mut tuple_value = tuple_child(tuples, true)
+    tuple_value = 8
+    print(tuples)
+"#,
+    )
+    .expect("local returned descriptors should allow class and tuple child forwarding");
+
+    for (function_name, expected) in [
+        ("class_child", ["left.value", "right.value"]),
+        ("tuple_child", ["left.1", "right.1"]),
+    ] {
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name == function_name)
+            .expect("child forwarding function should lower");
+        let contract = function_returned_view_contract(function)
+            .expect("source-produced returned-view contract should be valid")
+            .expect("child forwarding function should expose a returned-view contract");
+        assert_eq!(contract.projections.as_ref(), expected.as_slice());
+    }
+
+    validate_loan_flow(&module)
+        .expect("callers must receive the full class or tuple child projection authority");
+    let mir = crate::run_mir(&module).expect("public MIR execution should accept the contract");
+    assert_eq!(
+        mir.stdout,
+        "CellPair(left=Cell(value=1), right=Cell(value=9))\nTuplePair(left=(3, 8), right=(5, 6))\n"
+    );
+    let serialized = serde_json::to_vec(&module).expect("valid MIR should serialize");
+    let serialized = crate::run_serialized_mir(&serialized, "<test>", "")
+        .expect("serialized public MIR execution should preserve child authority");
+    assert_eq!(serialized.stdout, mir.stdout);
+    crate::native_codegen::emit_host_object(&module)
+        .expect("the direct backend should accept the same public MIR contract");
+}
+
+#[test]
+fn adr0038_member_effect_validation_uses_declared_receiver_passing() {
+    let mut user_method = crate::lower_source_to_mir(
+        r#"
+class Counter:
+    value: int64
+
+    def inspect(self) -> int64:
+        return self.value
+
+    def tweak(mut self) -> int64:
+        self.value += 1
+        return self.value
+
+def main():
+    mut counter = Counter(value=1)
+    view held = counter
+    print(counter.inspect())
+    print(held.value)
+"#,
+    )
+    .expect("user receiver fixture should lower");
+    let field = user_method
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .into_iter()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match instruction {
+            Instruction::Assign {
+                value:
+                    Rvalue::Call {
+                        callee: CallTarget::Member { field, .. },
+                        ..
+                    },
+                ..
+            } if field == "inspect" => Some(field),
+            _ => None,
+        })
+        .expect("inspect call should lower as a member call");
+    *field = "tweak".to_string();
+    let error = validate_loan_flow(&user_method)
+        .expect_err("an arbitrary user method name cannot hide a mutable receiver effect");
+    assert!(error.contains("mutates locked place `counter`"), "{error}");
+
+    let mut trait_method = crate::lower_source_to_mir(
+        r#"
+trait Observe:
+    def inspect(self) -> int64
+    def adjust(mut self) -> int64
+
+class Counter:
+    value: int64
+
+impl Observe for Counter:
+    def inspect(self) -> int64:
+        return self.value
+
+    def adjust(mut self) -> int64:
+        self.value += 1
+        return self.value
+
+def main():
+    mut counter = Counter(value=1)
+    view held = counter
+    print(counter.inspect())
+    print(held.value)
+"#,
+    )
+    .expect("trait receiver fixture should lower");
+    let field = trait_method
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .into_iter()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match instruction {
+            Instruction::Assign {
+                value:
+                    Rvalue::Call {
+                        callee: CallTarget::Member { field, .. },
+                        ..
+                    },
+                ..
+            } if field == "inspect" => Some(field),
+            _ => None,
+        })
+        .expect("trait inspect call should lower as a member call");
+    *field = "adjust".to_string();
+    let error = validate_loan_flow(&trait_method)
+        .expect_err("an arbitrary trait method name cannot hide a mutable receiver effect");
+    assert!(error.contains("mutates locked place `counter`"), "{error}");
+
+    let mut builtin = crate::lower_source_to_mir(
+        r#"
+def main():
+    mut values = [1, 2]
+    view held = values
+    print(values.contains(1))
+    print(held)
+"#,
+    )
+    .expect("builtin receiver fixture should lower");
+    let field = builtin
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .into_iter()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match instruction {
+            Instruction::Assign {
+                value:
+                    Rvalue::Call {
+                        callee: CallTarget::Member { field, .. },
+                        ..
+                    },
+                ..
+            } if field == "contains" => Some(field),
+            _ => None,
+        })
+        .expect("contains call should lower as a member call");
+    *field = "reserve".to_string();
+    let error = validate_loan_flow(&builtin)
+        .expect_err("a builtin omitted from a field allowlist must retain its mutable effect");
+    assert!(error.contains("mutates locked place `values`"), "{error}");
+}
+
+#[test]
+fn adr0038_mutable_member_receivers_cannot_redirect_writeback() {
+    let mut module = crate::lower_source_to_mir(
+        r#"
+class Counter:
+    value: int64
+
+    def increment(mut self):
+        self.value += 1
+
+def main():
+    mut left = Counter(value=1)
+    mut right = Counter(value=2)
+    left.increment()
+"#,
+    )
+    .expect("mutable receiver fixture should lower");
+    let receiver_place = module
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .into_iter()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match instruction {
+            Instruction::Assign {
+                value:
+                    Rvalue::Call {
+                        callee:
+                            CallTarget::Member {
+                                field,
+                                receiver_place,
+                                ..
+                            },
+                        ..
+                    },
+                ..
+            } if field == "increment" => Some(receiver_place),
+            _ => None,
+        })
+        .expect("increment should lower as a member call");
+    assert_eq!(receiver_place.as_deref(), Some("left"));
+    *receiver_place = Some("right".to_string());
+
+    let error = validate_loan_flow(&module)
+        .expect_err("mutable receiver writeback cannot target another valid place");
+    assert!(error.contains("redirects receiver `left`"), "{error}");
+    assert!(error.contains("writeback place `right`"), "{error}");
+    assert_public_boundaries_reject(&module, "redirects receiver `left`");
+}
+
+#[test]
+fn adr0038_loan_identifiers_and_active_descriptor_names_are_bounded() {
+    let make_module = |loan_names: Vec<String>| {
+        let mut module =
+            crate::lower_source_to_mir("def main():\n    pass\n").expect("baseline MIR");
+        let main = module
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "main")
+            .expect("main should exist");
+        for (index, loan) in loan_names.iter().enumerate() {
+            let source = format!("source_{index}");
+            main.local_types.push(MirLocalType {
+                name: source.clone(),
+                ty: Type::TypeParam("T".to_string()),
+            });
+            main.local_types.push(MirLocalType {
+                name: loan.clone(),
+                ty: Type::TypeParam("T".to_string()),
+            });
+            main.blocks[0].instructions.push(Instruction::BeginLoan {
+                loan: loan.clone(),
+                source,
+                mutable: false,
+            });
+        }
+        for loan in loan_names.into_iter().rev() {
+            main.blocks[0]
+                .instructions
+                .push(Instruction::EndLoan { loan });
+        }
+        module
+    };
+
+    for loan in ["bad\0name", "bad\nname", "%t01", "café"] {
+        let error = validate_loan_flow(&make_module(vec![loan.to_string()]))
+            .expect_err("public MIR loan names must use one canonical printable spelling");
+        assert!(error.contains("non-canonical MIR identifier"), "{error}");
+    }
+
+    let nul = make_module(vec!["bad\0name".to_string()]);
+    let runtime =
+        crate::run_mir(&nul).expect_err("in-memory MIR must reject NUL-bearing descriptor names");
+    assert!(runtime.message.contains("non-canonical MIR identifier"));
+    let serialized = serde_json::to_vec(&nul).expect("NUL-bearing MIR should serialize as JSON");
+    let runtime = crate::run_serialized_mir(&serialized, "<nul>", "")
+        .expect_err("serialized MIR must reject NUL-bearing descriptor names");
+    assert!(runtime.message.contains("non-canonical MIR identifier"));
+    let direct = crate::native_codegen::emit_host_object(&nul)
+        .expect_err("direct codegen must share canonical identifier validation");
+    assert!(direct.contains("non-canonical MIR identifier"), "{direct}");
+
+    let too_many = (0..=1_024).map(|index| format!("loan_{index}")).collect();
+    let error = validate_loan_flow(&make_module(too_many))
+        .expect_err("active descriptors must be capped before pairwise validation work");
+    assert!(error.contains("active loan descriptor limit"), "{error}");
+
+    let long_names = (0..128)
+        .map(|index| format!("loan_{index}_{}", "x".repeat(520)))
+        .collect();
+    let error = validate_loan_flow(&make_module(long_names))
+        .expect_err("active descriptor names need a cumulative byte budget");
+    assert!(error.contains("active loan-name byte limit"), "{error}");
+}
+
+#[test]
+fn adr0038_nested_fixed_places_render_without_placeholder_segments() {
+    let module = crate::lower_source_to_mir(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def main():
+    mut wrapper = (Pair(left=1, right=2), 3)
+    view mut field = wrapper[0].right
+    field = 9
+"#,
+    )
+    .expect("nested fixed place should lower");
+    let main = module
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+        .expect("main should lower");
+    assert!(main
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .any(|instruction| matches!(
+            instruction,
+            Instruction::BeginLoan { source, .. } if source == "wrapper.0.right"
+        )));
+    assert!(!main
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .any(|instruction| format!("{instruction:?}").contains("<expr>")));
+}
+
+#[test]
+fn adr0038_loan_validator_rejects_alias_spelling_moves_and_use_after_end() {
+    let make_module = |instructions: Vec<Instruction>| MirModule {
+        constants: Vec::new(),
+        functions: vec![MirFunction {
+            name: "main".to_string(),
+            module_name: "<test>".to_string(),
+            source_path: None,
+            span: Span::new(1, 1),
+            receiver: None,
+            params: Vec::new(),
+            local_types: vec![
+                MirLocalType {
+                    name: "pair".to_string(),
+                    ty: Type::Tuple(vec![Type::named("int64"), Type::named("int64")]),
+                },
+                MirLocalType {
+                    name: "value".to_string(),
+                    ty: Type::named("str"),
+                },
+                MirLocalType {
+                    name: "other".to_string(),
+                    ty: Type::named("str"),
+                },
+                MirLocalType {
+                    name: "alias".to_string(),
+                    ty: Type::named("str"),
+                },
+            ],
+            return_type: Type::named("int32"),
+            entry: "entry".to_string(),
+            blocks: vec![BasicBlock {
+                label: "entry".to_string(),
+                instructions,
+                terminator: Terminator::Return(Operand::Int(0)),
+            }],
+        }],
+        classes: Vec::new(),
+        trait_impls: Vec::new(),
+        top_level: None,
+    };
+
+    let numeric_alias = make_module(vec![
+        Instruction::BeginLoan {
+            loan: "left".to_string(),
+            source: "pair.01".to_string(),
+            mutable: true,
+        },
+        Instruction::BeginLoan {
+            loan: "right".to_string(),
+            source: "pair.1".to_string(),
+            mutable: true,
+        },
+        Instruction::EndLoan {
+            loan: "right".to_string(),
+        },
+        Instruction::EndLoan {
+            loan: "left".to_string(),
+        },
+    ]);
+    let error = validate_loan_flow(&numeric_alias)
+        .expect_err("tuple positions must use one canonical spelling");
+    assert!(error.contains("non-canonical"), "{error}");
+
+    let self_shadow = make_module(vec![
+        Instruction::BeginLoan {
+            loan: "value".to_string(),
+            source: "value".to_string(),
+            mutable: false,
+        },
+        Instruction::EndLoan {
+            loan: "value".to_string(),
+        },
+    ]);
+    let error = validate_loan_flow(&self_shadow)
+        .expect_err("a loan descriptor cannot shadow its own source root");
+    assert!(error.contains("shadows its source root"), "{error}");
+
+    let moved = make_module(vec![
+        Instruction::BeginLoan {
+            loan: "alias".to_string(),
+            source: "value".to_string(),
+            mutable: false,
+        },
+        Instruction::Assign {
+            target: "other".to_string(),
+            value: Rvalue::Use(Operand::MovePlace("value".to_string())),
+        },
+        Instruction::EndLoan {
+            loan: "alias".to_string(),
+        },
+    ]);
+    let error =
+        validate_loan_flow(&moved).expect_err("rvalue moves must not consume a loaned source");
+    assert!(error.contains("moves locked place"), "{error}");
+
+    let use_after_end = make_module(vec![
+        Instruction::BeginLoan {
+            loan: "alias".to_string(),
+            source: "value".to_string(),
+            mutable: false,
+        },
+        Instruction::EndLoan {
+            loan: "alias".to_string(),
+        },
+        Instruction::Eval {
+            value: Operand::Place("alias".to_string()),
+        },
+    ]);
+    let error = validate_loan_flow(&use_after_end)
+        .expect_err("ended loan descriptors cannot be used as ordinary places");
+    assert!(error.contains("uses ended loan"), "{error}");
+}
+
+#[test]
+fn adr0038_return_loan_is_linear_and_returned_paths_are_bounded() {
+    let mut module =
+        crate::lower_source_to_mir("def main():\n    pass\n").expect("baseline MIR should lower");
+    let main = module
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .expect("main should exist");
+    main.local_types.push(MirLocalType {
+        name: "origin".to_string(),
+        ty: Type::Tuple(vec![Type::named("int64"), Type::named("int64")]),
+    });
+    main.blocks[0].instructions.insert(
+        0,
+        Instruction::ReturnLoan {
+            loan: "origin".to_string(),
+            origin: "origin".to_string(),
+        },
+    );
+    let error = validate_loan_flow(&module)
+        .expect_err("ReturnLoan cannot manufacture a returned-view contract from a local origin");
+    assert!(error.contains("uses non-parameter origin"), "{error}");
+
+    let mut bounded =
+        crate::lower_source_to_mir("def main():\n    pass\n").expect("baseline MIR should lower");
+    let bounded_projections = vec!["0".to_string(), "1".to_string()];
+    add_test_returned_view_callee(
+        &mut bounded,
+        "test_choose_tuple_field",
+        Type::TypeParam("T".to_string()),
+        &bounded_projections,
+        false,
+    );
+    let main = bounded
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .expect("main should exist");
+    main.local_types.push(MirLocalType {
+        name: "root".to_string(),
+        ty: Type::Tuple(vec![Type::named("int64"), Type::named("int64")]),
+    });
+    for depth in 0..14 {
+        main.local_types.push(MirLocalType {
+            name: format!("loan{depth}"),
+            ty: Type::named("int64"),
+        });
+        main.local_types.push(MirLocalType {
+            name: format!("handoff{depth}"),
+            ty: Type::named("int64"),
+        });
+        main.blocks[0].instructions.push(Instruction::Assign {
+            target: format!("handoff{depth}"),
+            value: Rvalue::Call {
+                callee: CallTarget::Name("test_choose_tuple_field".to_string()),
+                args: vec![MirArg {
+                    name: None,
+                    value: Operand::Place(if depth == 0 {
+                        "root".to_string()
+                    } else {
+                        format!("loan{}", depth - 1)
+                    }),
+                    writeback_place: None,
+                }],
+            },
+        });
+        main.blocks[0]
+            .instructions
+            .push(Instruction::BeginReturnedLoan {
+                loan: format!("loan{depth}"),
+                origin: if depth == 0 {
+                    "root".to_string()
+                } else {
+                    format!("loan{}", depth - 1)
+                },
+                projections: bounded_projections.clone(),
+                mutable: false,
+            });
+    }
+    for depth in (0..14).rev() {
+        main.blocks[0].instructions.push(Instruction::EndLoan {
+            loan: format!("loan{depth}"),
+        });
+    }
+    let error = validate_loan_flow(&bounded)
+        .expect_err("returned-view alternatives need a deterministic expansion budget");
+    assert!(error.contains("alternative limit"), "{error}");
+}
+
+#[test]
+fn adr0038_mir_structure_is_validated_before_reachability() {
+    let baseline =
+        crate::lower_source_to_mir("def main():\n    pass\n").expect("baseline MIR should lower");
+
+    let mut duplicate = baseline.clone();
+    let main = duplicate
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .expect("main should exist");
+    main.blocks.push(BasicBlock {
+        label: main.entry.clone(),
+        instructions: Vec::new(),
+        terminator: Terminator::Return(Operand::Unit),
+    });
+    let error = validate_loan_flow(&duplicate)
+        .expect_err("duplicate block labels must not be hidden by map construction");
+    assert!(error.contains("duplicate block label"), "{error}");
+
+    let mut unknown_dead_successor = baseline;
+    let main = unknown_dead_successor
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .expect("main should exist");
+    main.blocks.push(BasicBlock {
+        label: "dead".to_string(),
+        instructions: Vec::new(),
+        terminator: Terminator::Goto("missing".to_string()),
+    });
+    let error = validate_loan_flow(&unknown_dead_successor)
+        .expect_err("unknown successors must be rejected even in unreachable blocks");
+    assert!(error.contains("unknown block `missing`"), "{error}");
+
+    let runtime_error = crate::mir_runtime::run(&unknown_dead_successor)
+        .expect_err("the MIR backend must use the common structural validator");
+    assert!(runtime_error.message.contains("unknown block `missing`"));
+    let direct_error = crate::native_codegen::emit_host_object(&unknown_dead_successor)
+        .expect_err("the direct backend must use the common structural validator");
+    assert!(
+        direct_error.contains("unknown block `missing`"),
+        "{direct_error}"
+    );
+}
+
+#[test]
+fn adr0038_mir_reborrow_and_returned_projections_are_canonical_and_type_valid() {
+    let make_module = |origin_ty: Type,
+                       parent_ty: Type,
+                       child_ty: Type,
+                       classes: Vec<MirClass>,
+                       instructions: Vec<Instruction>| MirModule {
+        constants: Vec::new(),
+        functions: vec![MirFunction {
+            name: "main".to_string(),
+            module_name: "<test>".to_string(),
+            source_path: None,
+            span: Span::new(1, 1),
+            receiver: None,
+            params: Vec::new(),
+            local_types: vec![
+                MirLocalType {
+                    name: "origin".to_string(),
+                    ty: origin_ty,
+                },
+                MirLocalType {
+                    name: "parent".to_string(),
+                    ty: parent_ty,
+                },
+                MirLocalType {
+                    name: "child".to_string(),
+                    ty: child_ty,
+                },
+                MirLocalType {
+                    name: "handoff".to_string(),
+                    ty: Type::named("int64"),
+                },
+            ],
+            return_type: Type::Unit,
+            entry: "entry".to_string(),
+            blocks: vec![BasicBlock {
+                label: "entry".to_string(),
+                instructions,
+                terminator: Terminator::Return(Operand::Unit),
+            }],
+        }],
+        classes,
+        trait_impls: Vec::new(),
+        top_level: None,
+    };
+    let tuple_ty = Type::Tuple(vec![Type::named("int64"), Type::named("int64")]);
+
+    for projection in ["01", "2"] {
+        let module = make_module(
+            tuple_ty.clone(),
+            tuple_ty.clone(),
+            Type::named("int64"),
+            Vec::new(),
+            vec![
+                Instruction::BeginLoan {
+                    loan: "parent".to_string(),
+                    source: "origin".to_string(),
+                    mutable: false,
+                },
+                Instruction::Reborrow {
+                    loan: "child".to_string(),
+                    parent: "parent".to_string(),
+                    projection: projection.to_string(),
+                    mutable: false,
+                },
+                Instruction::EndLoan {
+                    loan: "child".to_string(),
+                },
+                Instruction::EndLoan {
+                    loan: "parent".to_string(),
+                },
+            ],
+        );
+        let error = validate_loan_flow(&module)
+            .expect_err("forged tuple reborrow projections must be rejected centrally");
+        assert!(
+            error.contains(if projection == "01" {
+                "non-canonical"
+            } else {
+                "out of bounds"
+            }),
+            "{error}"
+        );
+        if projection == "01" {
+            let runtime_error = crate::mir_runtime::run(&module)
+                .expect_err("the MIR backend must reject non-canonical reborrows centrally");
+            assert!(runtime_error.message.contains("non-canonical"));
+            let direct_error = crate::native_codegen::emit_host_object(&module)
+                .expect_err("the direct backend must reject non-canonical reborrows centrally");
+            assert!(direct_error.contains("non-canonical"), "{direct_error}");
+        }
+    }
+
+    let pair = MirClass {
+        name: "Pair".to_string(),
+        type_params: Vec::new(),
+        fields: vec![MirClassField {
+            name: "left".to_string(),
+            ty: Type::named("int64"),
+        }],
+        methods: Vec::new(),
+    };
+    let returned = |projections: Vec<String>| {
+        let mut module = make_module(
+            Type::named("Pair"),
+            Type::named("int64"),
+            Type::named("int64"),
+            vec![pair.clone()],
+            vec![
+                Instruction::Assign {
+                    target: "handoff".to_string(),
+                    value: Rvalue::Call {
+                        callee: CallTarget::Name("test_pair_projection".to_string()),
+                        args: vec![MirArg {
+                            name: None,
+                            value: Operand::Place("origin".to_string()),
+                            writeback_place: None,
+                        }],
+                    },
+                },
+                Instruction::BeginReturnedLoan {
+                    loan: "parent".to_string(),
+                    origin: "origin".to_string(),
+                    projections: projections.clone(),
+                    mutable: false,
+                },
+                Instruction::EndLoan {
+                    loan: "parent".to_string(),
+                },
+            ],
+        );
+        add_test_returned_view_callee(
+            &mut module,
+            "test_pair_projection",
+            Type::named("Pair"),
+            &projections,
+            false,
+        );
+        module
+    };
+    let missing = returned(vec!["left".to_string(), "missing".to_string()]);
+    let error = validate_loan_flow(&missing)
+        .expect_err("every returned-view alternative must name a real field");
+    assert!(error.contains("has no field `missing`"), "{error}");
+
+    validate_loan_flow(&returned(vec!["left".to_string()]))
+        .expect("a canonical, type-valid returned-view projection should remain valid");
+
+    let mut self_shadow = returned(vec![String::new()]);
+    let instructions = &mut self_shadow.functions[0].blocks[0].instructions;
+    let Instruction::BeginReturnedLoan { loan, .. } = &mut instructions[1] else {
+        panic!("the probe should contain a returned loan");
+    };
+    *loan = "origin".to_string();
+    let error = validate_loan_flow(&self_shadow)
+        .expect_err("a returned loan descriptor cannot shadow its origin root");
+    assert!(error.contains("shadows its origin root"), "{error}");
+}
+
+#[test]
+fn adr0038_reborrow_expansion_has_cumulative_work_and_active_state_budgets() {
+    let projections = (0..MAX_VALIDATED_LOAN_ALTERNATIVES)
+        .map(|index| index.to_string())
+        .collect::<Vec<_>>();
+    let long_projection = "field".repeat(104);
+    let mut module =
+        crate::lower_source_to_mir("def main():\n    pass\n").expect("baseline MIR should lower");
+    add_test_returned_view_callee(
+        &mut module,
+        "test_many_projections",
+        Type::TypeParam("T".to_string()),
+        &projections,
+        false,
+    );
+    let main = module
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .expect("main should exist");
+    for name in ["origin", "parent", "first", "second"] {
+        main.local_types.push(MirLocalType {
+            name: name.to_string(),
+            ty: Type::TypeParam("T".to_string()),
+        });
+    }
+    main.local_types.push(MirLocalType {
+        name: "handoff".to_string(),
+        ty: Type::named("int64"),
+    });
+    main.blocks[0].instructions.extend([
+        Instruction::Assign {
+            target: "handoff".to_string(),
+            value: Rvalue::Call {
+                callee: CallTarget::Name("test_many_projections".to_string()),
+                args: vec![MirArg {
+                    name: None,
+                    value: Operand::Place("origin".to_string()),
+                    writeback_place: None,
+                }],
+            },
+        },
+        Instruction::BeginReturnedLoan {
+            loan: "parent".to_string(),
+            origin: "origin".to_string(),
+            projections,
+            mutable: false,
+        },
+        Instruction::Reborrow {
+            loan: "first".to_string(),
+            parent: "parent".to_string(),
+            projection: long_projection.clone(),
+            mutable: false,
+        },
+        Instruction::Reborrow {
+            loan: "second".to_string(),
+            parent: "parent".to_string(),
+            projection: long_projection,
+            mutable: false,
+        },
+        Instruction::EndLoan {
+            loan: "second".to_string(),
+        },
+        Instruction::EndLoan {
+            loan: "first".to_string(),
+        },
+        Instruction::EndLoan {
+            loan: "parent".to_string(),
+        },
+    ]);
+    let error = validate_loan_flow(&module)
+        .expect_err("reborrow expansion must be bounded before all paths are materialized");
+    assert!(error.contains("loan-path byte limit"), "{error}");
+}
+
+#[test]
+fn adr0038_generic_trait_views_and_early_return_cleanup_lower_without_panics() {
+    let generic = crate::lower_source_to_mir(
+        r#"
+trait Project:
+    def get(self) -> view int64 from self
+
+class Box:
+    value: int64
+
+impl Project for Box:
+    def get(self) -> view int64 from self:
+        return view self.value
+
+def read[T: Project](item: T) -> int64:
+    view alias = item.get()
+    return alias + 0
+
+def main():
+    print(read(Box(value=7)))
+"#,
+    )
+    .expect("bounded trait returned views should lower through their implementation footprints");
+    validate_loan_flow(&generic).expect("generic trait returned-view MIR should validate");
+
+    let early = crate::lower_source_to_mir(
+        r#"
+def main():
+    mut value = 1
+    view alias = value
+    if false:
+        return
+    print(alias)
+"#,
+    )
+    .expect("cleanup on an untaken early-return edge must not consume fallthrough lowering state");
+    validate_loan_flow(&early).expect("every reachable early-return path should balance its loans");
+}
+
+#[test]
+fn adr0038_branch_local_view_ids_and_existing_view_capture_sources_are_distinct() {
+    let module = crate::lower_source_to_mir(
+        r#"
+def main():
+    mut left = 1
+    mut right = 2
+    if true:
+        view mut selected = left
+        selected = 10
+    else:
+        view mut selected = right
+        selected = 20
+"#,
+    )
+    .expect("branch-local views should lower");
+    let loan_names = module
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+        .into_iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction {
+            Instruction::BeginLoan { loan, .. } => Some(loan.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        loan_names.len(),
+        2,
+        "branch-local aliases need distinct MIR identities"
+    );
+
+    let captured = crate::lower_source_to_mir(
+        r#"
+def main():
+    mut values = [1]
+    view mut editable = values
+    mut update: def(int64) -> None = lambda [mut editable] next: editable.append(next)
+    update(3)
+    print(editable)
+"#,
+    )
+    .expect("capturing an existing mutable view should lower as a contained access");
+    let capture = captured
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+        .into_iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .find_map(|instruction| match instruction {
+            Instruction::Assign {
+                value: Rvalue::Closure { captures, .. },
+                ..
+            } => captures.first(),
+            _ => None,
+        })
+        .expect("closure capture should exist");
+    assert_eq!(capture.source_place.as_deref(), Some("editable"));
+}
+
+#[test]
 fn adr0038_cleanup_ends_local_loans_before_early_exit() {
     let module = crate::lower_source_to_mir(
         r#"
@@ -53,7 +2241,7 @@ class Counter:
 
 def read(counter: Counter) -> int64:
     view value = counter.value
-    return value
+    return value + 0
 
 def loop_once(counter: Counter):
     while true:
@@ -303,6 +2491,161 @@ def main():
             .count()
             >= 2
     );
+}
+
+#[test]
+fn adr0038_module_qualified_returned_views_keep_exported_origin_metadata() {
+    let unique = format!(
+        "aura-mir-returned-view-imports-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should follow the Unix epoch")
+            .as_nanos()
+    );
+    let package = std::env::temp_dir().join(unique);
+    let src = package.join("src");
+    fs::create_dir_all(&src).expect("temporary returned-view package should exist");
+    fs::write(
+        package.join("Aura.toml"),
+        "[package]\nname = \"returned_view_imports\"\nversion = \"0.1.0\"\nedition = \"2026\"\n",
+    )
+    .expect("temporary package manifest should be writable");
+    fs::write(
+        src.join("api.au"),
+        "public def borrow(values: list[int64]) -> view list[int64] from values:\n    return view values\n",
+    )
+    .expect("temporary returned-view module should be writable");
+    let main_path = src.join("main.au");
+    fs::write(
+        &main_path,
+        "import api\n\ndef main():\n    values = [1]\n    view alias = api.borrow(values)\n    print(alias)\n",
+    )
+    .expect("temporary returned-view entry should be writable");
+
+    let module = crate::lower_path_to_mir(&main_path)
+        .expect("qualified exported returned-view calls should lower");
+    let _ = fs::remove_dir_all(&package);
+    let main = module
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+        .expect("main MIR should exist");
+    assert!(main
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .any(|instruction| matches!(
+            instruction,
+            Instruction::BeginReturnedLoan { origin, .. } if origin == "values"
+        )));
+}
+
+#[test]
+fn adr0038_imported_returned_view_forwarding_uses_the_declaration_owner() {
+    let unique = format!(
+        "aura-mir-returned-view-forwarding-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should follow the Unix epoch")
+            .as_nanos()
+    );
+    let package = std::env::temp_dir().join(unique);
+    let src = package.join("src");
+    fs::create_dir_all(&src).expect("temporary forwarding package should exist");
+    fs::write(
+        package.join("Aura.toml"),
+        "[package]\nname = \"returned_view_forwarding\"\nversion = \"0.1.0\"\nedition = \"2026\"\n",
+    )
+    .expect("temporary package manifest should be writable");
+    fs::write(
+        src.join("api.au"),
+        r#"public class Pair:
+    public left: int64
+    public right: int64
+
+public def choose(pair: mut Pair, take_left: bool) -> view mut int64 from pair:
+    if take_left:
+        return view mut pair.left
+    return view mut pair.right
+
+public def forward(pair: mut Pair, take_left: bool) -> view mut int64 from pair:
+    return view mut choose(pair, take_left)
+
+public trait Other:
+    def get(self) -> view int64 from self
+
+public trait Project:
+    def get(self) -> view int64 from self
+
+public class Box:
+    public value: int64
+    public other: int64
+
+impl Other for Box:
+    def get(self) -> view int64 from self:
+        return view self.other
+
+impl Project for Box:
+    def get(self) -> view int64 from self:
+        return view self.value
+
+public def trait_forward[T: Project](item: T) -> view int64 from item:
+    return view item.get()
+
+def inner(pair: Pair) -> view int64 from pair:
+    return view pair.left
+
+public def exact_forward(pair: Pair) -> view int64 from pair:
+    return view inner(pair)
+
+public def identity(pair: Pair) -> view Pair from pair:
+    return view pair
+
+public def nested_exact_forward(pair: Pair) -> view int64 from pair:
+    return view inner((identity(pair)))
+"#,
+    )
+    .expect("temporary returned-view module should be writable");
+    let main_path = src.join("main.au");
+    fs::write(
+        &main_path,
+        r#"import api
+
+def inner(pair: api.Pair) -> view int64 from pair:
+    return view pair.right
+
+def main():
+    mut pair = api.Pair(left=1, right=2)
+    view mut selected = api.forward(pair, false)
+    selected = 9
+    print(pair.right)
+    box = api.Box(value=7, other=8)
+    view value = api.trait_forward(box)
+    print(value)
+    mut exact_pair = api.Pair(left=10, right=20)
+    view exact = api.exact_forward(exact_pair)
+    exact_pair.right = 21
+    print(exact)
+    print(exact_pair.right)
+    mut nested_pair = api.Pair(left=30, right=40)
+    view nested_exact = api.nested_exact_forward(nested_pair)
+    nested_pair.right = 41
+    print(nested_exact)
+    print(nested_pair.right)
+"#,
+    )
+    .expect("temporary returned-view entry should be writable");
+
+    let result = (|| {
+        let module = crate::lower_path_to_mir(&main_path)?;
+        validate_loan_flow(&module).map_err(crate::Diagnostic::new)?;
+        crate::mir_runtime::run(&module)
+    })();
+    let _ = fs::remove_dir_all(&package);
+    let output = result.expect("imported forwarding must lower and execute without a panic");
+    assert_eq!(output.stdout, "9\n7\n10\n21\n30\n41\n");
 }
 
 fn lower_ffi_source(source: &str) -> MirModule {
@@ -1081,6 +3424,41 @@ def main():
 }
 
 #[test]
+fn projected_source_reads_do_not_register_projection_paths_as_mir_locals() {
+    let module = crate::lower_source_to_mir(
+        r#"
+class User:
+    name: str
+    id: int32
+
+def main():
+    mut user = User(name="Ada", id=1)
+    name = user.name
+    print(user.id)
+    user.name = "Grace"
+    print(user.name)
+"#,
+    )
+    .expect("partial-move and reinitialization source should lower");
+    let main = module
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+        .expect("main should lower");
+
+    assert!(
+        main.local_types
+            .iter()
+            .all(|local| !local.name.contains('.')),
+        "projection paths are MIR places, not local identifiers: {:?}",
+        main.local_types
+    );
+    validate_loan_flow(&module).expect("source-generated MIR must pass public MIR validation");
+    let output = crate::run_mir(&module).expect("valid source-generated MIR should execute");
+    assert_eq!(output.stdout, "1\nGrace\n");
+}
+
+#[test]
 fn tuple_patterns_lower_through_element_cfg_not_enum_match() {
     let module = crate::lower_source_to_mir(
         r#"
@@ -1636,6 +4014,253 @@ def zip_loop(left: list[int64], right: list[int64]):
             "{function_name}'s latch must return to its iteration dispatch"
         );
     }
+}
+
+#[test]
+fn queue_iteration_receiver_metadata_tracks_the_materialized_handle() {
+    let module = crate::lower_source_to_mir(
+        r#"
+def drain(jobs: Queue[int64]):
+    for job in jobs:
+        print(job)
+"#,
+    )
+    .expect("queue iteration should lower");
+
+    validate_loan_flow(&module)
+        .expect("source-produced queue iteration must satisfy public MIR validation");
+    let drain = module
+        .functions
+        .iter()
+        .find(|function| function.name == "drain")
+        .expect("drain should lower");
+    let (object, receiver_place) = drain
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .find_map(|instruction| match instruction {
+            Instruction::Assign {
+                value:
+                    Rvalue::Call {
+                        callee:
+                            CallTarget::Member {
+                                object,
+                                field,
+                                receiver_place,
+                            },
+                        ..
+                    },
+                ..
+            } if field == INTERNAL_QUEUE_GET_WITH_REGISTERED_PRODUCERS_FIELD => {
+                Some((object, receiver_place.as_deref()))
+            }
+            _ => None,
+        })
+        .expect("queue iteration should use the internal receive member");
+    let Operand::Place(object_place) = object else {
+        panic!("queue iteration should call through a materialized place operand")
+    };
+    assert!(
+        object_place.starts_with("%t"),
+        "Copy queue handles should be materialized at the loop sequence point"
+    );
+    assert_eq!(receiver_place, Some(object_place.as_str()));
+}
+
+#[test]
+fn projected_copy_member_receiver_metadata_tracks_the_materialized_value() {
+    let module = crate::lower_source_to_mir(
+        r#"
+def main():
+    values = [1]
+    print(values[0].to_string())
+"#,
+    )
+    .expect("projected Copy receiver should lower");
+    let main = module
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+        .expect("main should lower");
+    let (object, receiver_place) = main
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .find_map(|instruction| match instruction {
+            Instruction::Assign {
+                value:
+                    Rvalue::Call {
+                        callee:
+                            CallTarget::Member {
+                                object,
+                                field,
+                                receiver_place,
+                            },
+                        ..
+                    },
+                ..
+            } if field == "to_string" => Some((object, receiver_place.as_deref())),
+            _ => None,
+        })
+        .expect("projected scalar should lower through to_string");
+    let Operand::Place(object_place) = object else {
+        panic!("projected Copy receiver should be materialized into a place operand")
+    };
+    assert!(object_place.starts_with("%t"));
+    assert_eq!(receiver_place, Some(object_place.as_str()));
+    validate_loan_flow(&module)
+        .expect("source-produced projected Copy member call must satisfy MIR validation");
+}
+
+#[test]
+fn module_constant_index_receiver_metadata_tracks_the_materialized_collection() {
+    let module = crate::lower_source_to_mir(
+        r#"
+labels: dict[int32, int32] = {3: 30}
+
+def main():
+    print(labels[3])
+"#,
+    )
+    .expect("module constant index receiver should lower");
+    let main = module
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+        .expect("main should lower");
+    let (object, receiver_place) = main
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .find_map(|instruction| match instruction {
+            Instruction::Assign {
+                value:
+                    Rvalue::Call {
+                        callee:
+                            CallTarget::Member {
+                                object,
+                                field,
+                                receiver_place,
+                            },
+                        ..
+                    },
+                ..
+            } if field == INTERNAL_MAP_INDEX_FIELD => Some((object, receiver_place.as_deref())),
+            _ => None,
+        })
+        .expect("module constant dictionary should lower through indexed access");
+    let Operand::Place(object_place) = object else {
+        panic!("module constant collection should be materialized into a place operand")
+    };
+    assert!(object_place.starts_with("%t"));
+    assert_eq!(receiver_place, Some(object_place.as_str()));
+    validate_loan_flow(&module)
+        .expect("source-produced module constant index call must satisfy MIR validation");
+}
+
+#[test]
+fn module_constant_comprehension_receiver_metadata_tracks_the_materialized_collection() {
+    let module = crate::lower_source_to_mir(
+        r#"
+values: list[int32] = [1, 2, 3]
+squares: list[int32] = [value * value for value in values]
+
+def main():
+    print(squares)
+"#,
+    )
+    .expect("module constant comprehension should lower");
+    let initializer = module
+        .functions
+        .iter()
+        .find(|function| function.name.ends_with("::squares"))
+        .expect("squares initializer should lower");
+    let (object, receiver_place) = initializer
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .find_map(|instruction| match instruction {
+            Instruction::Assign {
+                value:
+                    Rvalue::Call {
+                        callee:
+                            CallTarget::Member {
+                                object,
+                                field,
+                                receiver_place,
+                            },
+                        ..
+                    },
+                ..
+            } if field == INTERNAL_VEC_INDEX_OPTION_FIELD => {
+                Some((object, receiver_place.as_deref()))
+            }
+            _ => None,
+        })
+        .expect("comprehension should lower through optional indexed access");
+    let Operand::Place(object_place) = object else {
+        panic!("module constant collection should be materialized into a place operand")
+    };
+    assert!(object_place.starts_with("%t"));
+    assert_eq!(receiver_place, Some(object_place.as_str()));
+    validate_loan_flow(&module)
+        .expect("source-produced module constant comprehension must satisfy MIR validation");
+}
+
+#[test]
+fn owned_operator_receiver_metadata_tracks_the_snapshot_operand() {
+    let module = crate::lower_source_to_mir(
+        r#"
+trait Add[Rhs, Out]:
+    def add(own self, rhs: own Rhs) -> Out
+
+copy class Counter:
+    value: int32
+
+impl Add[Counter, Counter] for Counter:
+    def add(own self, rhs: own Counter) -> Counter:
+        return Counter(value=self.value + rhs.value)
+
+def main():
+    counter = Counter(value=1)
+    print((counter + counter).value)
+"#,
+    )
+    .expect("owned operator receiver should lower");
+    let main = module
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+        .expect("main should lower");
+    let (object, receiver_place) = main
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .find_map(|instruction| match instruction {
+            Instruction::Assign {
+                value:
+                    Rvalue::Call {
+                        callee:
+                            CallTarget::TraitMember {
+                                object,
+                                trait_name,
+                                field,
+                                receiver_place,
+                            },
+                        ..
+                    },
+                ..
+            } if trait_name == "Add" && field == "add" => Some((object, receiver_place.as_deref())),
+            _ => None,
+        })
+        .expect("operator should lower through its trait member");
+    let Operand::Place(object_place) = object else {
+        panic!("Copy value receiver should be snapshotted into a place operand")
+    };
+    assert!(object_place.starts_with("%t"));
+    assert_eq!(receiver_place, Some(object_place.as_str()));
+    validate_loan_flow(&module)
+        .expect("source-produced owned operator call must satisfy MIR validation");
 }
 
 #[test]
@@ -3827,6 +6452,105 @@ def main() -> int32:
 }
 
 #[test]
+fn generic_operator_calls_retain_the_authoritative_trait_identity() {
+    let module = crate::lower_source_to_mir(
+        r#"
+trait Add[Rhs, Out]:
+    def add(self, rhs: Rhs) -> Out
+
+trait Neg[Out]:
+    def neg(self) -> Out
+
+def add_all[T: Add[T, T]](left: T, right: T) -> T:
+    return left + right
+
+def negate[T: Neg[T]](value: T) -> T:
+    return -value
+"#,
+    )
+    .expect("generic operator functions should lower to MIR");
+
+    for (function_name, expected_trait, expected_field) in
+        [("add_all", "Add", "add"), ("negate", "Neg", "neg")]
+    {
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name == function_name)
+            .unwrap_or_else(|| panic!("{function_name} should lower"));
+        assert!(
+            function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .any(|instruction| matches!(
+                    instruction,
+                    Instruction::Assign {
+                        value: Rvalue::Call {
+                            callee: CallTarget::TraitMember {
+                                trait_name,
+                                field,
+                                ..
+                            },
+                            ..
+                        },
+                        ..
+                    } if trait_name == expected_trait && field == expected_field
+                )),
+            "{function_name} must retain the `{expected_trait}` operator-trait identity"
+        );
+    }
+
+    validate_loan_flow(&module)
+        .expect("authoritative generic operator targets should pass common MIR validation");
+}
+
+#[test]
+fn generic_supertrait_calls_retain_the_declaring_trait_identity() {
+    let module = crate::lower_source_to_mir(include_str!(
+        "../tests/fixtures/run-pass/supertrait_bound_inherits_methods.au"
+    ))
+    .expect("supertrait-bound method calls should lower to MIR");
+    let total = module
+        .functions
+        .iter()
+        .find(|function| function.name == "total")
+        .expect("total should lower");
+
+    for (expected_trait, expected_field) in [("Base", "base"), ("Derived", "derived")] {
+        assert!(
+            total
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .any(|instruction| matches!(
+                    instruction,
+                    Instruction::Assign {
+                        value: Rvalue::Call {
+                            callee: CallTarget::TraitMember {
+                                trait_name,
+                                field,
+                                ..
+                            },
+                            ..
+                        },
+                        ..
+                    } if trait_name == expected_trait && field == expected_field
+                )),
+            "`{expected_field}` must retain its declaring `{expected_trait}` trait identity"
+        );
+    }
+
+    validate_loan_flow(&module)
+        .expect("trait-qualified inherited calls should pass common MIR validation");
+    let output = crate::run_mir(&module)
+        .expect("MIR runtime should resolve the named supertrait implementation");
+    assert_eq!(output.stdout, "21\n");
+    crate::native_codegen::emit_host_object(&module)
+        .expect("direct codegen should resolve the named supertrait implementation");
+}
+
+#[test]
 fn d6_mir_uses_declaration_resolved_parameter_conventions() {
     let module = crate::lower_source_to_mir(
         r#"
@@ -5072,12 +7796,18 @@ fn lowerer_trait_and_member_type_helpers_cover_trait_bounds_and_variants() {
         .insert("value".to_string(), Type::TypeParam("U".to_string()));
 
     assert_eq!(
-        lowerer.operator_field_for_binary(BinaryOp::Add, &name_expr("left"), &name_expr("right")),
-        binary_operator_trait(BinaryOp::Add).map(|(_, field)| field.to_string())
+        lowerer.operator_trait_member_for_binary(
+            BinaryOp::Add,
+            &name_expr("left"),
+            &name_expr("right")
+        ),
+        binary_operator_trait(BinaryOp::Add)
+            .map(|(trait_name, field)| { (trait_name.to_string(), field.to_string()) })
     );
     assert_eq!(
-        lowerer.operator_field_for_unary(UnaryOp::Neg, &name_expr("value")),
-        unary_operator_trait(UnaryOp::Neg).map(|(_, field)| field.to_string())
+        lowerer.operator_trait_member_for_unary(UnaryOp::Neg, &name_expr("value")),
+        unary_operator_trait(UnaryOp::Neg)
+            .map(|(trait_name, field)| { (trait_name.to_string(), field.to_string()) })
     );
     assert_eq!(
         lowerer.operator_return_type_for_binary(
@@ -5661,13 +8391,41 @@ fn lowerer_trait_and_member_type_helpers_cover_trait_bounds_and_variants() {
             return_type: Box::new(Type::named("bool")),
         })
     );
-    assert!(lowerer.member_call_mutates_receiver(&Operand::Place("items".to_string()), "append"));
-    assert!(!lowerer.member_call_mutates_receiver(&Operand::Place("label".to_string()), "len"));
-    assert!(!lowerer.member_call_mutates_receiver(&Operand::Place("items".to_string()), "contains"));
-    assert!(lowerer.member_call_mutates_receiver(&Operand::Place("user".to_string()), "reset"));
-    assert!(lowerer.member_call_mutates_receiver(&Operand::Place("counter".to_string()), "bump"));
-    assert!(!lowerer.member_call_mutates_receiver(&Operand::Place("missing".to_string()), "append"));
-    assert!(!lowerer.member_call_mutates_receiver(&Operand::Place("count".to_string()), "missing"));
+    assert!(lowerer.member_call_mutates_receiver(
+        &Operand::Place("items".to_string()),
+        None,
+        "append"
+    ));
+    assert!(!lowerer.member_call_mutates_receiver(
+        &Operand::Place("label".to_string()),
+        None,
+        "len"
+    ));
+    assert!(!lowerer.member_call_mutates_receiver(
+        &Operand::Place("items".to_string()),
+        None,
+        "contains"
+    ));
+    assert!(lowerer.member_call_mutates_receiver(
+        &Operand::Place("user".to_string()),
+        None,
+        "reset"
+    ));
+    assert!(lowerer.member_call_mutates_receiver(
+        &Operand::Place("counter".to_string()),
+        None,
+        "bump"
+    ));
+    assert!(!lowerer.member_call_mutates_receiver(
+        &Operand::Place("missing".to_string()),
+        None,
+        "append"
+    ));
+    assert!(!lowerer.member_call_mutates_receiver(
+        &Operand::Place("count".to_string()),
+        None,
+        "missing"
+    ));
     assert!(lowerer.rvalue_writes_place(
         &Rvalue::Call {
             callee: CallTarget::Member {

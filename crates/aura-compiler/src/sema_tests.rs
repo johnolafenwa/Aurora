@@ -21594,6 +21594,61 @@ def main():
     )
     .expect("source mutation after an alias's last use should remain valid");
     assert_eq!(after_last_use.stdout, "Ada\nupdated\n");
+
+    let returned_scrutinee = crate::check_source(
+        r#"
+class User:
+    name: str
+
+enum Slot:
+    Filled(User)
+    Empty
+
+def shared(slot: Slot) -> view Slot from slot:
+    return view slot
+
+def main():
+    mut slot = Slot.Filled(User(name="Ada"))
+    match shared(slot):
+        case Filled(user):
+            alias = user
+            slot = Slot.Empty
+            print(alias.name)
+        case Empty:
+            pass
+"#,
+    )
+    .expect_err("a returned shared match scrutinee must retain alias provenance");
+    assert_eq!(returned_scrutinee.code, "AU3002", "{returned_scrutinee:?}");
+    assert_eq!(
+        returned_scrutinee.message,
+        "cannot use pattern binding `alias` after reassigning match scrutinee `slot`"
+    );
+
+    crate::check_source(
+        r#"
+class User:
+    name: str
+
+enum Slot:
+    Filled(User)
+    Empty
+
+def shared(slot: Slot) -> view Slot from slot:
+    return view slot
+
+def main():
+    mut slot = Slot.Filled(User(name="Ada"))
+    match shared(slot):
+        case Filled(user):
+            alias = user
+            print(alias.name)
+            slot = Slot.Empty
+        case Empty:
+            pass
+"#,
+    )
+    .expect("a non-Copy returned match loan may end after its final alias use");
 }
 
 #[test]
@@ -21987,6 +22042,28 @@ def main() -> int32:
 "#,
     );
     valid.expect("inclusive stack bounds and forwarded named target arguments should type-check");
+
+    let returned_view = crate::check_source(
+        r#"
+def borrowed(value: mut int64) -> view mut int64 from value:
+    return view mut value
+
+def worker(value: int64) -> int64:
+    return value
+
+def main():
+    mut value = 1
+    with TaskGroup() as group:
+        task = group.start_with_stack(262144, worker, value=borrowed(value))
+        print(task.result_or(-1))
+"#,
+    )
+    .expect_err("a named forwarded returned view cannot cross a task boundary");
+    assert_eq!(returned_view.code, "AU3008", "{returned_view:?}");
+    assert_eq!(
+        returned_view.message,
+        "view argument 1 cannot cross a task boundary"
+    );
 
     for (literal, expected) in [
         (
@@ -24331,6 +24408,22 @@ fn imported_generic_function_values_specialize_as_values_and_task_targets() {
         },
         type_param_bounds: BTreeMap::new(),
     };
+    let mut marker_decl = unary_function_decl("marker");
+    marker_decl.type_params = vec!["Item".to_string(), "T".to_string()];
+    marker_decl.params[0].ty = type_ref("T");
+    marker_decl.return_type = type_ref("Item");
+    let marker = FunctionInfo {
+        module_name: "pkg.tools".to_string(),
+        decl: marker_decl,
+        signature: FunctionSignature {
+            params: vec![Type::TypeParam("T".to_string())],
+            param_passings: vec![ReceiverKind::Value],
+            return_type: Type::TypeParam("Item".to_string()),
+            rng_clone_safe_type_params: BTreeSet::new(),
+            array_equality_safe_type_params: BTreeSet::new(),
+        },
+        type_param_bounds: BTreeMap::new(),
+    };
     let namespace = ModuleNamespace {
         constants: BTreeMap::new(),
         all_constants: BTreeMap::new(),
@@ -24338,14 +24431,20 @@ fn imported_generic_function_values_specialize_as_values_and_task_targets() {
         path: "pkg.tools".to_string(),
         source_path: None,
         modules: BTreeMap::new(),
-        functions: BTreeMap::from([("identity".to_string(), identity.clone())]),
+        functions: BTreeMap::from([
+            ("identity".to_string(), identity.clone()),
+            ("marker".to_string(), marker.clone()),
+        ]),
         extern_functions: BTreeMap::new(),
         opaque_handles: BTreeMap::new(),
         classes: BTreeMap::new(),
         enums: BTreeMap::new(),
         traits: BTreeMap::new(),
         trait_impls: Vec::new(),
-        all_functions: BTreeMap::from([("identity".to_string(), identity)]),
+        all_functions: BTreeMap::from([
+            ("identity".to_string(), identity),
+            ("marker".to_string(), marker),
+        ]),
         all_extern_functions: BTreeMap::new(),
         all_opaque_handles: BTreeMap::new(),
         all_classes: BTreeMap::new(),
@@ -24361,6 +24460,7 @@ def main():
     callback = tools.identity[int32]
     value: int32 = callback(1)
     direct: int32 = tools.identity[int32](3)
+    marker = tools.marker[int32, str]("ready")
     with group = TaskGroup():
         task: Task[int32] = group.start(tools.identity[int32], 2)
 "#,
@@ -27079,6 +27179,460 @@ def main():
 }
 
 #[test]
+fn adr0038_returned_views_never_become_owned_values() {
+    for source in [
+        r#"
+def values_view(values: list[int64]) -> view list[int64] from values:
+    return view values
+
+def main():
+    values = [1]
+    copied = values_view(values)
+    print(copied)
+"#,
+        r#"
+def values_view(values: list[int64]) -> view list[int64] from values:
+    return view values
+
+def sink(value: own list[int64]):
+    print(value)
+
+def main():
+    values = [1]
+    sink(values_view(values))
+"#,
+        r#"
+def values_view(values: list[int64]) -> view list[int64] from values:
+    return view values
+
+def main():
+    borrower = values_view
+    values = [1]
+    print(borrower(values))
+"#,
+    ] {
+        let error = crate::check_source(source)
+            .expect_err("a returned view must remain a view at every caller boundary");
+        assert_eq!(error.code, "AU3010", "{source}: {error:?}");
+    }
+}
+
+#[test]
+fn adr0038_reborrow_suspension_and_nested_last_use_are_enforced() {
+    crate::check_source(
+        r#"
+def main():
+    mut value = 1
+    view mut parent = value
+    view mut child = parent
+    child = 2
+    print(parent)
+"#,
+    )
+    .expect("a mutable parent view is suspended while its child reborrow is live");
+
+    let error = crate::check_source(
+        r#"
+def main():
+    mut values = [1]
+    mut update: def(int64) -> None = lambda [mut values] item: values.append(item)
+    if true:
+        values.append(9)
+        update(2)
+    print(values)
+"#,
+    )
+    .expect_err("an enclosing statement header must not expire a loan used in its body");
+    assert_eq!(error.code, "AU3002");
+}
+
+#[test]
+fn adr0038_returned_view_capability_trait_dispatch_and_footprints_are_checked() {
+    let escalation = crate::check_source(
+        r#"
+def invalid(value: mut int64) -> view mut int64 from value:
+    view shared = value
+    return view mut shared
+"#,
+    )
+    .expect_err("returning a shared child as mutable must not escalate capability");
+    assert_eq!(escalation.code, "AU3010");
+
+    crate::check_source(
+        r#"
+trait Project:
+    def get(self) -> view int64 from self
+
+class Box:
+    value: int64
+
+impl Project for Box:
+    def get(self) -> view int64 from self:
+        return view self.value
+
+def read[T: Project](item: T) -> view int64 from item:
+    view alias = item.get()
+    return view alias
+
+def main():
+    item = Box(value=7)
+    view alias = item.get()
+    view forwarded = read(item)
+    print(alias)
+    print(forwarded)
+"#,
+    )
+    .expect("returned-view contracts must survive concrete and bounded trait dispatch");
+
+    crate::check_source(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def left_view(pair: Pair) -> view int64 from pair:
+    return view pair.left
+
+def main():
+    mut pair = Pair(left=1, right=2)
+    view left = left_view(pair)
+    pair.right = 3
+    print(left)
+"#,
+    )
+    .expect("one exact returned projection must not lock a disjoint sibling");
+}
+
+#[test]
+fn adr0038_views_of_copy_values_are_neither_owned_captures_nor_transferable() {
+    let captured = crate::check_source(
+        r#"
+def main():
+    mut value = 1
+    view mut alias = value
+    callback: def() -> int64 = lambda [own alias]: alias
+    print(callback())
+"#,
+    )
+    .expect_err("own capture must not snapshot a view of a Copy value");
+    assert_eq!(captured.code, "AU3004");
+
+    let transferred = crate::check_source(
+        r#"
+def main():
+    jobs = Queue[int64]()
+    value = 1
+    view alias = value
+    jobs.put(alias)
+"#,
+    )
+    .expect_err("a view of a Copy value is still not Transfer");
+    assert_eq!(transferred.code, "AU3008");
+}
+
+#[test]
+fn adr0038_returned_views_cannot_hide_in_groups_returns_or_aggregates() {
+    let cases = [
+        r#"
+def borrow(values: list[int64]) -> view list[int64] from values:
+    return view values
+
+def copied(values: list[int64]) -> list[int64]:
+    return borrow(values)
+"#,
+        r#"
+def borrow(values: list[int64]) -> view list[int64] from values:
+    return view values
+
+def main():
+    values = [1]
+    copied = (borrow(values))
+"#,
+        r#"
+def borrow(values: list[int64]) -> view list[int64] from values:
+    return view values
+
+def main():
+    values = [1]
+    stored = (borrow(values),)
+"#,
+        r#"
+class Holder:
+    values: list[int64]
+
+def borrow(values: list[int64]) -> view list[int64] from values:
+    return view values
+
+def main():
+    values = [1]
+    holder = Holder(values=borrow(values))
+"#,
+    ];
+    for source in cases {
+        let error = crate::check_source(source)
+            .expect_err("returned views must not become owned values through syntax wrappers");
+        assert_eq!(error.code, "AU3010", "{source}: {error:?}");
+    }
+}
+
+#[test]
+fn adr0038_forwarded_footprints_are_complete_and_exact() {
+    let incomplete = crate::check_source(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def left(pair: Pair) -> view int64 from pair:
+    return view pair.left
+
+def choose(pair: Pair, direct: bool) -> view int64 from pair:
+    if direct:
+        return view pair.right
+    return view left(pair)
+
+def main():
+    mut pair = Pair(left=1, right=2)
+    view selected = choose(pair, false)
+    pair.left = 9
+    print(selected)
+"#,
+    )
+    .expect_err("an unresolved forwarded return must not narrow a mixed footprint");
+    assert_eq!(incomplete.code, "AU3002");
+
+    crate::check_source(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def inner(pair: Pair) -> view int64 from pair:
+    return view pair.left
+
+def outer(pair: Pair) -> view int64 from pair:
+    return view inner(pair)
+
+def main():
+    mut pair = Pair(left=1, right=2)
+    view selected = outer(pair)
+    pair.right = 3
+    print(selected)
+"#,
+    )
+    .expect("one transitively fixed returned projection must leave its sibling unlocked");
+}
+
+#[test]
+fn adr0038_nested_dynamic_returned_views_keep_a_conservative_footprint() {
+    let error = crate::check_source(
+        r#"
+class Cell:
+    value: int64
+
+class Pair:
+    left: Cell
+    right: Cell
+
+def choose(pair: mut Pair, left: bool) -> view mut Cell from pair:
+    if left:
+        return view mut pair.left
+    return view mut pair.right
+
+def cell_value(cell: mut Cell) -> view mut int64 from cell:
+    return view mut cell.value
+
+def main():
+    mut pair = Pair(left=Cell(value=1), right=Cell(value=2))
+    view mut selected = cell_value(choose(pair, false))
+    pair.right.value = 5
+    selected = 9
+"#,
+    )
+    .expect_err("a projection after a dynamic returned view must retain the conservative root");
+    assert_eq!(error.code, "AU3002");
+}
+
+#[test]
+fn adr0038_transitive_method_forwarding_keeps_exact_footprints() {
+    crate::check_source(
+        r#"
+trait LeftProject:
+    def left_view(self) -> view int64 from self
+
+class Pair:
+    left: int64
+    right: int64
+
+    def left_view(self) -> view int64 from self:
+        return view self.left
+
+    def static_left(value: Pair) -> view int64 from value:
+        return view value.left
+
+impl LeftProject for Pair:
+    def left_view(self) -> view int64 from self:
+        return view self.left
+
+def through_class(pair: Pair) -> view int64 from pair:
+    return view pair.left_view()
+
+def through_static(pair: Pair) -> view int64 from pair:
+    return view Pair.static_left(pair)
+
+def through_trait[T: LeftProject](value: T) -> view int64 from value:
+    return view value.left_view()
+
+def main():
+    mut pair = Pair(left=1, right=2)
+    view class_value = through_class(pair)
+    pair.right = 3
+    print(class_value)
+    view static_value = through_static(pair)
+    pair.right = 4
+    print(static_value)
+    view trait_value = through_trait(pair)
+    pair.right = 5
+    print(trait_value)
+"#,
+    )
+    .expect("concrete, static, and trait method forwarding should preserve one exact projection");
+}
+
+#[test]
+fn adr0038_loop_headers_keep_loans_live_and_if_conditions_end_on_their_edge() {
+    for source in [
+        r#"
+def main():
+    mut value = 2
+    view alias = value
+    while alias > 0:
+        value = 0
+"#,
+        r#"
+def main():
+    mut values = [1, 2]
+    view alias = values
+    for value in alias:
+        values.append(value)
+"#,
+    ] {
+        let error = crate::check_source(source)
+            .expect_err("a loop header is reevaluated, so its source remains loaned in the body");
+        assert_eq!(error.code, "AU3002", "{source}: {error:?}");
+    }
+
+    crate::check_source(
+        r#"
+def main():
+    mut value = 1
+    view alias = value
+    if alias == 1:
+        value = 2
+    print(value)
+"#,
+    )
+    .expect("a non-loop condition's final use ends on the selected control-flow edge");
+}
+
+#[test]
+fn adr0038_grouped_closure_moves_and_view_task_arguments_retain_authority() {
+    let moved = crate::check_source(
+        r#"
+def main():
+    mut values = [1]
+    mut first: def(int64) -> None = lambda [mut values] item: values.append(item)
+    mut second = (first)
+    values.append(9)
+    second(2)
+"#,
+    )
+    .expect_err("grouping a closure move must not discard its loan region");
+    assert_eq!(moved.code, "AU3002");
+
+    let transferred = crate::check_source(
+        r#"
+def echo(value: int64) -> int64:
+    return value
+
+def main():
+    value = 7
+    view alias = value
+    with TaskGroup() as group:
+        task = group.start(echo, alias)
+        print(task.result())
+"#,
+    )
+    .expect_err("a direct view cannot cross a task boundary even when its pointee is Copy");
+    assert_eq!(transferred.code, "AU3008");
+}
+
+#[test]
+fn adr0038_shared_children_suspend_parents_and_projected_reborrows_resume_them() {
+    let suspended = crate::check_source(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def main():
+    mut pair = Pair(left=1, right=2)
+    view mut parent = pair
+    view child = parent.left
+    print(parent.right)
+    print(child)
+"#,
+    )
+    .expect_err("any live child reborrow suspends direct access through its mutable parent");
+    assert_eq!(suspended.code, "AU3002");
+
+    crate::check_source(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def main():
+    mut pair = Pair(left=1, right=2)
+    view mut parent = pair
+    view mut child = parent.left
+    child = 7
+    print(parent.left)
+"#,
+    )
+    .expect("a fixed projection from an existing view is a contained reborrow");
+}
+
+#[test]
+fn adr0038_loan_closure_regions_follow_moves_and_reject_aggregate_escape() {
+    let moved = crate::check_source(
+        r#"
+def main():
+    mut values = [1]
+    mut first: def(int64) -> None = lambda [mut values] item: values.append(item)
+    mut second = first
+    values.append(9)
+    second(2)
+"#,
+    )
+    .expect_err("moving a loan closure must move its still-live loan region");
+    assert_eq!(moved.code, "AU3002");
+
+    let aggregate = crate::check_source(
+        r#"
+def main():
+    mut value = 1
+    callback: def() -> int64 = lambda [value]: value
+    stored = (callback,)
+    value = 2
+    print(stored[0]())
+"#,
+    )
+    .expect_err("loan closures cannot escape into tuples");
+    assert_eq!(aggregate.code, "AU3010");
+}
+
+#[test]
 fn adr0038_returned_views_require_declared_origin_provenance() {
     crate::check_source(
         r#"
@@ -27123,6 +27677,10 @@ def main():
 class Counter:
     value: int64
 
+class Sink:
+    def bump(self, value: mut int64):
+        value += 1
+
 def value_mut(counter: mut Counter) -> view mut int64 from counter:
     return view mut counter.value
 
@@ -27131,7 +27689,11 @@ def bump(value: mut int64):
 
 def main():
     mut counter = Counter(value=1)
+    sink = Sink()
+    callback: def(mut int64) -> None = bump
     bump(value_mut(counter))
+    sink.bump(value_mut(counter))
+    callback(value_mut(counter))
     print(counter.value)
 "#,
     )
@@ -27907,6 +28469,8 @@ def main():
     disjoint_loan.view = Some(ViewBinding {
         kind: crate::ast::ViewKind::Mutable,
         source: PlacePath::root("box".to_string()),
+        parent: None,
+        ancestors: BTreeSet::new(),
         created_at: Span::new(1, 1),
         last_use: Span::new(2, 1),
     });
@@ -27966,4 +28530,1399 @@ fn adr0038_lambda_capture_lists_reject_unused_and_immutable_mut_entries() {
         "unexpected diagnostic: {}",
         immutable.message
     );
+}
+
+#[test]
+fn adr0038_grouped_closures_and_closure_children_retain_their_loans() {
+    let grouped = crate::check_source(
+        r#"
+def main():
+    mut value = 1
+    callback: def() -> int64 = (lambda [value]: value)
+    value = 2
+    print(callback())
+"#,
+    )
+    .expect_err("grouping a lambda must not erase its captured loan");
+    assert_eq!(grouped.code, "AU3002");
+
+    let suspended_parent = crate::check_source(
+        r#"
+def main():
+    mut value = 1
+    view mut parent = value
+    callback: def() -> int64 = lambda [parent]: parent
+    print(parent)
+    print(callback())
+"#,
+    )
+    .expect_err("a closure-held shared child must suspend its mutable parent");
+    assert_eq!(suspended_parent.code, "AU3002");
+}
+
+#[test]
+fn adr0038_tuple_views_use_nonconsuming_places_and_preserve_parent_capability() {
+    crate::check_source(
+        r#"
+def main():
+    pair = ("Ada", "Grace")
+    view first = pair[0]
+    print(first)
+"#,
+    )
+    .expect("viewing a fixed non-Copy tuple element must not consume it");
+
+    crate::check_source(
+        r#"
+def main():
+    mut pair = (1, 2)
+    view mut parent = pair
+    view mut child = parent[0]
+    child = 7
+    print(parent)
+"#,
+    )
+    .expect("a fixed tuple-position reborrow must retain its mutable parent identity");
+
+    let escalation = crate::check_source(
+        r#"
+def expose(pair: mut (int64, int64)) -> view mut int64 from pair:
+    view shared = pair
+    return view mut shared[0]
+"#,
+    )
+    .expect_err("a fixed tuple position must not hide shared-to-mutable escalation");
+    assert_eq!(escalation.code, "AU3010");
+}
+
+#[test]
+fn adr0038_loop_carried_views_and_wrapped_returned_views_do_not_escape() {
+    let loop_carried = crate::check_source(
+        r#"
+def main():
+    mut value = 1
+    mut count = 0
+    view alias = value
+    while count < 2:
+        print(alias)
+        value = 2
+        count += 1
+"#,
+    )
+    .expect_err("a body use repeats across a loop backedge and must keep the loan live");
+    assert_eq!(loop_carried.code, "AU3002");
+
+    let wrapped_escape = crate::check_source(
+        r#"
+class Holder:
+    value: int64
+
+def borrow(value: int64) -> view int64 from value:
+    return view value
+
+def main():
+    value = 1
+    holder = Holder(value=borrow(value) if true else 0)
+    print(holder.value)
+"#,
+    )
+    .expect_err("a returned view cannot escape through a conditional field initializer");
+    assert_eq!(wrapped_escape.code, "AU3010");
+}
+
+#[test]
+fn adr0038_closure_loans_block_mutable_calls_and_owned_moves() {
+    for source in [
+        r#"
+def change(value: mut int64):
+    value = 2
+
+def main():
+    mut value = 1
+    callback: def() -> int64 = lambda [value]: value
+    change(value)
+    print(callback())
+"#,
+        r#"
+def take(values: own list[int64]):
+    print(values)
+
+def main():
+    mut values = [1]
+    callback: def() -> int64 = lambda [values]: values.len()
+    take(values)
+    print(callback())
+"#,
+        r#"
+def main():
+    mut values = [1]
+    callback: def() -> int64 = lambda [values]: values.len()
+    moved = values
+    print(callback())
+    print(moved)
+"#,
+        r#"
+class Holder:
+    values: list[int64]
+
+def take(values: own list[int64]):
+    print(values)
+
+def main():
+    mut holder = Holder(values=[1])
+    callback: def() -> int64 = lambda [holder]: holder.values.len()
+    take(holder.values)
+    print(callback())
+"#,
+    ] {
+        let error = crate::check_source(source)
+            .expect_err("an active closure loan must block mutation or ownership transfer");
+        assert_eq!(error.code, "AU3002", "{source}: {error:?}");
+    }
+}
+
+#[test]
+fn adr0038_loan_closures_reject_unsupported_deferred_flows() {
+    for source in [
+        r#"
+def main():
+    mut value = 1
+    factory = lambda [value]: lambda [value]: value
+    callback = factory()
+    value = 2
+    print(callback())
+"#,
+        r#"
+def choose(flag: bool):
+    mut value = 1
+    callback: def() -> int64 = lambda [value]: value
+    selected = callback if flag else callback
+    value = 2
+    print(selected())
+"#,
+        r#"
+def choose(flag: bool):
+    mut value = 1
+    callback: def() -> int64 = lambda [value]: value
+    selected = match flag:
+        case true: callback
+        case false: callback
+    value = 2
+    print(selected())
+"#,
+        r#"
+def main():
+    mut value = 1
+    inner: def() -> int64 = lambda [value]: value
+    outer = lambda [own inner]: inner()
+    value = 2
+    print(outer())
+"#,
+        r#"
+def main():
+    mut value = 1
+    callback: def() -> int64 = lambda [value]: value
+    callbacks: list[def() -> int64] = [callback]
+    value = 2
+    print(callbacks[0]())
+"#,
+    ] {
+        let error = crate::check_source(source)
+            .expect_err("loan-bearing closures must remain in supported direct locals");
+        assert_eq!(error.code, "AU3010", "{source}: {error:?}");
+    }
+}
+
+#[test]
+fn adr0038_inline_explicit_captures_acquire_their_loans_immediately() {
+    for source in [
+        r#"
+def main():
+    mut value = 1
+    view mut parent = value
+    print((lambda [value]: value)())
+    parent = 2
+"#,
+        r#"
+def consume(value: int64):
+    print(value)
+
+def main():
+    mut value = 1
+    view mut parent = value
+    consume((lambda [value]: value)())
+    parent = 2
+"#,
+    ] {
+        let error = crate::check_source(source)
+            .expect_err("an inline explicit capture must perform overlap acquisition checks");
+        assert_eq!(error.code, "AU3002", "{source}: {error:?}");
+    }
+}
+
+#[test]
+fn adr0038_copy_views_never_decay_into_owned_values() {
+    for source in [
+        r#"
+def main():
+    value = 1
+    view alias = value
+    owned = alias
+    print(owned)
+"#,
+        r#"
+def main():
+    value = 1
+    view alias = value
+    stored = (alias,)
+    print(stored)
+"#,
+        r#"
+def main():
+    value = 1
+    view alias = value
+    stored = [alias]
+    print(stored)
+"#,
+        r#"
+class Holder:
+    value: int64
+
+def main():
+    value = 1
+    view alias = value
+    holder = Holder(value=alias)
+    print(holder)
+"#,
+        r#"
+enum Packet:
+    Item(int64)
+
+def main():
+    value = 1
+    view alias = value
+    packet = Packet.Item(alias)
+    print(packet)
+"#,
+        r#"
+def main():
+    value = 1
+    view alias = value
+    packet: Option[int64] = Option.Some(alias)
+    print(packet)
+"#,
+        r#"
+enum Packet:
+    Item(int64)
+
+class Box:
+    value: int64
+
+def borrow(box: mut Box) -> view mut int64 from box:
+    return view mut box.value
+
+def main():
+    mut box = Box(value=1)
+    packet = Packet.Item(borrow(box))
+    box.value = 2
+    print(packet)
+"#,
+    ] {
+        let error = crate::check_source(source)
+            .expect_err("Copy-valued views must not become owned bindings or aggregates");
+        assert_eq!(error.code, "AU3010", "{source}: {error:?}");
+    }
+}
+
+#[test]
+fn adr0038_views_cannot_escape_through_assignment_or_destructuring_sinks() {
+    for source in [
+        r#"
+class User:
+    name: str
+
+class Holder:
+    value: str
+
+def main():
+    user = User(name="Ada")
+    mut holder = Holder(value="empty")
+    view name = user.name
+    holder.value = name
+"#,
+        r#"
+class User:
+    name: str
+
+def main():
+    user = User(name="Ada")
+    mut values = ["empty"]
+    view name = user.name
+    values[0] = name
+"#,
+        r#"
+def main():
+    pair = ("Ada", "Grace")
+    view alias = pair
+    (left, right) = alias
+"#,
+    ] {
+        let error = crate::check_source(source)
+            .expect_err("a view descriptor cannot enter an owned storage sink");
+        assert_eq!(error.code, "AU3010", "{source}: {error:?}");
+    }
+}
+
+#[test]
+fn adr0038_returned_view_lookup_is_local_first_and_group_transparent() {
+    let shadowed = crate::check_source(
+        r#"
+def borrow(value: int64) -> view int64 from value:
+    return view value
+
+def plain(value: int64) -> int64:
+    return value
+
+def main():
+    borrow = plain
+    value = 1
+    view alias = borrow(value)
+    print(alias)
+"#,
+    )
+    .expect_err("a local callable must shadow a global returned-view function");
+    assert!(matches!(shadowed.code.as_str(), "AU3004" | "AU3010"));
+
+    crate::check_source(
+        r#"
+def borrow[T](value: T) -> view T from value:
+    return view value
+
+def main():
+    value = 1
+    view alias = (borrow)(value)
+    view specialized = (borrow[int64])(value)
+    print(alias)
+    print(specialized)
+"#,
+    )
+    .expect("grouping a free or specialized returned-view callee is transparent");
+}
+
+#[test]
+fn adr0038_nested_place_types_are_nonconsuming_and_alias_relative() {
+    crate::check_source(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def main():
+    mut tuple_pair = (Pair(left=1, right=2), Pair(left=3, right=4))
+    view nested = tuple_pair[0].right
+    view mut editable = tuple_pair[1].left
+    editable = 7
+    print(nested)
+"#,
+    )
+    .expect("nested tuple/class places must be typed without consuming tuple elements");
+
+    crate::check_source(
+        r#"
+class Cell:
+    value: int64
+
+class Pair:
+    left: Cell
+    right: Cell
+
+def choose(pair: mut Pair, left: bool) -> view mut Cell from pair:
+    if left:
+        return view mut pair.left
+    return view mut pair.right
+
+def main():
+    mut pair = Pair(left=Cell(value=1), right=Cell(value=2))
+    view mut selected = choose(pair, true)
+    selected.value = 7
+    view mut value = selected.value
+    value = 8
+    print(selected.value)
+"#,
+    )
+    .expect("a child of a multi-projection returned view uses the alias pointee type");
+}
+
+#[test]
+fn adr0038_branch_local_loan_expiry_is_independent_of_arm_order() {
+    crate::check_source(
+        r#"
+def first(flag: bool):
+    mut value = 1
+    view alias = value
+    if flag:
+        value = 2
+    else:
+        print(alias)
+
+def second(flag: bool):
+    mut value = 1
+    view alias = value
+    if flag:
+        print(alias)
+    else:
+        value = 2
+
+def third(flag: bool):
+    mut value = 1
+    view alias = value
+    match flag:
+        case true:
+            value = 2
+        case false:
+            print(alias)
+
+def fourth(flag: bool):
+    mut value = 1
+    view alias = value
+    match flag:
+        case true:
+            print(alias)
+        case false:
+            value = 2
+"#,
+    )
+    .expect("an unused branch may end a loan regardless of textual arm order");
+}
+
+#[test]
+fn adr0038_generic_calls_cannot_erase_loan_closure_regions() {
+    for source in [
+        r#"
+def identity[T](value: own T) -> T:
+    return value
+
+def main():
+    mut value = 1
+    callback: def() -> int64 = lambda [value]: value
+    escaped = identity(callback)
+    value = 2
+    print(escaped())
+"#,
+        r#"
+class Holder[T]:
+    value: T
+
+def wrap[T](value: own T) -> Holder[T]:
+    return Holder(value=value)
+
+def main():
+    mut value = 1
+    callback: def() -> int64 = lambda [value]: value
+    holder = wrap(callback)
+    value = 2
+    print(holder.value())
+"#,
+    ] {
+        let error = crate::check_source(source)
+            .expect_err("generic substitution must not erase a loan-bearing closure region");
+        assert_eq!(error.code, "AU3010", "{source}: {error:?}");
+    }
+}
+
+#[test]
+fn adr0038_returned_view_arguments_retain_their_physical_places() {
+    let error = crate::check_source(
+        r#"
+class Counter:
+    value: int64
+
+def value_mut(counter: mut Counter) -> view mut int64 from counter:
+    return view mut counter.value
+
+def update_both(left: mut int64, right: mut int64):
+    left += 1
+    right += 10
+
+def main():
+    mut counter = Counter(value=1)
+    update_both(value_mut(counter), value_mut(counter))
+"#,
+    )
+    .expect_err("two mutable returned-view arguments cannot overlap");
+    assert_eq!(error.code, "AU3002");
+}
+
+#[test]
+fn adr0038_mutable_returned_views_require_a_mutable_view_context() {
+    for expression in [
+        "inspect(value_mut(counter))",
+        "print(value_mut(counter) + 1)",
+        "value_mut(counter)",
+    ] {
+        let source = format!(
+            r#"
+class Counter:
+    value: int64
+
+def value_mut(counter: mut Counter) -> view mut int64 from counter:
+    return view mut counter.value
+
+def inspect(value: int64):
+    print(value)
+
+def main():
+    mut counter = Counter(value=1)
+    {expression}
+"#
+        );
+        let error = crate::check_source(&source)
+            .expect_err("a mutable returned view cannot decay into an ordinary read");
+        assert_eq!(error.code, "AU3010", "{expression}: {error:?}");
+    }
+
+    crate::check_source(
+        r#"
+class Counter:
+    value: int64
+
+def value_mut(counter: mut Counter) -> view mut int64 from counter:
+    return view mut counter.value
+
+def bump(value: mut int64):
+    value += 1
+
+def main():
+    mut counter = Counter(value=1)
+    view mut selected = value_mut(counter)
+    selected = 2
+    bump(value_mut(counter))
+"#,
+    )
+    .expect("mutable binding and immediate mutable reborrow contexts stay supported");
+}
+
+#[test]
+fn adr0038_copy_view_reads_can_write_through_an_existing_mutable_view() {
+    crate::check_source(
+        r#"
+def main():
+    mut left = 1
+    right = 2
+    view mut output = left
+    view input = right
+    output = input
+    print(left)
+"#,
+    )
+    .expect("a Copy pointee may be read from one view and written through another");
+}
+
+#[test]
+fn adr0038_if_elif_conditions_use_the_previous_false_edge_state() {
+    crate::check_source(
+        r#"
+def bump(value: mut int64) -> bool:
+    value += 1
+    return true
+
+def main():
+    mut value = 1
+    view alias = value
+    if alias == 0:
+        pass
+    elif bump(value):
+        pass
+    print(value)
+"#,
+    )
+    .expect("a loan used only by an earlier condition ends on its false edge");
+}
+
+#[test]
+fn adr0038_recursive_singleton_forwarding_keeps_its_exact_footprint() {
+    crate::check_source(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def select_left(pair: Pair, recurse: bool) -> view int64 from pair:
+    if recurse:
+        return view select_left(pair, false)
+    return view pair.left
+
+def main():
+    mut pair = Pair(left=1, right=2)
+    view left = select_left(pair, true)
+    pair.right = 3
+    print(left)
+"#,
+    )
+    .expect("a recursive returned-view SCC with one fixed projection stays exact");
+}
+
+#[test]
+fn adr0038_returned_shared_iterables_lock_their_origin() {
+    let common = r#"
+def borrow_values(values: list[int64]) -> view list[int64] from values:
+    return view values
+
+def mutate(values: mut list[int64]) -> bool:
+    values[0] = 9
+    return true
+"#;
+    for body in [
+        r#"
+def main():
+    mut values = [1, 2]
+    for item in borrow_values(values):
+        values[0] = 9
+        print(item)
+"#,
+        r#"
+def main():
+    mut values = [1, 2]
+    for index, item in enumerate(borrow_values(values)):
+        values[0] = 9
+        print(index)
+        print(item)
+"#,
+        r#"
+def main():
+    mut values = [1, 2]
+    for left, right in zip(borrow_values(values), [3, 4]):
+        values[0] = 9
+        print(left + right)
+"#,
+        r#"
+def main():
+    mut values = [1, 2]
+    selected = [item for item in borrow_values(values) if mutate(values)]
+    print(selected)
+"#,
+    ] {
+        let source = format!("{common}{body}");
+        let error = crate::check_source(&source)
+            .expect_err("a returned shared iterable must keep its physical origin locked");
+        assert_eq!(error.code, "AU3002", "{source}: {error:?}");
+    }
+}
+
+#[test]
+fn adr0038_returned_view_control_contexts_preserve_capability_and_lifetime() {
+    let matched = crate::check_source(
+        r#"
+def borrow_option(value: Option[int64]) -> view Option[int64] from value:
+    return view value
+
+def main():
+    mut value: Option[int64] = Some(1)
+    match borrow_option(value):
+        case Some(item):
+            value = None
+            print(item)
+        case None:
+            pass
+"#,
+    )
+    .expect_err("a shared returned match scrutinee must lock its origin");
+    assert_eq!(matched.code, "AU3002");
+
+    let managed = crate::check_source(
+        r#"
+class Resource:
+    value: int64
+
+    def close(mut self):
+        print(self.value)
+
+def borrow_resource(resource: Resource) -> view Resource from resource:
+    return view resource
+
+def main():
+    resource = Resource(value=7)
+    with alias = borrow_resource(resource):
+        print(alias.value)
+"#,
+    )
+    .expect_err("a returned view cannot escape into an owned cleanup resource");
+    assert_eq!(managed.code, "AU3010");
+
+    crate::check_source(
+        r#"
+def main():
+    mut value = 0
+    view alias = value
+    for item in range(alias, alias + 1):
+        value = 9
+        print(item)
+"#,
+    )
+    .expect("a view used only to construct the iterable expires before the loop body");
+}
+
+#[test]
+fn adr0038_mutable_returned_views_reject_all_read_only_control_contexts() {
+    for body in [
+        "    assert borrow_bool(value)\n",
+        "    while borrow_bool(value):\n        break\n",
+        "    match borrow_bool(value):\n        case true:\n            pass\n        case false:\n            pass\n",
+        "    print(f\"{borrow_int(number)}\")\n",
+        "    selected = [item for item in borrow_list(values)]\n    print(selected)\n",
+        "    selected = [item for item in [1] if borrow_bool(value)]\n    print(selected)\n",
+        "    selected = [borrow_int(number) for item in [1]]\n    print(selected)\n",
+        "    callback: def() -> bool = lambda [mut value]: borrow_bool(value)\n    print(callback())\n",
+        "    match 1:\n        case item if borrow_bool(value):\n            print(item)\n        case _:\n            pass\n",
+        "    selected = match 1:\n        case item if borrow_bool(value): item\n        case _: 0\n    print(selected)\n",
+        "    box.value += borrow_int(number)\n",
+        "    values[0] += borrow_int(number)\n",
+    ] {
+        let source = format!(
+            r#"
+def borrow_bool(value: mut bool) -> view mut bool from value:
+    return view mut value
+
+def borrow_int(value: mut int64) -> view mut int64 from value:
+    return view mut value
+
+def borrow_list(values: mut list[int64]) -> view mut list[int64] from values:
+    return view mut values
+
+class Box:
+    value: int64
+
+def main():
+    mut value = true
+    mut number = 7
+    mut values = [1]
+    mut box = Box(value=0)
+{body}"#
+        );
+        let error = crate::check_source(&source)
+            .expect_err("mutable returned views cannot decay in read-only control contexts");
+        assert_eq!(error.code, "AU3010", "{source}: {error:?}");
+    }
+}
+
+#[test]
+fn adr0038_returned_view_metadata_lookup_is_inert_for_ordinary_type_calls() {
+    crate::check_source(
+        r#"
+class Factory:
+    def make(value: int64) -> int64:
+        return value
+
+def main():
+    maybe: Option[int64] = Option.Some(1)
+    result: Result[int64, str] = Result.Ok(2)
+    value = Factory.make(3)
+    print(maybe)
+    print(result)
+    print(value)
+"#,
+    )
+    .expect("returned-view metadata probing must not reinterpret ordinary associated calls");
+}
+
+#[test]
+fn adr0038_mutable_result_context_checks_preserve_nested_scopes_and_moves() {
+    crate::check_source(
+        r#"
+class Flag:
+    value: bool
+
+    def okay(self) -> bool:
+        return self.value
+
+class Token:
+    value: str
+
+    def take(own self) -> str:
+        return self.value
+
+enum Choice:
+    Value(Flag)
+    Empty
+
+def main():
+    flags = [Flag(value=true)]
+    selected = [item.value for item in flags if item.okay()]
+    choice = Choice.Value(Flag(value=true))
+    result = match choice:
+        case Value(flag) if flag.okay(): 1
+        case _: 0
+    token = Token(value="kept")
+    print(selected)
+    print(result)
+    print(token.take())
+"#,
+    )
+    .expect("context-only mutable-result checks must retain comprehension, arm, and move state");
+}
+
+#[test]
+fn adr0038_lambda_owned_results_cannot_erase_returned_view_regions() {
+    for body in ["borrow_bool(value)", "(borrow_bool(value),)"] {
+        let source = format!(
+            r#"
+def borrow_bool(value: bool) -> view bool from value:
+    return view value
+
+def main():
+    value = true
+    callback = lambda [value]: {body}
+    print(callback())
+"#,
+        );
+        let error = crate::check_source(&source)
+            .expect_err("an owned lambda result cannot erase a returned-view region");
+        assert_eq!(error.code, "AU3010", "{source}: {error:?}");
+    }
+}
+
+#[test]
+fn adr0038_view_capabilities_follow_receiver_and_argument_passing() {
+    crate::check_source(
+        r#"
+class Box:
+    value: int64
+
+    def inspect(self) -> int64:
+        return self.value
+
+    def change(mut self, value: int64):
+        self.value = value
+
+class Wrapper:
+    box: Box
+
+def shared(box: Box) -> view Box from box:
+    return view box
+
+def borrowed(box: mut Box) -> view mut Box from box:
+    return view mut box
+
+def borrowed_wrapper(wrapper: mut Wrapper) -> view mut Wrapper from wrapper:
+    return view mut wrapper
+
+def main():
+    mut box = Box(value=1)
+    mut wrapper = Wrapper(box=Box(value=3))
+    print(shared(box).inspect())
+    borrowed(box).change(2)
+    borrowed_wrapper(wrapper).box.change(4)
+    print(box.value)
+    print(wrapper.box.value)
+"#,
+    )
+    .expect("returned receivers retain their capability when the receiver mode matches");
+
+    for body in [
+        "    print(borrowed_box(box).inspect())\n",
+        "    print(borrowed_box(box).take())\n",
+        "    print(shared(box).take())\n",
+        "    print(borrowed_values(values).len())\n",
+    ] {
+        let source = format!(
+            r#"
+class Box:
+    value: int64
+
+    def inspect(self) -> int64:
+        return self.value
+
+    def take(own self) -> int64:
+        return self.value
+
+def shared(box: Box) -> view Box from box:
+    return view box
+
+def borrowed_box(box: mut Box) -> view mut Box from box:
+    return view mut box
+
+def borrowed_values(values: mut list[int64]) -> view mut list[int64] from values:
+    return view mut values
+
+def main():
+    mut box = Box(value=1)
+    mut values = [1]
+{body}"#
+        );
+        let error = crate::check_source(&source)
+            .expect_err("a returned receiver cannot decay to another capability");
+        assert_eq!(error.code, "AU3010", "{source}: {error:?}");
+    }
+}
+
+#[test]
+fn adr0038_owned_sinks_cannot_erase_returned_view_regions() {
+    let common = r#"
+trait Add[Rhs, Out]:
+    def add(own self, rhs: own Rhs) -> Out
+
+class Box:
+    value: str
+
+impl Add[Box, Box] for Box:
+    def add(own self, rhs: own Box) -> Box:
+        return Box(value=self.value + rhs.value)
+
+enum Choice:
+    Item(str)
+
+def shared_box(box: Box) -> view Box from box:
+    return view box
+
+def shared_boxes(boxes: list[Box]) -> view list[Box] from boxes:
+    return view boxes
+
+def shared_choice(choice: Choice) -> view Choice from choice:
+    return view choice
+
+def shared_result(result: Result[str, str]) -> view Result[str, str] from result:
+    return view result
+"#;
+    for body in [
+        "    result = shared_box(left) + right\n    print(result.value)\n",
+        "    result = left + shared_box(right)\n    print(result.value)\n",
+        "    boxes.append(shared_box(left))\n",
+        "    match own shared_choice(choice):\n        case Item(text):\n            print(text)\n",
+        "    for item in own shared_boxes(boxes):\n        print(item.value)\n",
+        "    text = try shared_result(outcome)\n    print(text)\n",
+        "    text = shared_box(left).value\n    print(text)\n",
+    ] {
+        let source = format!(
+            r#"{common}
+def use() -> Result[None, str]:
+    left = Box(value="left")
+    right = Box(value="right")
+    mut boxes = list[Box]()
+    choice = Choice.Item("choice")
+    outcome: Result[str, str] = Result.Ok("ok")
+{body}    return Result.Ok(None)
+"#
+        );
+        let error = crate::check_source(&source)
+            .expect_err("an owned sink cannot erase a returned-view region");
+        assert_eq!(error.code, "AU3010", "{source}: {error:?}");
+    }
+
+    let constant = crate::check_source(
+        r#"
+class Box:
+    value: str
+
+def shared(box: Box) -> view Box from box:
+    return view box
+
+BASE = Box(value="base")
+ALIAS = shared(BASE)
+
+def main():
+    print(ALIAS.value)
+"#,
+    )
+    .expect_err("module storage cannot retain a returned view");
+    assert_eq!(constant.code, "AU3010");
+}
+
+#[test]
+fn adr0038_assignment_indices_cannot_read_mutable_returned_views() {
+    let error = crate::check_source(
+        r#"
+def borrowed(index: mut int64) -> view mut int64 from index:
+    return view mut index
+
+def main():
+    mut index = 0
+    mut values = [1]
+    values[borrowed(index)] = 2
+"#,
+    )
+    .expect_err("an assignment index is a read-only value context");
+    assert_eq!(error.code, "AU3010");
+}
+
+#[test]
+fn adr0038_deep_mutable_reborrows_suspend_and_resume_every_ancestor() {
+    crate::check_source(
+        r#"
+def main():
+    mut value = 1
+    view mut first = value
+    view mut second = first
+    view mut third = second
+    third = 2
+    print(first)
+"#,
+    )
+    .expect("a deep contained reborrow must release every ancestor after its last use");
+
+    let suspended = crate::check_source(
+        r#"
+def main():
+    mut value = 1
+    view mut first = value
+    view mut second = first
+    view mut third = second
+    print(first)
+    third = 2
+"#,
+    )
+    .expect_err("a live deep descendant must keep every mutable ancestor suspended");
+    assert_eq!(suspended.code, "AU3002");
+}
+
+#[test]
+fn adr0038_whole_copy_views_cannot_escape_through_owned_returns() {
+    let error = crate::check_source(
+        r#"
+def leak(value: int64) -> int64:
+    view alias = value
+    return alias
+
+def main():
+    print(leak(7))
+"#,
+    )
+    .expect_err("an ordinary return cannot erase a Copy-valued view descriptor");
+    assert_eq!(error.code, "AU3010");
+}
+
+#[test]
+fn adr0038_shared_views_support_direct_read_contexts_and_copy_projections() {
+    crate::check_source(
+        r#"
+class Box:
+    value: int64
+
+def borrow_bool(value: bool) -> view bool from value:
+    return view value
+
+def borrow_index(index: int64) -> view int64 from index:
+    return view index
+
+def borrow_box(box: Box) -> view Box from box:
+    return view box
+
+def main():
+    flag = true
+    index = 0
+    box = Box(value=7)
+    mut target_values = [1, 2]
+    source_values = [1, 2]
+    view local_flag = flag
+    view local_index = index
+    view local_box = box
+    view local_values = source_values
+    assert borrow_bool(flag)
+    selected = [item for item in [1] if local_flag]
+    target_values[borrow_index(index)] = 2
+    first = local_box.value
+    second = borrow_box(box).value
+    third = local_values[0]
+    converted = local_index as int64
+    print(selected)
+    print(first + second + third + converted)
+"#,
+    )
+    .expect("direct reads copy pointee values without storing their view descriptors");
+}
+
+#[test]
+fn adr0038_projected_returned_views_preserve_capability_and_parentage() {
+    let escalation = crate::check_source(
+        r#"
+class Box:
+    value: int64
+
+def shared(box: Box) -> view Box from box:
+    return view box
+
+def escalate(box: mut Box) -> view mut int64 from box:
+    return view mut shared(box).value
+"#,
+    )
+    .expect_err("a projection cannot hide a shared returned-view capability");
+    assert_eq!(escalation.code, "AU3010");
+
+    crate::check_source(
+        r#"
+class Box:
+    value: int64
+
+class Wrapper:
+    box: Box
+
+def borrowed(wrapper: mut Wrapper) -> view mut Wrapper from wrapper:
+    return view mut wrapper
+
+def identity(wrapper: mut Wrapper) -> view mut Wrapper from wrapper:
+    return view mut wrapper
+
+def main():
+    mut wrapper = Wrapper(box=Box(value=1))
+    view mut root = wrapper
+    view mut field = borrowed(root).box
+    field.value = 9
+    print(root.box.value)
+
+    view mut nested = identity(borrowed(root)).box
+    nested.value = 10
+    print(root.box.value)
+"#,
+    )
+    .expect("a projected mutable returned view remains a contained reborrow of its parent");
+}
+
+#[test]
+fn adr0038_match_and_iteration_locks_use_canonical_physical_places() {
+    crate::check_source(
+        r#"
+enum Slot:
+    Filled(str)
+    Empty
+
+def main():
+    mut slot = Slot.Filled("old")
+    match mut slot:
+        case Filled(value):
+            slot = Slot.Empty
+        case Empty:
+            pass
+    match mut slot:
+        case Filled(value):
+            print(value)
+        case Empty:
+            print("empty")
+"#,
+    )
+    .expect("the syntactic `match mut` scrutinee remains an authorized writeback route");
+
+    for source in [
+        r#"
+enum Slot:
+    Filled(str)
+
+def main():
+    mut slot = Slot.Filled("old")
+    view parent = slot
+    match parent:
+        case Filled(value):
+            slot = Slot.Filled("new")
+            print(value)
+"#,
+        r#"
+enum Slot:
+    Filled(str)
+
+def main():
+    mut slot = Slot.Filled("old")
+    view mut parent = slot
+    match mut parent:
+        case Filled(value):
+            slot = Slot.Filled("new")
+            print(value)
+"#,
+        r#"
+enum Slot:
+    Filled(int64)
+
+def main():
+    mut slot = Slot.Filled(1)
+    view mut parent = slot
+    match mut parent:
+        case Filled(value):
+            view mut child = parent
+            match mut child:
+                case Filled(other):
+                    other = 2
+"#,
+        r#"
+def main():
+    mut values = [1, 2]
+    view mut parent = values
+    for item in mut parent:
+        view mut child = parent
+        child[0] = 9
+        print(item)
+"#,
+    ] {
+        let error = crate::check_source(source)
+            .expect_err("a syntactic view alias must not bypass a physical match or loop lock");
+        assert_eq!(error.code, "AU3002", "{source}: {error:?}");
+    }
+}
+
+#[test]
+fn adr0038_call_initialized_view_aliases_keep_exact_returned_footprints() {
+    crate::check_source(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def inner(pair: Pair) -> view int64 from pair:
+    return view pair.left
+
+def outer(pair: Pair) -> view int64 from pair:
+    view alias = inner(pair)
+    return view alias
+
+def main():
+    mut pair = Pair(left=1, right=2)
+    view selected = outer(pair)
+    pair.right = 3
+    print(selected)
+"#,
+    )
+    .expect("a call-initialized local alias must retain its unique transitive projection");
+}
+
+#[test]
+fn adr0038_concrete_generic_trait_calls_narrow_returned_view_footprints() {
+    crate::check_source(
+        r#"
+trait Project:
+    def get(self) -> view int64 from self
+
+trait Alternate:
+    def get(self) -> view int64 from self
+
+class LeftBox:
+    left: int64
+    right: int64
+
+class RightBox:
+    left: int64
+    right: int64
+
+class Envelope[T]:
+    value: T
+
+impl Project for LeftBox:
+    def get(self) -> view int64 from self:
+        return view self.left
+
+impl Project for RightBox:
+    def get(self) -> view int64 from self:
+        return view self.right
+
+impl Alternate for LeftBox:
+    def get(self) -> view int64 from self:
+        return view self.right
+
+def forward[T: Project](value: T) -> view int64 from value:
+    view selected = value.get()
+    return view selected
+
+def identity[T](value: T) -> view T from value:
+    return view value
+
+def through_envelope[T: Project](envelope: Envelope[T]) -> view int64 from envelope:
+    view selected = forward(envelope.value)
+    return view selected
+
+def through_alias[T: Project](value: T) -> view int64 from value:
+    view alias = identity(value)
+    return view forward(alias)
+
+def main():
+    mut explicit_box = LeftBox(left=1, right=2)
+    mut inferred_box = LeftBox(left=3, right=4)
+    mut grouped_box = LeftBox(left=5, right=6)
+    mut named_box = LeftBox(left=7, right=8)
+    mut envelope = Envelope(value=LeftBox(left=9, right=10))
+    mut aliased_box = LeftBox(left=11, right=12)
+    view explicit = forward[LeftBox](explicit_box)
+    explicit_box.right = 20
+    view inferred = forward(inferred_box)
+    inferred_box.right = 40
+    view grouped = (forward[LeftBox])(grouped_box)
+    grouped_box.right = 60
+    view named = forward[LeftBox](value=named_box)
+    named_box.right = 80
+    view parameterized = through_envelope[LeftBox](envelope)
+    envelope.value.right = 100
+    view aliased = through_alias[LeftBox](aliased_box)
+    aliased_box.right = 120
+    print(explicit + inferred + grouped + named + parameterized + aliased)
+"#,
+    )
+    .expect("concrete generic dispatch must select one implementation footprint at each call");
+}
+
+#[test]
+fn adr0038_imported_generic_specializations_keep_owner_relative_footprints() {
+    let unique = format!(
+        "aura-sema-returned-view-specialization-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should follow the Unix epoch")
+            .as_nanos()
+    );
+    let package = std::env::temp_dir().join(unique);
+    let src = package.join("src");
+    std::fs::create_dir_all(&src).expect("temporary specialization package should exist");
+    std::fs::write(
+        package.join("Aura.toml"),
+        "[package]\nname = \"returned_view_specialization\"\nversion = \"0.1.0\"\nedition = \"2026\"\n",
+    )
+    .expect("temporary package manifest should be writable");
+    std::fs::write(
+        src.join("api.au"),
+        r#"public trait Project:
+    def get(self) -> view int64 from self
+
+public trait Alternate:
+    def get(self) -> view int64 from self
+
+public class LeftBox:
+    public left: int64
+    public right: int64
+
+public class RightBox:
+    public left: int64
+    public right: int64
+
+impl Project for LeftBox:
+    def get(self) -> view int64 from self:
+        return view self.left
+
+impl Project for RightBox:
+    def get(self) -> view int64 from self:
+        return view self.right
+
+impl Alternate for LeftBox:
+    def get(self) -> view int64 from self:
+        return view self.right
+
+public def forward[T: Project](value: T) -> view int64 from value:
+    view selected = value.get()
+    return view selected
+"#,
+    )
+    .expect("temporary specialization module should be writable");
+    let main_path = src.join("main.au");
+    std::fs::write(
+        &main_path,
+        r#"import api
+
+def main():
+    mut explicit_box = api.LeftBox(left=1, right=2)
+    mut inferred_box = api.LeftBox(left=3, right=4)
+    view explicit = api.forward[api.LeftBox](explicit_box)
+    explicit_box.right = 20
+    view inferred = api.forward(inferred_box)
+    inferred_box.right = 40
+    print(explicit + inferred)
+"#,
+    )
+    .expect("temporary specialization entry should be writable");
+
+    let result = crate::check_path(&main_path);
+    let _ = std::fs::remove_dir_all(&package);
+    result.expect("imported explicit and inferred calls must retain declaration-owner precision");
 }

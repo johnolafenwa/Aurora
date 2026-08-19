@@ -1,6 +1,6 @@
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::slice;
@@ -142,6 +142,8 @@ pub(crate) fn run_entry_with_stdout_sink_and_program_args_trusted(
     stdout_sink: Option<StdoutSink>,
     program_args: Vec<String>,
 ) -> Result<RunOutput> {
+    crate::mir::validate_loan_flow(module)
+        .map_err(|error| Diagnostic::coded("AU4001", format!("invalid MIR loan flow: {error}")))?;
     crate::runtime_config::validate_runtime_configuration()?;
     let entry = entry.map(|name| name.to_string());
     let module = module.clone();
@@ -213,23 +215,21 @@ fn reject_untrusted_extern_calls(module: &MirModule) -> Result<()> {
         .flat_map(|function| &function.blocks)
         .flat_map(|block| &block.instructions)
         .find_map(|instruction| match instruction {
-            Instruction::Assign {
-                value:
-                    Rvalue::Call {
-                        callee: CallTarget::Extern(call),
-                        ..
-                    },
-                ..
-            } => Some(call.symbol.as_str()),
+            Instruction::Assign { value, .. } | Instruction::WriteLoan { value, .. } => match value
+            {
+                Rvalue::Call {
+                    callee: CallTarget::Extern(call),
+                    ..
+                } => Some(call.symbol.as_str()),
+                _ => None,
+            },
             Instruction::Safepoint
             | Instruction::BeginLoan { .. }
             | Instruction::BeginReturnedLoan { .. }
             | Instruction::Reborrow { .. }
             | Instruction::ReadLoan { .. }
-            | Instruction::WriteLoan { .. }
             | Instruction::EndLoan { .. }
             | Instruction::ReturnLoan { .. }
-            | Instruction::Assign { .. }
             | Instruction::Eval { .. }
             | Instruction::PushCleanup { .. }
             | Instruction::PopCleanup { .. } => None,
@@ -340,7 +340,9 @@ fn rvalue_materializes_process_run(value: &Rvalue) -> bool {
             let callee_materializes = match callee {
                 CallTarget::Name(_) | CallTarget::Extern(_) => false,
                 CallTarget::Value(value) => operand_is_process_run_function(value),
-                CallTarget::Member { object, .. } => operand_is_process_run_function(object),
+                CallTarget::Member { object, .. } | CallTarget::TraitMember { object, .. } => {
+                    operand_is_process_run_function(object)
+                }
             };
             callee_materializes || args_materialize_process_run(args)
         }
@@ -410,6 +412,8 @@ const MAX_EMBEDDED_RUNTIME_BYTES: usize = 1 << 30;
 const MAX_RUNTIME_BLOCKS: usize = 1_000_000;
 const MAX_RUNTIME_INSTRUCTIONS: usize = 1_000_000;
 const MAX_RUNTIME_TERMINATOR_ARMS: usize = 1_000_000;
+const MAX_RUNTIME_LOAN_PROJECTIONS: usize = 100_000;
+const MAX_RUNTIME_LOAN_PATH_BYTES: usize = 1 << 20;
 
 #[derive(Clone, Copy)]
 struct RuntimeModuleLimits {
@@ -423,6 +427,187 @@ const DEFAULT_RUNTIME_MODULE_LIMITS: RuntimeModuleLimits = RuntimeModuleLimits {
     max_instructions: MAX_RUNTIME_INSTRUCTIONS,
     max_terminator_arms: MAX_RUNTIME_TERMINATOR_ARMS,
 };
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RuntimeLoanExpansion {
+    alternatives: usize,
+    path_bytes: usize,
+}
+
+fn runtime_append_loan_projection(
+    base: RuntimeLoanExpansion,
+    projection: &str,
+) -> RuntimeLoanExpansion {
+    RuntimeLoanExpansion {
+        alternatives: base.alternatives,
+        path_bytes: base.path_bytes.saturating_add(
+            base.alternatives.saturating_mul(
+                ((!projection.is_empty()) as usize).saturating_add(projection.len()),
+            ),
+        ),
+    }
+}
+
+fn runtime_returned_loan_expansion(
+    base: RuntimeLoanExpansion,
+    projections: &[String],
+) -> RuntimeLoanExpansion {
+    let projections = projections
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let projection_count = projections.len();
+    let projection_bytes = projections.iter().fold(0usize, |total, projection| {
+        total.saturating_add(((!projection.is_empty()) as usize).saturating_add(projection.len()))
+    });
+    RuntimeLoanExpansion {
+        alternatives: base.alternatives.saturating_mul(projection_count),
+        path_bytes: base
+            .path_bytes
+            .saturating_mul(projection_count)
+            .saturating_add(base.alternatives.saturating_mul(projection_bytes)),
+    }
+}
+
+fn runtime_loan_expansion_for_name<'a>(
+    name: &'a str,
+    definitions: &BTreeMap<&'a str, Vec<&'a Instruction>>,
+    memo: &mut BTreeMap<&'a str, RuntimeLoanExpansion>,
+    visiting: &mut BTreeSet<&'a str>,
+) -> RuntimeLoanExpansion {
+    if let Some(expansion) = memo.get(name) {
+        return *expansion;
+    }
+    if visiting.len() >= 256 {
+        return RuntimeLoanExpansion {
+            alternatives: crate::mir::MAX_VALIDATED_LOAN_ALTERNATIVES.saturating_add(1),
+            path_bytes: crate::mir::MAX_VALIDATED_EXPANDED_LOAN_PATH_BYTES.saturating_add(1),
+        };
+    }
+    if !visiting.insert(name) {
+        return RuntimeLoanExpansion {
+            alternatives: crate::mir::MAX_VALIDATED_LOAN_ALTERNATIVES.saturating_add(1),
+            path_bytes: crate::mir::MAX_VALIDATED_EXPANDED_LOAN_PATH_BYTES.saturating_add(1),
+        };
+    }
+    let mut maximum = RuntimeLoanExpansion {
+        alternatives: 1,
+        path_bytes: name.len(),
+    };
+    if let Some(candidates) = definitions.get(name) {
+        maximum = RuntimeLoanExpansion::default();
+        for instruction in candidates {
+            let candidate =
+                runtime_loan_expansion_for_instruction(instruction, definitions, memo, visiting);
+            maximum.alternatives = maximum.alternatives.max(candidate.alternatives);
+            maximum.path_bytes = maximum.path_bytes.max(candidate.path_bytes);
+        }
+    }
+    visiting.remove(name);
+    memo.insert(name, maximum);
+    maximum
+}
+
+fn runtime_loan_expansion_for_place<'a>(
+    place: &'a str,
+    definitions: &BTreeMap<&'a str, Vec<&'a Instruction>>,
+    memo: &mut BTreeMap<&'a str, RuntimeLoanExpansion>,
+    visiting: &mut BTreeSet<&'a str>,
+) -> RuntimeLoanExpansion {
+    let (root, projection) = place.split_once('.').unwrap_or((place, ""));
+    let base = if definitions.contains_key(root) {
+        runtime_loan_expansion_for_name(root, definitions, memo, visiting)
+    } else {
+        RuntimeLoanExpansion {
+            alternatives: 1,
+            path_bytes: root.len(),
+        }
+    };
+    runtime_append_loan_projection(base, projection)
+}
+
+fn runtime_loan_expansion_for_instruction<'a>(
+    instruction: &'a Instruction,
+    definitions: &BTreeMap<&'a str, Vec<&'a Instruction>>,
+    memo: &mut BTreeMap<&'a str, RuntimeLoanExpansion>,
+    visiting: &mut BTreeSet<&'a str>,
+) -> RuntimeLoanExpansion {
+    match instruction {
+        Instruction::BeginLoan { source, .. } => RuntimeLoanExpansion {
+            alternatives: 1,
+            path_bytes: source.len(),
+        },
+        Instruction::BeginReturnedLoan {
+            origin,
+            projections,
+            ..
+        } => runtime_returned_loan_expansion(
+            runtime_loan_expansion_for_place(origin, definitions, memo, visiting),
+            projections,
+        ),
+        Instruction::Reborrow {
+            parent, projection, ..
+        } => runtime_append_loan_projection(
+            runtime_loan_expansion_for_name(parent, definitions, memo, visiting),
+            projection,
+        ),
+        _ => RuntimeLoanExpansion::default(),
+    }
+}
+
+fn validate_runtime_loan_expansion_complexity(
+    function: &MirFunction,
+) -> std::result::Result<usize, Diagnostic> {
+    let mut definitions = BTreeMap::<&str, Vec<&Instruction>>::new();
+    for instruction in function
+        .blocks
+        .iter()
+        .flat_map(|block| block.instructions.iter())
+    {
+        let loan = match instruction {
+            Instruction::BeginLoan { loan, .. }
+            | Instruction::BeginReturnedLoan { loan, .. }
+            | Instruction::Reborrow { loan, .. } => loan,
+            _ => continue,
+        };
+        definitions.entry(loan).or_default().push(instruction);
+    }
+
+    let mut memo = BTreeMap::new();
+    let mut total_path_bytes = 0usize;
+    for instruction in function
+        .blocks
+        .iter()
+        .flat_map(|block| block.instructions.iter())
+        .filter(|instruction| {
+            matches!(
+                instruction,
+                Instruction::BeginReturnedLoan { .. } | Instruction::Reborrow { .. }
+            )
+        })
+    {
+        let expansion = runtime_loan_expansion_for_instruction(
+            instruction,
+            &definitions,
+            &mut memo,
+            &mut BTreeSet::new(),
+        );
+        if expansion.alternatives > crate::mir::MAX_VALIDATED_LOAN_ALTERNATIVES {
+            return Err(Diagnostic::new(format!(
+                "embedded MIR exceeds the supported expanded loan alternative limit of {}",
+                crate::mir::MAX_VALIDATED_LOAN_ALTERNATIVES
+            )));
+        }
+        total_path_bytes = total_path_bytes.saturating_add(expansion.path_bytes);
+        if total_path_bytes > crate::mir::MAX_VALIDATED_EXPANDED_LOAN_PATH_BYTES {
+            return Err(Diagnostic::new(format!(
+                "embedded MIR exceeds the supported expanded loan-path byte limit of {}",
+                crate::mir::MAX_VALIDATED_EXPANDED_LOAN_PATH_BYTES
+            )));
+        }
+    }
+    Ok(total_path_bytes)
+}
 
 fn render_runtime_error(path: &str, source: &str, error: &Diagnostic) -> String {
     error.render_with_source(path, source)
@@ -454,6 +639,9 @@ fn validate_runtime_module_complexity_with_limits(
     let mut total_blocks = 0usize;
     let mut total_instructions = 0usize;
     let mut total_arms = 0usize;
+    let mut total_loan_projections = 0usize;
+    let mut total_loan_path_bytes = 0usize;
+    let mut total_expanded_loan_path_bytes = 0usize;
     for function in module.functions.iter().chain(module.top_level.iter()) {
         total_blocks = total_blocks.saturating_add(function.blocks.len());
         if total_blocks > limits.max_blocks {
@@ -480,6 +668,52 @@ fn validate_runtime_module_complexity_with_limits(
                     limits.max_terminator_arms
                 )));
             }
+            for instruction in &block.instructions {
+                match instruction {
+                    Instruction::BeginLoan { source, .. } => {
+                        total_loan_path_bytes = total_loan_path_bytes.saturating_add(source.len());
+                    }
+                    Instruction::BeginReturnedLoan {
+                        origin,
+                        projections,
+                        ..
+                    } => {
+                        total_loan_projections =
+                            total_loan_projections.saturating_add(projections.len());
+                        total_loan_path_bytes = total_loan_path_bytes
+                            .saturating_add(origin.len())
+                            .saturating_add(projections.iter().map(String::len).sum::<usize>());
+                    }
+                    Instruction::Reborrow {
+                        parent, projection, ..
+                    } => {
+                        total_loan_path_bytes = total_loan_path_bytes
+                            .saturating_add(parent.len())
+                            .saturating_add(projection.len());
+                    }
+                    _ => {}
+                }
+                if total_loan_projections > MAX_RUNTIME_LOAN_PROJECTIONS {
+                    return Err(Diagnostic::new(format!(
+                        "embedded MIR exceeds the supported returned-loan projection limit of {}",
+                        MAX_RUNTIME_LOAN_PROJECTIONS
+                    )));
+                }
+                if total_loan_path_bytes > MAX_RUNTIME_LOAN_PATH_BYTES {
+                    return Err(Diagnostic::new(format!(
+                        "embedded MIR exceeds the supported loan-path byte limit of {}",
+                        MAX_RUNTIME_LOAN_PATH_BYTES
+                    )));
+                }
+            }
+        }
+        total_expanded_loan_path_bytes = total_expanded_loan_path_bytes
+            .saturating_add(validate_runtime_loan_expansion_complexity(function)?);
+        if total_expanded_loan_path_bytes > crate::mir::MAX_VALIDATED_EXPANDED_LOAN_PATH_BYTES {
+            return Err(Diagnostic::new(format!(
+                "embedded MIR exceeds the supported expanded loan-path byte limit of {}",
+                crate::mir::MAX_VALIDATED_EXPANDED_LOAN_PATH_BYTES
+            )));
         }
     }
     Ok(())
@@ -636,7 +870,11 @@ struct MirRuntime {
     task_ancestry: Vec<RuntimeTaskFrame>,
     return_type_stack: Vec<Type>,
     constant_states: Arc<Mutex<HashMap<String, MirConstantState>>>,
+    /// Projection returned by the most recently completed child call and
+    /// awaiting BeginReturnedLoan in the current frame.
     pending_returned_view_projection: Option<String>,
+    /// Projection selected by ReturnLoan for the current function itself.
+    outgoing_returned_view_projection: Option<String>,
 }
 
 #[derive(Clone)]
@@ -647,9 +885,24 @@ enum MirConstantState {
 }
 
 struct CallOutcome {
-    value: Value,
+    value: CallValueOutcome,
     updated_receiver: Option<Value>,
     updated_params: Vec<(usize, Value)>,
+    returned_view_projection: Option<String>,
+}
+
+enum CallValueOutcome {
+    Completed(Result<Value>),
+    Cancelled,
+}
+
+impl CallValueOutcome {
+    fn into_result(self) -> Result<Value> {
+        match self {
+            Self::Completed(result) => result,
+            Self::Cancelled => panic::panic_any(TaskCancelledSignal),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -697,13 +950,14 @@ struct Env {
     values: HashMap<String, Value>,
     shared_values: HashMap<String, Arc<Value>>,
     types: HashMap<String, Type>,
-    loans: HashMap<String, RuntimeLoan>,
+    loans: BTreeMap<String, RuntimeLoan>,
 }
 
 #[derive(Clone)]
 struct RuntimeLoan {
     source: String,
     mutable: bool,
+    parent: Option<String>,
 }
 
 #[cfg(test)]
@@ -747,6 +1001,37 @@ impl Env {
     }
 
     fn begin_loan(&mut self, loan: &str, source: &str, mutable: bool) -> Result<()> {
+        if loan.is_empty() || loan.contains('.') {
+            return Err(Diagnostic::new(format!(
+                "MIR loan descriptor `{loan}` must be one undotted local identifier"
+            )));
+        }
+        split_place_segments(source)?;
+        if self.loans.contains_key(loan) {
+            return Err(Diagnostic::new(format!(
+                "cannot begin already-active MIR loan `{loan}`"
+            )));
+        }
+        let source_root = source.split('.').next().unwrap_or_default();
+        if loan == source_root {
+            return Err(Diagnostic::new(format!(
+                "MIR loan descriptor `{loan}` cannot shadow its source root"
+            )));
+        }
+        let parent = self
+            .loans
+            .contains_key(source_root)
+            .then(|| source_root.to_string());
+        if mutable
+            && parent
+                .as_deref()
+                .and_then(|parent| self.loans.get(parent))
+                .is_some_and(|parent| !parent.mutable)
+        {
+            return Err(Diagnostic::new(format!(
+                "cannot create mutable MIR reborrow `{loan}` from shared loan `{source_root}`"
+            )));
+        }
         let source = self.resolve_loan_place(source)?;
         if !self
             .values
@@ -759,9 +1044,63 @@ impl Env {
                 "cannot begin MIR loan `{loan}` from unknown place `{source}`"
             )));
         }
-        self.loans
-            .insert(loan.to_string(), RuntimeLoan { source, mutable });
+        let mut ancestors = std::collections::BTreeSet::new();
+        let mut current = parent.as_deref();
+        while let Some(name) = current {
+            if !ancestors.insert(name.to_string()) {
+                break;
+            }
+            current = self.loans.get(name).and_then(|loan| loan.parent.as_deref());
+        }
+        for (active_name, active) in &self.loans {
+            if ancestors.contains(active_name) {
+                continue;
+            }
+            if crate::mir::mir_place_paths_overlap(&source, &active.source)
+                && (mutable || active.mutable)
+            {
+                return Err(Diagnostic::new(format!(
+                    "cannot begin MIR loan `{loan}` because it overlaps active {} loan `{active_name}`",
+                    if active.mutable { "mutable" } else { "shared" }
+                )));
+            }
+        }
+        self.loans.insert(
+            loan.to_string(),
+            RuntimeLoan {
+                source,
+                mutable,
+                parent,
+            },
+        );
         Ok(())
+    }
+
+    fn loan_has_active_child(&self, loan: &str) -> bool {
+        self.loans.keys().any(|candidate| {
+            let mut current = self
+                .loans
+                .get(candidate)
+                .and_then(|loan| loan.parent.as_deref());
+            let mut seen = std::collections::BTreeSet::new();
+            while let Some(parent) = current {
+                if !seen.insert(parent.to_string()) {
+                    return false;
+                }
+                if parent == loan {
+                    return true;
+                }
+                current = self
+                    .loans
+                    .get(parent)
+                    .and_then(|loan| loan.parent.as_deref());
+            }
+            false
+        })
+    }
+
+    fn loan_is_suspended(&self, loan: &str) -> bool {
+        self.loans.get(loan).is_some_and(|loan| loan.mutable) && self.loan_has_active_child(loan)
     }
 
     fn returned_view_projection(&self, loan: &str, origin: &str) -> Result<String> {
@@ -781,6 +1120,11 @@ impl Env {
     }
 
     fn end_loan(&mut self, loan: &str) -> Result<()> {
+        if self.loan_has_active_child(loan) {
+            return Err(Diagnostic::new(format!(
+                "cannot end MIR loan `{loan}` while a child reborrow remains active"
+            )));
+        }
         self.loans
             .remove(loan)
             .map(|_| ())
@@ -891,6 +1235,22 @@ impl Env {
     }
 
     fn read_place(&self, place: &str) -> Result<Value> {
+        let original_root = place.split('.').next().unwrap_or_default();
+        if self.loans.contains_key(original_root) && self.loan_is_suspended(original_root) {
+            return Err(Diagnostic::new(format!(
+                "cannot read suspended MIR loan `{original_root}` while a child reborrow remains active"
+            )));
+        }
+        if !self.loans.contains_key(original_root) {
+            let resolved = self.resolve_loan_place(place)?;
+            if self.loans.values().any(|loan| {
+                loan.mutable && crate::mir::mir_place_paths_overlap(&resolved, &loan.source)
+            }) {
+                return Err(Diagnostic::new(format!(
+                    "cannot read MIR place `{place}` while a mutable loan remains active"
+                )));
+            }
+        }
         #[cfg(test)]
         MIR_VALUE_CLONE_COUNT.with(|count| count.set(count.get() + 1));
         let value = self.place_ref(place)?;
@@ -902,6 +1262,7 @@ impl Env {
     }
 
     fn take_place(&mut self, place: &str) -> Result<Value> {
+        self.ensure_place_move_allowed(place)?;
         let resolved_place = self.resolve_loan_place(place)?;
         let place = resolved_place.as_str();
         let segments = split_place_segments(place)?;
@@ -930,6 +1291,7 @@ impl Env {
     }
 
     fn place_mut(&mut self, place: &str) -> Result<&mut Value> {
+        self.ensure_place_mutation_allowed(place)?;
         let resolved_place = self.resolve_loan_place(place)?;
         let place = resolved_place.as_str();
         let segments = split_place_segments(place)?;
@@ -947,6 +1309,7 @@ impl Env {
     }
 
     fn take_variant_payload(&mut self, place: &str, index: usize) -> Result<Value> {
+        self.ensure_place_move_allowed(place)?;
         let resolved_place = self.resolve_loan_place(place)?;
         let place = resolved_place.as_str();
         let segments = split_place_segments(place)?;
@@ -993,6 +1356,7 @@ impl Env {
     }
 
     fn take_tuple_element(&mut self, place: &str, index: usize) -> Result<Value> {
+        self.ensure_place_move_allowed(place)?;
         let resolved_place = self.resolve_loan_place(place)?;
         let place = resolved_place.as_str();
         let segments = split_place_segments(place)?;
@@ -1023,14 +1387,7 @@ impl Env {
     }
 
     fn write_place(&mut self, place: &str, value: Value) -> Result<()> {
-        let original_root = place.split('.').next().unwrap_or_default();
-        if let Some(loan) = self.loans.get(original_root) {
-            if !loan.mutable {
-                return Err(Diagnostic::new(format!(
-                    "cannot write through shared MIR loan `{original_root}`"
-                )));
-            }
-        }
+        self.ensure_place_mutation_allowed(place)?;
         let resolved_place = self.resolve_loan_place(place)?;
         let place = resolved_place.as_str();
         let segments = split_place_segments(place)?;
@@ -1053,6 +1410,54 @@ impl Env {
             .map(|segment| segment.as_str())
             .collect::<Vec<_>>();
         write_nested_place(root_value, &rest_refs, value, place)
+    }
+
+    fn ensure_place_mutation_allowed(&self, place: &str) -> Result<()> {
+        let original_root = place.split('.').next().unwrap_or_default();
+        if let Some(loan) = self.loans.get(original_root) {
+            if !loan.mutable {
+                return Err(Diagnostic::new(format!(
+                    "cannot write through shared MIR loan `{original_root}`"
+                )));
+            }
+            if self.loan_is_suspended(original_root) {
+                return Err(Diagnostic::new(format!(
+                    "cannot write suspended MIR loan `{original_root}` while a child reborrow remains active"
+                )));
+            }
+            return Ok(());
+        }
+        let resolved = self.resolve_loan_place(place)?;
+        if self
+            .loans
+            .values()
+            .any(|loan| crate::mir::mir_place_paths_overlap(&resolved, &loan.source))
+        {
+            return Err(Diagnostic::new(format!(
+                "cannot write locked MIR place `{place}` while a loan remains active"
+            )));
+        }
+        Ok(())
+    }
+
+    fn ensure_place_move_allowed(&self, place: &str) -> Result<()> {
+        let original_root = place.split('.').next().unwrap_or_default();
+        if self.loans.contains_key(original_root) {
+            return Err(Diagnostic::new(format!(
+                "cannot move through active MIR loan `{original_root}`"
+            )));
+        }
+        let resolved = self.resolve_loan_place(place)?;
+        if self
+            .loans
+            .values()
+            .any(|loan| crate::mir::mir_place_paths_overlap(&resolved, &loan.source))
+        {
+            return Err(Diagnostic::new(format!(
+                "cannot move locked MIR place `{place}` while a loan remains active"
+            )));
+        }
+        Ok(())
     }
 
     fn write_shared_place(&mut self, place: &str, value: Arc<Value>) -> Result<()> {
@@ -1168,6 +1573,19 @@ fn split_place_segments(place: &str) -> Result<Vec<String>> {
         return Err(Diagnostic::new(format!("invalid MIR place `{}`", place)));
     }
     segments.push(current);
+    for segment in segments.iter().skip(1) {
+        if segment.bytes().all(|byte| byte.is_ascii_digit()) {
+            let canonical = segment
+                .parse::<usize>()
+                .map_err(|_| Diagnostic::new(format!("invalid MIR place `{place}`")))?
+                .to_string();
+            if canonical != *segment {
+                return Err(Diagnostic::new(format!(
+                    "non-canonical tuple projection `{segment}` in MIR place `{place}`"
+                )));
+            }
+        }
+    }
     Ok(segments)
 }
 
@@ -1813,6 +2231,7 @@ impl MirRuntime {
             return_type_stack: Vec::new(),
             constant_states: Arc::new(Mutex::new(HashMap::new())),
             pending_returned_view_projection: None,
+            outgoing_returned_view_projection: None,
         }
     }
 
@@ -1845,9 +2264,12 @@ impl MirRuntime {
                 "missing MIR initializer `{initializer}` for module constant `{key}`"
             ))
         })?;
-        match self.call_function(&function, None, Vec::new()) {
-            Ok(outcome) => {
-                let stored = Arc::new(outcome.value);
+        match self
+            .call_function(&function, None, Vec::new())
+            .and_then(|outcome| outcome.value.into_result())
+        {
+            Ok(value) => {
+                let stored = Arc::new(value);
                 self.constant_states
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1890,9 +2312,21 @@ impl MirRuntime {
     }
 
     fn find_trait_impl_method(&self, receiver_ty: &Type, field: &str) -> Option<&MirMethod> {
+        self.find_trait_impl_method_for_trait(receiver_ty, None, field)
+    }
+
+    fn find_trait_impl_method_for_trait(
+        &self,
+        receiver_ty: &Type,
+        trait_name: Option<&str>,
+        field: &str,
+    ) -> Option<&MirMethod> {
         let mut best = None;
         let mut best_specificity = 0usize;
         for trait_impl in &self.trait_impls {
+            if trait_name.is_some_and(|name| trait_impl.trait_name != name) {
+                continue;
+            }
             let mut type_params = std::collections::BTreeSet::new();
             collect_type_params_from_type(&trait_impl.for_type, &mut type_params);
             let mut substitutions = HashMap::new();
@@ -1972,7 +2406,9 @@ impl MirRuntime {
             outcome.updated_params,
             env,
         )?;
-        Ok(outcome.value)
+        let value = outcome.value.into_result()?;
+        self.publish_returned_view_projection(outcome.returned_view_projection);
+        Ok(value)
     }
 
     fn find_from_trait_impl_method(
@@ -2058,7 +2494,7 @@ impl MirRuntime {
             }],
             None,
         )?;
-        Ok(outcome.value)
+        outcome.value.into_result()
     }
 
     fn find_trait_impl_method_for_class_name(
@@ -2112,7 +2548,7 @@ impl MirRuntime {
             });
             function.and_then(|function| {
                 self.call_function(&function, None, Vec::new())
-                    .map(|outcome| outcome.value)
+                    .and_then(|outcome| outcome.value.into_result())
             })
         } else {
             self.run_main()
@@ -2123,7 +2559,10 @@ impl MirRuntime {
 
     fn run_main(&mut self) -> Result<Value> {
         if let Some(main_fn) = self.functions.get("main").cloned() {
-            return Ok(self.call_function(&main_fn, None, Vec::new())?.value);
+            return self
+                .call_function(&main_fn, None, Vec::new())?
+                .value
+                .into_result();
         }
 
         let Some(top_level) = self.module.top_level.clone() else {
@@ -2131,7 +2570,9 @@ impl MirRuntime {
                 "no `main` function or top-level script statements were found",
             ));
         };
-        Ok(self.call_function(&top_level, None, Vec::new())?.value)
+        self.call_function(&top_level, None, Vec::new())?
+            .value
+            .into_result()
     }
 
     fn infer_value_type(value: &Value) -> Option<Type> {
@@ -2372,18 +2813,24 @@ impl MirRuntime {
         let mut index = 0usize;
         while index < rest.len() {
             let segment = &rest[index];
-            let Type::Named(class_name, args) = current else {
-                return None;
+            current = match current {
+                Type::Tuple(elements) => {
+                    let tuple_index = segment.parse::<usize>().ok()?;
+                    elements.get(tuple_index)?.clone()
+                }
+                Type::Named(class_name, args) => {
+                    let class = self.classes.get(&class_name)?;
+                    let field = class.fields.iter().find(|field| field.name == *segment)?;
+                    let substitutions = class
+                        .type_params
+                        .iter()
+                        .cloned()
+                        .zip(args)
+                        .collect::<HashMap<_, _>>();
+                    substitute_type(&field.ty, &substitutions)
+                }
+                _ => return None,
             };
-            let class = self.classes.get(&class_name)?;
-            let field = class.fields.iter().find(|field| field.name == *segment)?;
-            let substitutions = class
-                .type_params
-                .iter()
-                .cloned()
-                .zip(args)
-                .collect::<HashMap<_, _>>();
-            current = substitute_type(&field.ty, &substitutions);
             index += 1;
         }
 
@@ -2449,6 +2896,43 @@ impl MirRuntime {
     }
 
     fn call_function_with_receiver_type(
+        &mut self,
+        function: &MirFunction,
+        receiver: Option<Value>,
+        args: Vec<EvaluatedMirArg>,
+        expected_return_type: Option<&Type>,
+        concrete_function_type: Option<&Type>,
+        receiver_type: Option<&Type>,
+    ) -> Result<CallOutcome> {
+        // A returned-view projection belongs to one Aura invocation. In
+        // particular, cleanup runs after ReturnLoan and may itself call a
+        // returned-view function. Keep that nested handoff inside the nested
+        // call and return the completed descriptor alongside the value.
+        let caller_projection = self.pending_returned_view_projection.take();
+        let caller_outgoing_projection = self.outgoing_returned_view_projection.take();
+        let outcome = self.call_function_with_receiver_type_unscoped(
+            function,
+            receiver,
+            args,
+            expected_return_type,
+            concrete_function_type,
+            receiver_type,
+        );
+        // A callee can directly consume a returned view without forwarding
+        // it. Discard that unconsumed child token; only ReturnLoan constitutes
+        // this invocation's outgoing handoff.
+        self.pending_returned_view_projection = None;
+        let returned_view_projection = self.outgoing_returned_view_projection.take();
+        self.pending_returned_view_projection = caller_projection;
+        self.outgoing_returned_view_projection = caller_outgoing_projection;
+        outcome.map(|mut outcome| {
+            outcome.returned_view_projection = returned_view_projection;
+            outcome
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn call_function_with_receiver_type_unscoped(
         &mut self,
         function: &MirFunction,
         receiver: Option<Value>,
@@ -2541,30 +3025,40 @@ impl MirRuntime {
 
             let return_type = substitute_type(&function.return_type, &substitutions);
             self.return_type_stack.push(return_type);
-            let value_result = self.execute_function(function, &mut env);
+            let value = match panic::catch_unwind(AssertUnwindSafe(|| {
+                self.execute_function(function, &mut env)
+            })) {
+                Ok(result) => CallValueOutcome::Completed(result),
+                Err(payload) if payload.is::<TaskCancelledSignal>() => CallValueOutcome::Cancelled,
+                Err(payload) => panic::resume_unwind(payload),
+            };
             self.return_type_stack.pop();
-            let value = value_result?;
             let updated_receiver = if function.receiver == Some(MirReceiverKind::BorrowMut) {
-                Some(env.read_place("self")?)
+                Some(try_clone_mir_value(env.place_ref("self")?)?)
             } else {
                 None
             };
             let mut updated_params = Vec::new();
             for (index, param) in function.params.iter().enumerate() {
                 if param.passing == MirReceiverKind::BorrowMut {
-                    updated_params.push((index, env.read_place(&param.name)?));
+                    updated_params.push((index, try_clone_mir_value(env.place_ref(&param.name)?)?));
                 }
             }
             Ok(CallOutcome {
                 value,
                 updated_receiver,
                 updated_params,
+                returned_view_projection: None,
             })
         })();
         self.call_depth -= 1;
         let outcome = outcome.map_err(|error| self.annotate_runtime_trap_once(error));
         self.call_stack.pop();
         outcome
+    }
+
+    fn publish_returned_view_projection(&mut self, projection: Option<String>) {
+        self.pending_returned_view_projection = projection;
     }
 
     fn bind_function_args(
@@ -2619,7 +3113,8 @@ impl MirRuntime {
             let expected = substitute_type(&param.ty, &substitutions);
             let value = self
                 .call_function_for_target(&default_function, None, Vec::new(), Some(&expected))?
-                .value;
+                .value
+                .into_result()?;
             bound[index] = Some(EvaluatedMirArg {
                 name: Some(param.name.clone()),
                 value,
@@ -2654,12 +3149,24 @@ impl MirRuntime {
             })?;
             let block = &function.blocks[block_index];
             for instruction in &block.instructions {
-                match self.execute_instruction(
-                    instruction,
-                    env,
-                    &mut cleanup_stack,
-                    &mut safepoint_fuel,
-                ) {
+                let instruction_result = panic::catch_unwind(AssertUnwindSafe(|| {
+                    self.execute_instruction(
+                        instruction,
+                        env,
+                        &mut cleanup_stack,
+                        &mut safepoint_fuel,
+                    )
+                }));
+                let instruction_result = match instruction_result {
+                    Ok(result) => result,
+                    Err(payload) if payload.is::<TaskCancelledSignal>() => {
+                        env.loans.clear();
+                        let _ = self.unwind_cleanups(&mut cleanup_stack, env, true);
+                        panic::resume_unwind(payload);
+                    }
+                    Err(payload) => panic::resume_unwind(payload),
+                };
+                match instruction_result {
                     Ok(Some(value)) => {
                         self.unwind_cleanups(&mut cleanup_stack, env, true)?;
                         return Ok(value);
@@ -2667,6 +3174,12 @@ impl MirRuntime {
                     Ok(None) => {}
                     Err(error) => {
                         let error = self.annotate_runtime_trap_once(error);
+                        // A trap exits the entire frame, so every lexical loan
+                        // in that frame ends before managed-resource cleanup.
+                        // Leaving a mutable descriptor active would otherwise
+                        // prevent cleanup from observing a writeback that the
+                        // trapping child call already published.
+                        env.loans.clear();
                         let _ = self.unwind_cleanups(&mut cleanup_stack, env, true);
                         return Err(error);
                     }
@@ -2683,6 +3196,7 @@ impl MirRuntime {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     let error = self.annotate_runtime_trap_once(error);
+                    env.loans.clear();
                     let _ = self.unwind_cleanups(&mut cleanup_stack, env, true);
                     return Err(error);
                 }
@@ -2816,8 +3330,12 @@ impl MirRuntime {
                 Ok(None)
             }
             Instruction::ReturnLoan { loan, origin } => {
-                self.pending_returned_view_projection =
-                    Some(env.returned_view_projection(loan, origin)?);
+                let projection = env.returned_view_projection(loan, origin)?;
+                let loan_root = loan.split('.').next().unwrap_or_default();
+                if env.loans.contains_key(loan_root) {
+                    env.end_loan(loan_root)?;
+                }
+                self.outgoing_returned_view_projection = Some(projection);
                 Ok(None)
             }
             Instruction::Assign { target, value } => {
@@ -3165,6 +3683,7 @@ impl MirRuntime {
                 if let Some(updated_receiver) = outcome.updated_receiver {
                     env.write_place(place, updated_receiver)?;
                 }
+                outcome.value.into_result()?;
                 Ok(())
             }
             _ => Err(Diagnostic::new(format!(
@@ -3200,11 +3719,17 @@ impl MirRuntime {
             } => {
                 let mut captured = Vec::with_capacity(captures.len());
                 for capture in captures {
+                    let source_place = match &capture.source_place {
+                        Some(source) if capture.resolve_source_at_capture => {
+                            Some(env.resolve_loan_place(source)?)
+                        }
+                        source => source.clone(),
+                    };
                     captured.push(ClosureCaptureValue {
                         name: capture.name.clone(),
                         ty: capture.ty.clone(),
                         value: self.evaluate_owned_operand(&capture.value, env)?,
-                        source_place: capture.source_place.clone(),
+                        source_place,
                         mutable: capture.passing == MirReceiverKind::BorrowMut,
                     });
                 }
@@ -4194,7 +4719,9 @@ impl MirRuntime {
                     outcome.updated_params,
                     env,
                 )?;
-                Ok(outcome.value)
+                let value = outcome.value.into_result()?;
+                self.publish_returned_view_projection(outcome.returned_view_projection);
+                Ok(value)
             }
             CallTarget::Extern(call) => self.evaluate_extern_call(call, args, env),
             CallTarget::Value(function) => {
@@ -4204,7 +4731,48 @@ impl MirRuntime {
                 object,
                 field,
                 receiver_place,
+            }
+            | CallTarget::TraitMember {
+                object,
+                field,
+                receiver_place,
+                ..
             } => {
+                if let CallTarget::TraitMember { trait_name, .. } = callee {
+                    let receiver_static_ty = self
+                        .resolve_operand_type(object, env)
+                        .filter(|ty| !matches!(ty, Type::TypeParam(_)));
+                    let receiver = self.evaluate_owned_operand(object, env)?;
+                    let resolved_receiver_ty = receiver_static_ty
+                        .or_else(|| self.infer_runtime_value_type(&receiver))
+                        .ok_or_else(|| {
+                            Diagnostic::new(format!(
+                                "cannot resolve MIR trait receiver type for `{trait_name}.{field}`"
+                            ))
+                        })?;
+                    let method = self
+                        .find_trait_impl_method_for_trait(
+                            &resolved_receiver_ty,
+                            Some(trait_name),
+                            field,
+                        )
+                        .cloned()
+                        .ok_or_else(|| {
+                            Diagnostic::new(format!(
+                                "type `{resolved_receiver_ty}` has no MIR implementation of `{trait_name}.{field}`"
+                            ))
+                        })?;
+                    return self.evaluate_resolved_trait_method_call(
+                        receiver,
+                        &resolved_receiver_ty,
+                        field,
+                        method,
+                        receiver_place.as_deref(),
+                        args,
+                        expected_return_type,
+                        env,
+                    );
+                }
                 if matches!(field.as_str(), "len" | "byte_len") {
                     if let Operand::Place(place) = object {
                         if let Some(result) =
@@ -4671,7 +5239,9 @@ impl MirRuntime {
                             outcome.updated_params,
                             env,
                         )?;
-                        Ok(outcome.value)
+                        let value = outcome.value.into_result()?;
+                        self.publish_returned_view_projection(outcome.returned_view_projection);
+                        Ok(value)
                     }
                     // Checked non-instance trait calls return through the trait-dispatch
                     // block above before reaching this exhaustive runtime-value match.
@@ -4846,7 +5416,9 @@ impl MirRuntime {
                 outcome.updated_params,
                 env,
             )?;
-            return Ok(outcome.value);
+            let value = outcome.value.into_result()?;
+            self.publish_returned_view_projection(outcome.returned_view_projection);
+            return Ok(value);
         }
         let writeback_places = bind_function_writeback_places(&function.params, &evaluated_args)?;
         let outcome = self.call_function_for_value(
@@ -4861,7 +5433,9 @@ impl MirRuntime {
             outcome.updated_params,
             env,
         )?;
-        Ok(outcome.value)
+        let value = outcome.value.into_result()?;
+        self.publish_returned_view_projection(outcome.returned_view_projection);
+        Ok(value)
     }
 
     fn start_task(&mut self, request: StartTaskRequest<'_>, env: &mut Env) -> Result<Value> {
@@ -4958,7 +5532,7 @@ impl MirRuntime {
             if is_closure {
                 runtime
                     .call_function_for_target(&function_for_task, None, bound_args, None)
-                    .map(|outcome| outcome.value)
+                    .and_then(|outcome| outcome.value.into_result())
             } else {
                 runtime
                     .call_function_for_value(
@@ -4967,7 +5541,7 @@ impl MirRuntime {
                         &function_signature,
                         None,
                     )
-                    .map(|outcome| outcome.value)
+                    .and_then(|outcome| outcome.value.into_result())
             }
         };
         let register_before_submit = |task: &TaskValue| {

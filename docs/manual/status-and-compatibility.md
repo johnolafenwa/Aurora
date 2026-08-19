@@ -213,7 +213,7 @@ youngest-first task ancestry. Each public schema-version-1 frame span has its
 own required source `path`; the analysis/LSP editor shape permits an optional
 `file_path` for source-only analysis. The public diagnostic schema remains
 version `1` because the always-present arrays are an additive extension;
-compiler-service/editor transport uses semantic schema version `5`. This
+compiler-service/editor transport uses semantic schema version `6`. This
 version includes structural function values, import aliases, and the expanded
 numeric expression surface, and forwards the same diagnostic records.
 

@@ -9,7 +9,8 @@ use crate::ast::{
     TypeRef, VariantPattern, ViewStmt,
 };
 use crate::call::{
-    BuiltinAssociatedFunction, BuiltinClassConstructor, BuiltinFunction, BuiltinMember,
+    bind_call_arguments, callable_params_from_decl, BuiltinAssociatedFunction,
+    BuiltinClassConstructor, BuiltinFunction, BuiltinMember, CallConvention,
     ALL_BUILTIN_ASSOCIATED_FUNCTIONS, ALL_BUILTIN_FUNCTIONS,
 };
 use crate::diag::{Diagnostic, Result, RuntimeSourceSpan, Span};
@@ -17,7 +18,8 @@ use crate::parser;
 use crate::sema::{
     builtin_duration_binary_result, resolve_param_passing, substitute_trait_bound, ClassInfo,
     ClosureInfo, ComprehensionInfo, EnumInfo, ExternFunctionInfo, FunctionInfo,
-    FunctionParamContract, MethodInfo, OpaqueHandleInfo, Program, TraitBound, Type,
+    FunctionParamContract, FunctionSignature, MethodInfo, OpaqueHandleInfo, Program, TraitBound,
+    Type,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -224,10 +226,17 @@ fn complete_with_checker<F>(
 where
     F: FnMut(&str) -> Result<Program>,
 {
+    let capture_opener = lambda_capture_opener_before_position(source, line, character);
     let program = match check_program(source) {
         Ok(program) => program,
         Err(error) if trigger_character == Some('.') => {
             recover_checked_program_after_position(source, line, character, &mut check_program)
+                .ok_or(error)?
+        }
+        Err(error) if capture_opener.is_some() => {
+            let opener = capture_opener.expect("guarded lambda capture opener remains available");
+            let recovered = replace_lambda_capture_statement_with_recovery_stmt(source, opener);
+            recover_checked_program_after_member_errors(&recovered, &mut check_program)
                 .ok_or(error)?
         }
         Err(error) => return Err(error),
@@ -2280,10 +2289,17 @@ impl<'a> AnalysisBuilder<'a> {
         let declaration = self
             .find_identifier_range(view.span.line, &view.name)
             .unwrap_or_else(|| range_from_span(view.span, view.name.len()));
-        let source = render_view_source(&view.source).unwrap_or_else(|| "<place>".to_string());
-        let definition = view_source_root(&view.source)
-            .and_then(|root| scope.get(root))
-            .map(|binding| binding.definition.clone())
+        let returned_origin = self.returned_view_origin(&view.source, scope);
+        let source = render_view_source(&view.source)
+            .or_else(|| returned_origin.as_ref().map(|(source, _)| source.clone()))
+            .unwrap_or_else(|| "<place>".to_string());
+        let definition = returned_origin
+            .map(|(_, definition)| definition)
+            .or_else(|| {
+                view_source_root(&view.source)
+                    .and_then(|root| scope.get(root))
+                    .map(|binding| binding.definition.clone())
+            })
             .unwrap_or_else(|| declaration.clone());
         let hover = format!(
             "```aura\nview {}{}: {} from {}\n```",
@@ -2302,6 +2318,104 @@ impl<'a> AnalysisBuilder<'a> {
             },
         );
         self.push_occurrence(declaration, hover, Some(definition));
+    }
+
+    fn returned_view_callee_decl(
+        &self,
+        callee: &Expr,
+        scope: &BTreeMap<String, BindingInfo>,
+    ) -> Option<(FunctionDecl, Option<Expr>)> {
+        if let ExprKind::Group(inner) = &callee.kind {
+            if let ExprKind::Index { object, .. } = &inner.kind {
+                if let Some((decl, receiver)) = self.returned_view_callee_decl(object, scope) {
+                    if decl.view_return.is_some() {
+                        return Some((decl, receiver));
+                    }
+                }
+            }
+            return self.returned_view_callee_decl(inner, scope);
+        }
+        if let ExprKind::Specialize { expr: inner, .. } = &callee.kind {
+            return self.returned_view_callee_decl(inner, scope);
+        }
+        match &callee.kind {
+            ExprKind::Name(name) => self
+                .program
+                .functions
+                .get(name)
+                .map(|function| (function.decl.clone(), None)),
+            ExprKind::Member { object, field } => {
+                let receiver_ty = self.infer_expr_type(object, scope)?;
+                if let Type::Module(module_path) = &receiver_ty {
+                    let function = self.module_namespace(module_path).and_then(|namespace| {
+                        namespace
+                            .functions
+                            .get(field)
+                            .or_else(|| namespace.all_functions.get(field))
+                    });
+                    return function.map(|function| (function.decl.clone(), None));
+                }
+                if let Type::Named(class_name, _) = &receiver_ty {
+                    if let Some(method) = self
+                        .class_info_for_type_name(class_name)
+                        .and_then(|class| class.methods.get(field))
+                    {
+                        return Some((method.decl.clone(), Some((**object).clone())));
+                    }
+                }
+                if let Some((_trait_impl, method, _)) =
+                    self.trait_method_for_receiver(&receiver_ty, field)
+                {
+                    return Some((method.decl.clone(), Some((**object).clone())));
+                }
+                if let Some((_trait_info, method, _bound)) =
+                    self.unambiguous_trait_bound_method(&receiver_ty, field, scope)
+                {
+                    return Some((method.decl.clone(), Some((**object).clone())));
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn returned_view_origin(
+        &self,
+        expr: &Expr,
+        scope: &BTreeMap<String, BindingInfo>,
+    ) -> Option<(String, AnalysisRange)> {
+        if let ExprKind::Group(inner) = &expr.kind {
+            return self.returned_view_origin(inner, scope);
+        }
+        let ExprKind::Call { callee, args } = &expr.kind else {
+            return None;
+        };
+        let (decl, receiver) = self.returned_view_callee_decl(callee, scope)?;
+        let contract = decl.view_return.as_ref()?;
+        let origin = if contract.origin == "self" {
+            receiver.as_ref()?
+        } else {
+            let index = decl
+                .params
+                .iter()
+                .position(|param| param.name == contract.origin)?;
+            let ordered = bind_call_arguments(
+                &format!("callable `{}`", decl.name),
+                &callable_params_from_decl(&decl.params),
+                args,
+                callee.span,
+                CallConvention::PositionalOrNamed,
+            )
+            .ok()?;
+            &ordered.get(index).copied().flatten()?.value
+        };
+        if let Some(source) = render_view_source(origin) {
+            let root = view_source_root(origin)?;
+            let definition = scope.get(root)?.definition.clone();
+            Some((source, definition))
+        } else {
+            self.returned_view_origin(origin, scope)
+        }
     }
 
     fn bind_target_value(
@@ -2450,8 +2564,29 @@ impl<'a> AnalysisBuilder<'a> {
                 }
                 self.visit_comprehension_output(output, &comprehension_scope);
             }
-            ExprKind::Lambda { params, body, .. } => {
+            ExprKind::Lambda {
+                captures,
+                params,
+                body,
+            } => {
                 let mut lambda_scope = scope.clone();
+                if let Some(captures) = captures {
+                    for capture in captures {
+                        let Some(binding) = scope.get(&capture.name) else {
+                            continue;
+                        };
+                        let range = range_from_span_with_path(
+                            capture.span,
+                            capture.name.len(),
+                            self.current_source_path(),
+                        );
+                        self.push_occurrence(
+                            range,
+                            binding.hover.clone(),
+                            Some(binding.definition.clone()),
+                        );
+                    }
+                }
                 if let Some(contracts) = self.closure_info(expr).map(|info| info.params.clone()) {
                     for (param, contract) in params.iter().zip(&contracts) {
                         let definition = range_from_span(param.span, param.name.len());
@@ -2747,7 +2882,74 @@ impl<'a> AnalysisBuilder<'a> {
             }
         }
         let receiver_type = self.infer_expr_type(object, scope)?;
+        if let Some((trait_info, method, bound)) =
+            self.unambiguous_trait_bound_method(&receiver_type, field, scope)
+        {
+            let substitutions = crate::sema::self_type_substitutions(
+                &trait_info.decl,
+                &bound.trait_args,
+                receiver_type.clone(),
+            );
+            return Some(ResolvedMember {
+                hover: format_method_hover(&method.decl),
+                definition: Some(self.definition_range(
+                    &trait_info.module_name,
+                    method.decl.span,
+                    method.decl.name.len(),
+                )),
+                ty: Some(crate::sema::substitute_type(
+                    &method.signature.return_type,
+                    &substitutions,
+                )),
+            });
+        }
         self.resolve_member_type(&receiver_type, field)
+    }
+
+    fn unambiguous_trait_bound_method(
+        &self,
+        receiver_type: &Type,
+        field: &str,
+        scope: &BTreeMap<String, BindingInfo>,
+    ) -> Option<(
+        &crate::sema::TraitInfo,
+        &crate::sema::TraitMethodInfo,
+        TraitBound,
+    )> {
+        let Type::TypeParam(type_param) = receiver_type else {
+            return None;
+        };
+        let bounds = &scope
+            .values()
+            .find(|binding| binding.ty == Type::TypeParam(type_param.clone()))?
+            .trait_bounds;
+
+        let mut selected: Option<(
+            &crate::sema::TraitInfo,
+            &crate::sema::TraitMethodInfo,
+            TraitBound,
+        )> = None;
+        for bound in bounds {
+            let Some(trait_info) = self.program.traits.get(&bound.trait_name) else {
+                continue;
+            };
+            let Some(method) = trait_info.methods.get(field) else {
+                continue;
+            };
+            if let Some((selected_trait, selected_method, selected_bound)) = &selected {
+                let same_declaration = selected_trait.module_name == trait_info.module_name
+                    && selected_method.decl.span.line == method.decl.span.line
+                    && selected_method.decl.span.column == method.decl.span.column
+                    && selected_method.decl.name == method.decl.name
+                    && selected_bound == bound;
+                if !same_declaration {
+                    return None;
+                }
+            } else {
+                selected = Some((trait_info, method, bound.clone()));
+            }
+        }
+        selected
     }
 
     fn resolve_member_type(&self, receiver_type: &Type, field: &str) -> Option<ResolvedMember> {
@@ -2854,15 +3056,31 @@ impl<'a> AnalysisBuilder<'a> {
 
         let base_name = base_type_name(receiver_type);
         if let Some(class_info) = self.class_info_for_type_name(base_name) {
+            let class_substitutions = match receiver_type {
+                Type::Named(_, args) if class_info.decl.type_params.len() == args.len() => {
+                    crate::sema::substitutions_from_decl_type_args(
+                        &class_info.decl.type_params,
+                        args,
+                    )
+                }
+                _ => std::collections::HashMap::new(),
+            };
             if let Some(field_info) = class_info.fields.get(field) {
                 return Some(ResolvedMember {
-                    hover: format_value_hover("field", field, &field_info.ty),
+                    hover: format_value_hover(
+                        "field",
+                        field,
+                        &crate::sema::substitute_type(&field_info.ty, &class_substitutions),
+                    ),
                     definition: Some(self.definition_range(
                         &class_info.module_name,
                         field_info.span,
                         field.len(),
                     )),
-                    ty: Some(field_info.ty.clone()),
+                    ty: Some(crate::sema::substitute_type(
+                        &field_info.ty,
+                        &class_substitutions,
+                    )),
                 });
             }
             if let Some(method_info) = class_info.methods.get(field) {
@@ -2873,7 +3091,10 @@ impl<'a> AnalysisBuilder<'a> {
                         method_info.decl.span,
                         method_info.decl.name.len(),
                     )),
-                    ty: Some(method_info.signature.return_type.clone()),
+                    ty: Some(crate::sema::substitute_type(
+                        &method_info.signature.return_type,
+                        &class_substitutions,
+                    )),
                 });
             }
         }
@@ -4008,6 +4229,27 @@ impl<'a> AnalysisBuilder<'a> {
         scope: &BTreeMap<String, BindingInfo>,
     ) -> Option<Type> {
         match &callee.kind {
+            ExprKind::Group(inner) => {
+                if let ExprKind::Index { object, index } = &inner.kind {
+                    let type_arg_exprs = match &index.kind {
+                        ExprKind::Tuple(elements) => elements.as_slice(),
+                        _ => std::slice::from_ref(index.as_ref()),
+                    };
+                    let concrete_args = type_arg_exprs
+                        .iter()
+                        .map(|expr| self.analysis_type_arg_expr(expr))
+                        .collect::<Option<Vec<_>>>()?;
+                    if let Some(return_type) = self.infer_specialized_callable_return_type(
+                        object,
+                        &concrete_args,
+                        args,
+                        scope,
+                    ) {
+                        return Some(return_type);
+                    }
+                }
+                self.infer_call_type(inner, args, scope)
+            }
             ExprKind::Name(name) => {
                 if let Some(binding) = scope.get(name) {
                     match &binding.ty {
@@ -4018,7 +4260,7 @@ impl<'a> AnalysisBuilder<'a> {
                     }
                 }
                 if let Some(function) = self.program.functions.get(name) {
-                    return Some(function.signature.return_type.clone());
+                    return Some(self.infer_function_call_return_type(function, args, scope));
                 }
                 if let Some(function) = self.program.extern_functions.get(name) {
                     return Some(function.signature.return_type.clone());
@@ -4202,14 +4444,7 @@ impl<'a> AnalysisBuilder<'a> {
                     };
                     return Some(Type::Named("Array".to_string(), vec![*return_type]));
                 }
-                self.resolve_member_expr(object, field, scope)
-                    .and_then(|member| member.ty)
-                    .map(|ty| match ty {
-                        Type::Function { return_type, .. } | Type::Closure { return_type, .. } => {
-                            *return_type
-                        }
-                        ty => ty,
-                    })
+                self.infer_member_call_return_type(object, &receiver_type, field, args, None, scope)
             }
             ExprKind::Specialize { expr, type_args } => match &expr.kind {
                 ExprKind::Name(name)
@@ -4233,45 +4468,267 @@ impl<'a> AnalysisBuilder<'a> {
                             .unwrap_or_else(|| Type::Named(name.clone(), args)),
                     )
                 }
-                _ => self
-                    .infer_specialized_function_return_type(expr, type_args, scope)
-                    .or_else(|| self.infer_call_type(expr, args, scope)),
+                _ => {
+                    let concrete_args = type_args
+                        .iter()
+                        .map(|ty| self.lower_analysis_type_ref(ty))
+                        .collect::<Vec<_>>();
+                    self.infer_specialized_callable_return_type(expr, &concrete_args, args, scope)
+                        .or_else(|| self.infer_call_type(expr, args, scope))
+                }
             },
             _ => None,
         }
     }
 
-    fn infer_specialized_function_return_type(
+    fn infer_function_call_return_type(
         &self,
-        expr: &Expr,
-        type_args: &[TypeRef],
+        function: &FunctionInfo,
+        args: &[crate::ast::Argument],
         scope: &BTreeMap<String, BindingInfo>,
-    ) -> Option<Type> {
-        let function = match &expr.kind {
-            ExprKind::Name(name) => self.program.functions.get(name)?,
+    ) -> Type {
+        self.infer_callable_return_type(
+            &function.decl,
+            &function.signature,
+            args,
+            None,
+            scope,
+            std::collections::HashMap::new(),
+        )
+    }
+
+    fn infer_callable_return_type(
+        &self,
+        decl: &FunctionDecl,
+        signature: &FunctionSignature,
+        args: &[crate::ast::Argument],
+        explicit_type_args: Option<&[Type]>,
+        scope: &BTreeMap<String, BindingInfo>,
+        mut substitutions: std::collections::HashMap<String, Type>,
+    ) -> Type {
+        if let Some(concrete_args) = explicit_type_args {
+            if concrete_args.len() == decl.type_params.len() {
+                substitutions.extend(crate::sema::substitutions_from_decl_type_args(
+                    &decl.type_params,
+                    concrete_args,
+                ));
+            }
+            return crate::sema::substitute_type(&signature.return_type, &substitutions);
+        }
+        if decl.type_params.is_empty() {
+            return crate::sema::substitute_type(&signature.return_type, &substitutions);
+        }
+        let Ok(ordered) = bind_call_arguments(
+            &format!("callable `{}`", decl.name),
+            &callable_params_from_decl(&decl.params),
+            args,
+            decl.span,
+            CallConvention::PositionalOrNamed,
+        ) else {
+            return crate::sema::substitute_type(&signature.return_type, &substitutions);
+        };
+        let type_params = decl.type_params.iter().cloned().collect::<BTreeSet<_>>();
+        let mut inferred = std::collections::HashMap::new();
+        for (argument, pattern) in ordered.iter().zip(&signature.params) {
+            let Some(argument) = argument else {
+                continue;
+            };
+            let Some(actual) = self.infer_expr_type(&argument.value, scope) else {
+                continue;
+            };
+            let pattern = crate::sema::substitute_type(pattern, &substitutions);
+            let _ =
+                crate::sema::type_pattern_matches(&pattern, &actual, &type_params, &mut inferred);
+        }
+        substitutions.extend(inferred);
+        crate::sema::substitute_type(&signature.return_type, &substitutions)
+    }
+
+    fn analysis_function_info_for_callee(
+        &self,
+        callee: &Expr,
+        scope: &BTreeMap<String, BindingInfo>,
+    ) -> Option<&FunctionInfo> {
+        match &callee.kind {
+            ExprKind::Name(name) if !scope.contains_key(name) => self.program.functions.get(name),
             ExprKind::Member { object, field } => {
-                let Type::Module(module_path) = self.infer_expr_type(object, scope)? else {
+                let Type::Module(path) = self.infer_expr_type(object, scope)? else {
                     return None;
                 };
-                self.module_namespace(&module_path)?.functions.get(field)?
+                self.module_namespace(&path).and_then(|namespace| {
+                    namespace
+                        .functions
+                        .get(field)
+                        .or_else(|| namespace.all_functions.get(field))
+                })
             }
-            _ => return None,
-        };
-        if function.decl.type_params.len() != type_args.len() {
+            ExprKind::Group(inner) | ExprKind::Specialize { expr: inner, .. } => {
+                self.analysis_function_info_for_callee(inner, scope)
+            }
+            _ => None,
+        }
+    }
+
+    fn analysis_type_arg_expr(&self, expr: &Expr) -> Option<Type> {
+        match &expr.kind {
+            ExprKind::Name(name) => Some(Type::named(
+                self.program
+                    .canonical_type_names
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| match name.as_str() {
+                        "int" => "int64".to_string(),
+                        _ => name.clone(),
+                    }),
+            )),
+            ExprKind::Group(inner) => self.analysis_type_arg_expr(inner),
+            ExprKind::Index { object, index } => {
+                let ExprKind::Name(name) = &object.kind else {
+                    return None;
+                };
+                let args = match &index.kind {
+                    ExprKind::Tuple(elements) => elements
+                        .iter()
+                        .map(|element| self.analysis_type_arg_expr(element))
+                        .collect::<Option<Vec<_>>>()?,
+                    _ => vec![self.analysis_type_arg_expr(index)?],
+                };
+                Some(Type::Named(name.clone(), args))
+            }
+            _ => None,
+        }
+    }
+
+    fn infer_specialized_callable_return_type(
+        &self,
+        expr: &Expr,
+        concrete_args: &[Type],
+        args: &[crate::ast::Argument],
+        scope: &BTreeMap<String, BindingInfo>,
+    ) -> Option<Type> {
+        if let Some(function) = self.analysis_function_info_for_callee(expr, scope) {
+            if function.decl.type_params.len() != concrete_args.len() {
+                return None;
+            }
+            return Some(self.infer_callable_return_type(
+                &function.decl,
+                &function.signature,
+                args,
+                Some(concrete_args),
+                scope,
+                std::collections::HashMap::new(),
+            ));
+        }
+        match &expr.kind {
+            ExprKind::Member { object, field } => {
+                let receiver_type = self.infer_expr_type(object, scope)?;
+                self.infer_member_call_return_type(
+                    object,
+                    &receiver_type,
+                    field,
+                    args,
+                    Some(concrete_args),
+                    scope,
+                )
+            }
+            ExprKind::Group(inner) => {
+                self.infer_specialized_callable_return_type(inner, concrete_args, args, scope)
+            }
+            _ => None,
+        }
+    }
+
+    fn infer_member_call_return_type(
+        &self,
+        object: &Expr,
+        receiver_type: &Type,
+        field: &str,
+        args: &[crate::ast::Argument],
+        explicit_type_args: Option<&[Type]>,
+        scope: &BTreeMap<String, BindingInfo>,
+    ) -> Option<Type> {
+        if let Some((trait_info, method, bound)) =
+            self.unambiguous_trait_bound_method(receiver_type, field, scope)
+        {
+            if explicit_type_args
+                .is_some_and(|type_args| type_args.len() != method.decl.type_params.len())
+            {
+                return None;
+            }
+            let substitutions = crate::sema::self_type_substitutions(
+                &trait_info.decl,
+                &bound.trait_args,
+                receiver_type.clone(),
+            );
+            return Some(self.infer_callable_return_type(
+                &method.decl,
+                &method.signature,
+                args,
+                explicit_type_args,
+                scope,
+                substitutions,
+            ));
+        }
+
+        let base_name = base_type_name(receiver_type);
+        if let Some(class_info) = self.class_info_for_type_name(base_name) {
+            if let Some(method) = class_info.methods.get(field) {
+                if explicit_type_args
+                    .is_some_and(|type_args| type_args.len() != method.decl.type_params.len())
+                {
+                    return None;
+                }
+                let substitutions = match receiver_type {
+                    Type::Named(_, class_args)
+                        if class_info.decl.type_params.len() == class_args.len() =>
+                    {
+                        crate::sema::substitutions_from_decl_type_args(
+                            &class_info.decl.type_params,
+                            class_args,
+                        )
+                    }
+                    _ => std::collections::HashMap::new(),
+                };
+                return Some(self.infer_callable_return_type(
+                    &method.decl,
+                    &method.signature,
+                    args,
+                    explicit_type_args,
+                    scope,
+                    substitutions,
+                ));
+            }
+        }
+
+        if let Some((_trait_impl, method, substitutions)) =
+            self.trait_method_for_receiver(receiver_type, field)
+        {
+            if explicit_type_args
+                .is_some_and(|type_args| type_args.len() != method.decl.type_params.len())
+            {
+                return None;
+            }
+            return Some(self.infer_callable_return_type(
+                &method.decl,
+                &method.signature,
+                args,
+                explicit_type_args,
+                scope,
+                substitutions,
+            ));
+        }
+
+        if explicit_type_args.is_some() {
             return None;
         }
-        let concrete_args = type_args
-            .iter()
-            .map(|ty| self.lower_analysis_type_ref(ty))
-            .collect::<Vec<_>>();
-        let substitutions = crate::sema::substitutions_from_decl_type_args(
-            &function.decl.type_params,
-            &concrete_args,
-        );
-        Some(crate::sema::substitute_type(
-            &function.signature.return_type,
-            &substitutions,
-        ))
+        self.resolve_member_expr(object, field, scope)
+            .and_then(|member| member.ty)
+            .map(|ty| match ty {
+                Type::Function { return_type, .. } | Type::Closure { return_type, .. } => {
+                    *return_type
+                }
+                ty => ty,
+            })
     }
 
     fn infer_iterable_binding_type(
@@ -6230,6 +6687,159 @@ where
         span.column.saturating_sub(1),
         check_program,
     )
+}
+
+#[derive(Clone, Copy)]
+struct LambdaCaptureOpener {
+    line: usize,
+    character: usize,
+}
+
+fn lambda_capture_opener_before_position(
+    source: &str,
+    line: usize,
+    character: usize,
+) -> Option<LambdaCaptureOpener> {
+    let source_lines = source.split('\n').collect::<Vec<_>>();
+    source_lines.get(line)?;
+
+    let mut delimiters = Vec::<(char, Option<LambdaCaptureOpener>)>::new();
+    let mut pending_lambda = false;
+    for (line_index, text) in source_lines.iter().enumerate().take(line + 1) {
+        let limit = if line_index == line {
+            character
+        } else {
+            text.chars().count()
+        };
+        let chars = text.chars().take(limit).collect::<Vec<_>>();
+        let mut index = 0usize;
+        while index < chars.len() {
+            let ch = chars[index];
+            if ch == '#' {
+                break;
+            }
+            if ch == '"' || ch == '\'' {
+                pending_lambda = false;
+                let quote = ch;
+                index += 1;
+                let mut escaped = false;
+                while index < chars.len() {
+                    let current = chars[index];
+                    index += 1;
+                    if escaped {
+                        escaped = false;
+                    } else if current == '\\' {
+                        escaped = true;
+                    } else if current == quote {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if ch == '_' || ch.is_alphabetic() {
+                let start = index;
+                index += 1;
+                while index < chars.len() && (chars[index] == '_' || chars[index].is_alphanumeric())
+                {
+                    index += 1;
+                }
+                pending_lambda = chars[start..index].iter().collect::<String>() == "lambda";
+                continue;
+            }
+            if ch.is_whitespace() {
+                index += 1;
+                continue;
+            }
+
+            let capture = (pending_lambda && ch == '[').then_some(LambdaCaptureOpener {
+                line: line_index,
+                character: index,
+            });
+            pending_lambda = false;
+            match ch {
+                '(' | '[' | '{' => delimiters.push((ch, capture)),
+                ')' | ']' | '}' => {
+                    let expected = match ch {
+                        ')' => '(',
+                        ']' => '[',
+                        '}' => '{',
+                        _ => unreachable!(),
+                    };
+                    if matches!(delimiters.last(), Some((opener, _)) if *opener == expected) {
+                        delimiters.pop();
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+    }
+
+    delimiters.iter().rev().find_map(|(_, capture)| *capture)
+}
+
+fn replace_lambda_capture_statement_with_recovery_stmt(
+    source: &str,
+    opener: LambdaCaptureOpener,
+) -> String {
+    let mut lines = source.split('\n').map(str::to_string).collect::<Vec<_>>();
+    let start_line =
+        unmatched_delimiter_statement_start_line(source, opener.line).unwrap_or(opener.line);
+    let Some(line_text) = lines.get(start_line) else {
+        return source.to_string();
+    };
+    let indent = line_text
+        .chars()
+        .take_while(|ch| ch.is_whitespace())
+        .collect::<String>();
+    let replacement = format!("{indent}pass");
+
+    let mut depth = 0usize;
+    let mut opened = false;
+    let mut end_line = opener.line;
+    'lines: for (candidate, text) in source.split('\n').enumerate().skip(opener.line) {
+        let mut quote = None;
+        let mut escaped = false;
+        let start_character = if candidate == opener.line {
+            opener.character
+        } else {
+            0
+        };
+        for ch in text.chars().skip(start_character) {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' && quote.is_some() {
+                escaped = true;
+                continue;
+            }
+            match quote {
+                Some(active) if ch == active => quote = None,
+                Some(_) => {}
+                None if ch == '"' || ch == '\'' => quote = Some(ch),
+                None if ch == '#' => break,
+                None if matches!(ch, '(' | '[' | '{') => {
+                    opened = true;
+                    depth += 1;
+                }
+                None if matches!(ch, ')' | ']' | '}') => {
+                    depth = depth.saturating_sub(1);
+                    if opened && depth == 0 {
+                        end_line = candidate;
+                        break 'lines;
+                    }
+                }
+                None => {}
+            }
+        }
+        end_line = candidate;
+    }
+    for text in lines.iter_mut().take(end_line).skip(start_line) {
+        text.clear();
+    }
+    lines[end_line] = replacement;
+    lines.join("\n")
 }
 
 fn recover_checked_program_after_position<F>(

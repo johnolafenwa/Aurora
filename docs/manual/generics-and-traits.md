@@ -458,7 +458,10 @@ Invariant generics, local/contextual inference, explicit specialization,
 nominal traits and bounds, supertraits, default methods, generic and specialized
 implementations, unique-most-specific dispatch, operator traits, `Self`, and
 `From`-based `try` conversion plus inferred clone-safety contracts are implemented for the post-Phase 1.5 surface.
-Return values are owned. Trait objects, dynamic dispatch, associated types,
+Ordinary `-> T` return values are owned. Generic functions and methods may
+instead declare `-> view [mut] T from origin`; trait implementations preserve
+the trait declaration's origin slot as well as its specialized pointee type.
+Trait objects, dynamic dispatch, associated types,
 higher-kinded types, general
 subtyping, and arbitrary blanket implementation targets are unavailable.
 

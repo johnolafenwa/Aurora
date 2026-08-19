@@ -186,9 +186,11 @@ class Counter:
         return self.value
 ```
 
-Returning a non-copy field requires ownership: clone it when clone-safe, or
-consume the owner with `own self`. Return annotations do not carry a source
-label or reserve an aliasing contract. See [Functions](/manual/functions#owned-returns).
+Returning a non-copy field through an ordinary `-> T` result requires
+ownership: clone it when clone-safe, or consume the owner with `own self`. A
+method may instead declare `-> view [mut] T from self` and return non-owning
+access to the receiver or one of its supported fixed projections. See
+[Functions](/manual/functions#owned-returns).
 
 ## `copy class`
 
@@ -330,9 +332,10 @@ implementation-defined.
 Ordinary and copy classes, generic classes, construction, defaults,
 visibility, inherent and associated methods, all maintained receiver modes,
 partial-field moves, recursive `indirect` fields, and non-generic user-resource
-classes are implemented for the post-Phase 1.5 surface. First-class field loans
-or views would require a new design; current return syntax reserves no such
-contract. Inheritance, properties,
+classes are implemented for the post-Phase 1.5 surface. ADR-0038 adds local
+shared or mutable views of fixed class fields and returned-view contracts tied
+to one receiver or parameter; views still cannot be stored in class fields or
+other owned aggregates. Inheritance, properties,
 custom constructor/destructor hooks, and generic `with` resources are
 unavailable and MUST NOT be inferred from accepted class syntax. The
 constructor evaluation rule is implemented under

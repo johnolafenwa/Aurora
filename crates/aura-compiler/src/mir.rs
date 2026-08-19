@@ -17,7 +17,7 @@ use crate::sema::{
     ComprehensionInfo, FunctionParamContract, ModuleNamespace, Program, TraitBound, Type,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 fn is_known_enum_name(program: &Program, name: &str) -> bool {
     program.enums.contains_key(name)
@@ -394,6 +394,7 @@ fn place_paths_overlap(left: &str, right: &str) -> bool {
     shared == left_segments.len() || shared == right_segments.len()
 }
 
+#[cfg(test)]
 fn return_view_projection_expr(
     expr: &Expr,
     origin: &str,
@@ -427,6 +428,48 @@ fn return_view_projection_expr(
     }
 }
 
+fn return_view_projection_set(
+    expr: &Expr,
+    origin: &str,
+    aliases: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    match &expr.kind {
+        ExprKind::Name(name) if name == origin => vec![String::new()],
+        ExprKind::Name(name) => aliases.get(name).cloned().unwrap_or_default(),
+        ExprKind::Group(inner) => return_view_projection_set(inner, origin, aliases),
+        ExprKind::Member { object, field } => return_view_projection_set(object, origin, aliases)
+            .into_iter()
+            .map(|parent| {
+                if parent.is_empty() {
+                    field.clone()
+                } else {
+                    format!("{parent}.{field}")
+                }
+            })
+            .collect(),
+        ExprKind::Index { object, index } => {
+            let ExprKind::Int(index) = index.kind else {
+                return Vec::new();
+            };
+            let Ok(index) = usize::try_from(index) else {
+                return Vec::new();
+            };
+            return_view_projection_set(object, origin, aliases)
+                .into_iter()
+                .map(|parent| {
+                    if parent.is_empty() {
+                        index.to_string()
+                    } else {
+                        format!("{parent}.{index}")
+                    }
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
 fn collect_return_view_projections(
     body: &[Stmt],
     origin: &str,
@@ -501,6 +544,7 @@ fn collect_return_view_projections(
     }
 }
 
+#[cfg(test)]
 fn return_view_projections(function: &crate::ast::FunctionDecl) -> Vec<String> {
     let Some(contract) = function.view_return.as_ref() else {
         return Vec::new();
@@ -778,6 +822,11 @@ pub struct MirClosureCapture {
     pub passing: MirReceiverKind,
     #[serde(default)]
     pub source_place: Option<String>,
+    /// Resolve a loan-backed source to its selected concrete place when the
+    /// closure value is created. This lets a closure retain a dynamic
+    /// returned-view choice after the temporary caller-side descriptor ends.
+    #[serde(default)]
+    pub resolve_source_at_capture: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -792,6 +841,16 @@ pub enum CallTarget {
     Extern(MirExternCall),
     Member {
         object: Operand,
+        field: String,
+        receiver_place: Option<String>,
+    },
+    /// A member call selected through one specific generic trait bound.
+    ///
+    /// Keeping the bound identity in public MIR prevents same-named methods
+    /// from unrelated traits from changing validation or backend dispatch.
+    TraitMember {
+        object: Operand,
+        trait_name: String,
         field: String,
         receiver_place: Option<String>,
     },
@@ -902,6 +961,2520 @@ pub enum Terminator {
         span: crate::diag::Span,
     },
     Unreachable,
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedLoan {
+    /// Expanded source alternatives are immutable after a loan begins. Sharing
+    /// them keeps CFG state propagation from multiplying attacker-controlled
+    /// path storage at every branch and join.
+    sources: std::sync::Arc<[String]>,
+    mutable: bool,
+    parent: Option<String>,
+    returned_descriptor: bool,
+    active_children: usize,
+}
+
+impl PartialEq for ValidatedLoan {
+    fn eq(&self, other: &Self) -> bool {
+        self.mutable == other.mutable
+            && self.parent == other.parent
+            && self.returned_descriptor == other.returned_descriptor
+            && self.active_children == other.active_children
+            && (std::sync::Arc::ptr_eq(&self.sources, &other.sources)
+                || self.sources == other.sources)
+    }
+}
+
+impl Eq for ValidatedLoan {}
+
+type ValidatedLoans = BTreeMap<String, ValidatedLoan>;
+
+pub(crate) const MAX_VALIDATED_LOAN_ALTERNATIVES: usize = 4_096;
+pub(crate) const MAX_VALIDATED_EXPANDED_LOAN_PATH_BYTES: usize = 4 << 20;
+pub(crate) const MAX_VALIDATED_ACTIVE_LOANS: usize = 1_024;
+pub(crate) const MAX_VALIDATED_ACTIVE_LOAN_NAME_BYTES: usize = 64 << 10;
+const MAX_VALIDATED_MIR_IDENTIFIER_BYTES: usize = 4 << 10;
+const MAX_VALIDATED_SYMBOLIC_LOAN_DEPTH: usize = 256;
+
+#[derive(Default)]
+struct ValidatedLoanBudget {
+    expanded_path_bytes: usize,
+}
+
+impl ValidatedLoanBudget {
+    fn reserve(
+        &mut self,
+        function: &MirFunction,
+        loan: &str,
+        expanded_path_bytes: usize,
+    ) -> std::result::Result<(), String> {
+        self.expanded_path_bytes = self.expanded_path_bytes.saturating_add(expanded_path_bytes);
+        if self.expanded_path_bytes > MAX_VALIDATED_EXPANDED_LOAN_PATH_BYTES {
+            return Err(format!(
+                "invalid MIR loan `{loan}` in `{}` exceeds the cumulative expanded loan-path byte limit of {}",
+                function.name, MAX_VALIDATED_EXPANDED_LOAN_PATH_BYTES
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReturnedViewOriginSlot {
+    Receiver,
+    Param(usize),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ValidatedReturnedViewContract {
+    origin: ReturnedViewOriginSlot,
+    mutable: bool,
+    projections: std::sync::Arc<[String]>,
+}
+
+#[derive(Clone, Debug)]
+struct SymbolicLoanContract {
+    sources: BTreeSet<String>,
+    mutable: bool,
+}
+
+fn validate_symbolic_loan_contract_budget(
+    name: &str,
+    contract: &SymbolicLoanContract,
+) -> std::result::Result<(), String> {
+    if contract.sources.len() > MAX_VALIDATED_LOAN_ALTERNATIVES {
+        return Err(format!(
+            "invalid MIR returned-view contract `{name}` exceeds the alternative limit of {}",
+            MAX_VALIDATED_LOAN_ALTERNATIVES
+        ));
+    }
+    let path_bytes = contract
+        .sources
+        .iter()
+        .map(String::len)
+        .fold(0usize, usize::saturating_add);
+    if path_bytes > MAX_VALIDATED_EXPANDED_LOAN_PATH_BYTES {
+        return Err(format!(
+            "invalid MIR returned-view contract `{name}` exceeds the expanded loan-path byte limit of {}",
+            MAX_VALIDATED_EXPANDED_LOAN_PATH_BYTES
+        ));
+    }
+    Ok(())
+}
+
+fn symbolic_loan_place_sources<'a>(
+    place: &str,
+    definitions: &BTreeMap<&'a str, Vec<&'a Instruction>>,
+    memo: &mut BTreeMap<&'a str, SymbolicLoanContract>,
+    visiting: &mut BTreeSet<&'a str>,
+    depth: usize,
+) -> std::result::Result<BTreeSet<String>, String> {
+    let (root, suffix) = place.split_once('.').unwrap_or((place, ""));
+    let Some((definition_root, _)) = definitions.get_key_value(root) else {
+        return Ok(BTreeSet::from([place.to_string()]));
+    };
+    let sources = symbolic_loan_contract(
+        definition_root,
+        definitions,
+        memo,
+        visiting,
+        depth.saturating_add(1),
+    )?
+    .sources
+    .into_iter()
+    .map(|source| {
+        if suffix.is_empty() {
+            source
+        } else {
+            format!("{source}.{suffix}")
+        }
+    })
+    .collect();
+    Ok(sources)
+}
+
+fn symbolic_loan_contract<'a>(
+    name: &'a str,
+    definitions: &BTreeMap<&'a str, Vec<&'a Instruction>>,
+    memo: &mut BTreeMap<&'a str, SymbolicLoanContract>,
+    visiting: &mut BTreeSet<&'a str>,
+    depth: usize,
+) -> std::result::Result<SymbolicLoanContract, String> {
+    if let Some(contract) = memo.get(name) {
+        return Ok(contract.clone());
+    }
+    if depth > MAX_VALIDATED_SYMBOLIC_LOAN_DEPTH {
+        return Err(format!(
+            "invalid MIR returned-view contract `{name}` exceeds the symbolic loan descriptor depth limit of {MAX_VALIDATED_SYMBOLIC_LOAN_DEPTH}"
+        ));
+    }
+    if !visiting.insert(name) {
+        return Err(format!(
+            "invalid MIR returned-view contract contains a cyclic loan descriptor rooted at `{name}`"
+        ));
+    }
+    let mut combined: Option<SymbolicLoanContract> = None;
+    for instruction in definitions.get(name).into_iter().flatten() {
+        let candidate = match instruction {
+            Instruction::BeginLoan {
+                source, mutable, ..
+            } => SymbolicLoanContract {
+                sources: symbolic_loan_place_sources(source, definitions, memo, visiting, depth)?,
+                mutable: *mutable,
+            },
+            Instruction::BeginReturnedLoan {
+                origin,
+                projections,
+                mutable,
+                ..
+            } => {
+                let origins =
+                    symbolic_loan_place_sources(origin, definitions, memo, visiting, depth)?;
+                let unique_projections = projections.iter().collect::<BTreeSet<_>>();
+                if origins.len().saturating_mul(unique_projections.len())
+                    > MAX_VALIDATED_LOAN_ALTERNATIVES
+                {
+                    return Err(format!(
+                        "invalid MIR returned-view contract `{name}` exceeds the alternative limit of {}",
+                        MAX_VALIDATED_LOAN_ALTERNATIVES
+                    ));
+                }
+                let mut sources = BTreeSet::new();
+                for origin in origins {
+                    for projection in &unique_projections {
+                        sources.insert(if projection.is_empty() {
+                            origin.clone()
+                        } else {
+                            format!("{origin}.{projection}")
+                        });
+                    }
+                }
+                SymbolicLoanContract {
+                    sources,
+                    mutable: *mutable,
+                }
+            }
+            Instruction::Reborrow {
+                parent,
+                projection,
+                mutable,
+                ..
+            } => {
+                let sources = symbolic_loan_contract(
+                    parent,
+                    definitions,
+                    memo,
+                    visiting,
+                    depth.saturating_add(1),
+                )?
+                .sources
+                .into_iter()
+                .map(|source| {
+                    if projection.is_empty() {
+                        source
+                    } else {
+                        format!("{source}.{projection}")
+                    }
+                })
+                .collect();
+                SymbolicLoanContract {
+                    sources,
+                    mutable: *mutable,
+                }
+            }
+            _ => continue,
+        };
+        validate_symbolic_loan_contract_budget(name, &candidate)?;
+        if let Some(existing) = combined.as_mut() {
+            if existing.mutable != candidate.mutable {
+                return Err(format!(
+                    "invalid MIR loan descriptor `{name}` has inconsistent returned-view capabilities"
+                ));
+            }
+            existing.sources.extend(candidate.sources);
+            validate_symbolic_loan_contract_budget(name, existing)?;
+        } else {
+            combined = Some(candidate);
+        }
+    }
+    visiting.remove(name);
+    let contract = combined.ok_or_else(|| {
+        format!("invalid MIR returned-view contract references unknown loan `{name}`")
+    })?;
+    memo.insert(name, contract.clone());
+    Ok(contract)
+}
+
+fn reachable_mir_blocks(function: &MirFunction) -> std::result::Result<Vec<&BasicBlock>, String> {
+    let mut blocks = BTreeMap::new();
+    for block in &function.blocks {
+        if blocks.insert(block.label.as_str(), block).is_some() {
+            return Err(format!(
+                "invalid MIR function `{}` has duplicate block label `{}`",
+                function.name, block.label
+            ));
+        }
+    }
+    if !blocks.contains_key(function.entry.as_str()) {
+        return Err(format!(
+            "invalid MIR function `{}` has missing entry block `{}`",
+            function.name, function.entry
+        ));
+    }
+    let mut reachable = BTreeSet::new();
+    let mut pending = vec![function.entry.as_str()];
+    while let Some(label) = pending.pop() {
+        if !reachable.insert(label) {
+            continue;
+        }
+        let block = blocks[label];
+        for successor in mir_successors(&block.terminator) {
+            if !blocks.contains_key(successor) {
+                return Err(format!(
+                    "invalid MIR function `{}` branches to unknown block `{successor}` from block `{}`",
+                    function.name, block.label
+                ));
+            }
+            pending.push(successor);
+        }
+    }
+    Ok(function
+        .blocks
+        .iter()
+        .filter(|block| reachable.contains(block.label.as_str()))
+        .collect())
+}
+
+fn function_returned_view_contract(
+    function: &MirFunction,
+) -> std::result::Result<Option<ValidatedReturnedViewContract>, String> {
+    let reachable_blocks = reachable_mir_blocks(function)?;
+    let instructions = reachable_blocks
+        .iter()
+        .flat_map(|block| block.instructions.iter())
+        .collect::<Vec<_>>();
+    let mut definitions = BTreeMap::<&str, Vec<&Instruction>>::new();
+    for instruction in &instructions {
+        let name = match instruction {
+            Instruction::BeginLoan { loan, .. }
+            | Instruction::BeginReturnedLoan { loan, .. }
+            | Instruction::Reborrow { loan, .. } => loan,
+            _ => continue,
+        };
+        definitions.entry(name).or_default().push(instruction);
+    }
+    let mut origin = None;
+    let mut mutable = None;
+    let mut projections = BTreeSet::new();
+    let mut projection_bytes = 0usize;
+    let mut memo = BTreeMap::new();
+    for instruction in instructions {
+        let Instruction::ReturnLoan {
+            loan,
+            origin: declared_origin,
+        } = instruction
+        else {
+            continue;
+        };
+        validate_canonical_mir_place(function, loan)?;
+        validate_canonical_mir_place(function, declared_origin)?;
+        let origin_slot = if declared_origin == "self" {
+            match function.receiver {
+                Some(MirReceiverKind::Borrow | MirReceiverKind::BorrowMut) => {
+                    ReturnedViewOriginSlot::Receiver
+                }
+                _ => {
+                    return Err(format!(
+                    "invalid returned MIR loan in `{}` uses non-borrowed receiver origin `self`",
+                    function.name
+                ))
+                }
+            }
+        } else {
+            let Some((index, param)) = function
+                .params
+                .iter()
+                .enumerate()
+                .find(|(_, param)| param.name == *declared_origin)
+            else {
+                return Err(format!(
+                    "invalid returned MIR loan in `{}` uses non-parameter origin `{declared_origin}`",
+                    function.name
+                ));
+            };
+            if param.passing == MirReceiverKind::Value {
+                return Err(format!(
+                    "invalid returned MIR loan in `{}` uses owned parameter origin `{declared_origin}`",
+                    function.name
+                ));
+            }
+            ReturnedViewOriginSlot::Param(index)
+        };
+        if origin
+            .as_ref()
+            .is_some_and(|existing| existing != &origin_slot)
+        {
+            return Err(format!(
+                "invalid MIR function `{}` has inconsistent returned-view origins",
+                function.name
+            ));
+        }
+        origin = Some(origin_slot);
+
+        let loan_root = loan.split('.').next().unwrap_or_default();
+        let contract = if definitions.contains_key(loan_root) {
+            let mutable = symbolic_loan_contract(
+                loan_root,
+                &definitions,
+                &mut memo,
+                &mut BTreeSet::new(),
+                0,
+            )?
+            .mutable;
+            SymbolicLoanContract {
+                sources: symbolic_loan_place_sources(
+                    loan,
+                    &definitions,
+                    &mut memo,
+                    &mut BTreeSet::new(),
+                    0,
+                )?,
+                mutable,
+            }
+        } else {
+            let root_mutable = if loan_root == "self" {
+                function.receiver == Some(MirReceiverKind::BorrowMut)
+            } else {
+                function
+                    .params
+                    .iter()
+                    .find(|param| param.name == loan_root)
+                    .is_some_and(|param| param.passing == MirReceiverKind::BorrowMut)
+            };
+            SymbolicLoanContract {
+                sources: BTreeSet::from([loan.clone()]),
+                mutable: root_mutable,
+            }
+        };
+        if mutable.is_some_and(|existing| existing != contract.mutable) {
+            return Err(format!(
+                "invalid MIR function `{}` has inconsistent returned-view capabilities",
+                function.name
+            ));
+        }
+        mutable = Some(contract.mutable);
+        for source in contract.sources {
+            let projection = if source == *declared_origin {
+                String::new()
+            } else {
+                source
+                    .strip_prefix(&format!("{declared_origin}."))
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        format!(
+                            "invalid returned MIR loan `{loan}` in `{}` resolves outside origin `{declared_origin}`",
+                            function.name
+                        )
+                    })?
+            };
+            let projection_len = projection.len();
+            if projections.insert(projection) {
+                projection_bytes = projection_bytes.saturating_add(projection_len);
+            }
+            if projections.len() > MAX_VALIDATED_LOAN_ALTERNATIVES {
+                return Err(format!(
+                    "invalid MIR function `{}` exceeds the returned-view projection alternative limit of {}",
+                    function.name, MAX_VALIDATED_LOAN_ALTERNATIVES
+                ));
+            }
+            if projection_bytes > MAX_VALIDATED_EXPANDED_LOAN_PATH_BYTES {
+                return Err(format!(
+                    "invalid MIR function `{}` exceeds the returned-view projection byte limit of {}",
+                    function.name, MAX_VALIDATED_EXPANDED_LOAN_PATH_BYTES
+                ));
+            }
+        }
+    }
+    let Some(origin) = origin else {
+        return Ok(None);
+    };
+    if projections.is_empty() {
+        return Err(format!(
+            "invalid MIR function `{}` has an empty returned-view projection contract",
+            function.name
+        ));
+    }
+    Ok(Some(ValidatedReturnedViewContract {
+        origin,
+        mutable: mutable.unwrap_or(false),
+        projections: projections.into_iter().collect::<Vec<_>>().into(),
+    }))
+}
+
+struct MirLoanValidationContext<'a> {
+    classes: BTreeMap<&'a str, &'a MirClass>,
+    functions: BTreeMap<&'a str, &'a MirFunction>,
+    trait_impls: &'a [MirTraitImpl],
+    returned_views: BTreeMap<&'a str, ValidatedReturnedViewContract>,
+}
+
+impl<'a> MirLoanValidationContext<'a> {
+    fn new(module: &'a MirModule) -> std::result::Result<Self, String> {
+        let mut classes = BTreeMap::new();
+        for class in &module.classes {
+            if classes.insert(class.name.as_str(), class).is_some() {
+                return Err(format!(
+                    "invalid MIR module has duplicate class `{}`",
+                    class.name
+                ));
+            }
+        }
+        let mut functions = BTreeMap::new();
+        for function in module.functions.iter().chain(module.top_level.iter()) {
+            if functions.insert(function.name.as_str(), function).is_some() {
+                return Err(format!(
+                    "invalid MIR module has duplicate function `{}`",
+                    function.name
+                ));
+            }
+        }
+        let mut returned_views = BTreeMap::new();
+        for (name, function) in &functions {
+            if let Some(contract) = function_returned_view_contract(function)? {
+                returned_views.insert(*name, contract);
+            }
+        }
+        Ok(Self {
+            classes,
+            functions,
+            trait_impls: &module.trait_impls,
+            returned_views,
+        })
+    }
+
+    fn root_type(&self, function: &MirFunction, root: &str) -> Option<Type> {
+        function
+            .local_types
+            .iter()
+            .find(|local| local.name == root)
+            .map(|local| local.ty.clone())
+            .or_else(|| {
+                function
+                    .params
+                    .iter()
+                    .find(|param| param.name == root)
+                    .map(|param| param.ty.clone())
+            })
+    }
+
+    fn place_type(
+        &self,
+        function: &MirFunction,
+        place: &str,
+    ) -> std::result::Result<Option<Type>, String> {
+        validate_canonical_mir_place(function, place)?;
+        let mut segments = place.split('.');
+        let root = segments.next().unwrap_or_default();
+        let Some(mut ty) = self.root_type(function, root) else {
+            return Ok(None);
+        };
+        for segment in segments {
+            ty = match ty {
+                Type::Tuple(elements) => {
+                    let index = segment.parse::<usize>().map_err(|_| {
+                        format!(
+                            "invalid MIR tuple projection `{segment}` in `{place}` in `{}` is not a fixed position",
+                            function.name
+                        )
+                    })?;
+                    elements.get(index).cloned().ok_or_else(|| {
+                        format!(
+                            "invalid MIR tuple projection `{segment}` in `{place}` in `{}` is out of bounds",
+                            function.name
+                        )
+                    })?
+                }
+                Type::Named(class_name, args) => {
+                    let Some(class) = self.classes.get(class_name.as_str()) else {
+                        // Opaque built-ins and downstream types do not expose enough
+                        // metadata for static field validation. Their paths remain
+                        // syntax-checked and are validated when concrete metadata exists.
+                        return Ok(None);
+                    };
+                    if args.len() != class.type_params.len() {
+                        return Err(format!(
+                            "invalid MIR class type `{class_name}` in `{place}` in `{}` has {} arguments, expected {}",
+                            function.name,
+                            args.len(),
+                            class.type_params.len()
+                        ));
+                    }
+                    let field = class
+                        .fields
+                        .iter()
+                        .find(|field| field.name == segment)
+                        .ok_or_else(|| {
+                            format!(
+                                "invalid MIR class `{class_name}` in `{}` has no field `{segment}` in place `{place}`",
+                                function.name
+                            )
+                        })?;
+                    let substitutions = class
+                        .type_params
+                        .iter()
+                        .cloned()
+                        .zip(args)
+                        .collect::<std::collections::HashMap<_, _>>();
+                    substitute_type(&field.ty, &substitutions)
+                }
+                Type::TypeParam(_) => return Ok(None),
+                Type::Function { .. }
+                | Type::Closure { .. }
+                | Type::Module(_)
+                | Type::Unit => {
+                    return Err(format!(
+                        "invalid MIR projection `{segment}` in `{place}` in `{}` traverses a non-projectable type",
+                        function.name
+                    ))
+                }
+            };
+        }
+        Ok(Some(ty))
+    }
+
+    fn validate_projected_loan_type(
+        &self,
+        function: &MirFunction,
+        loan: &str,
+        place: &str,
+    ) -> std::result::Result<(), String> {
+        let Some(actual) = self.place_type(function, place)? else {
+            return Ok(());
+        };
+        let Some(expected) = self.root_type(function, loan) else {
+            return Ok(());
+        };
+        if !matches!(actual, Type::TypeParam(_))
+            && !matches!(expected, Type::TypeParam(_))
+            && actual != expected
+        {
+            return Err(format!(
+                "invalid MIR loan `{loan}` in `{}` projects `{place}` with type `{:?}`, expected `{:?}`",
+                function.name, actual, expected
+            ));
+        }
+        Ok(())
+    }
+
+    fn root_allows_mutable_loan(&self, function: &MirFunction, root: &str) -> bool {
+        if root == "self" {
+            return matches!(
+                function.receiver,
+                Some(MirReceiverKind::Value | MirReceiverKind::BorrowMut)
+            );
+        }
+        if let Some(param) = function.params.iter().find(|param| param.name == root) {
+            return param.passing != MirReceiverKind::Borrow;
+        }
+        function.local_types.iter().any(|local| local.name == root)
+    }
+
+    fn validate_named_function_operand(
+        &self,
+        caller: &MirFunction,
+        name: &str,
+        signature: &Type,
+    ) -> std::result::Result<(), String> {
+        let callee = self.functions.get(name).copied().ok_or_else(|| {
+            format!(
+                "invalid MIR function operand `{name}` in `{}` references an unknown declaration",
+                caller.name
+            )
+        })?;
+        if callee.receiver.is_some() {
+            return Err(format!(
+                "invalid MIR function operand `{name}` in `{}` names an unbound receiver method",
+                caller.name
+            ));
+        }
+        let Type::Function {
+            params,
+            return_type,
+        } = signature
+        else {
+            return Err(format!(
+                "invalid MIR function operand `{name}` in `{}` has a non-function signature",
+                caller.name
+            ));
+        };
+        if params.len() != callee.params.len() {
+            return Err(format!(
+                "invalid MIR function operand `{name}` in `{}` has a signature that does not match declaration arity {}",
+                caller.name,
+                callee.params.len()
+            ));
+        }
+        let mut type_params = BTreeSet::new();
+        for param in &callee.params {
+            collect_type_params_from_type(&param.ty, &mut type_params);
+        }
+        collect_type_params_from_type(&callee.return_type, &mut type_params);
+        let mut substitutions = HashMap::new();
+        for (index, (actual, expected)) in params.iter().zip(&callee.params).enumerate() {
+            let expected_passing = match expected.passing {
+                MirReceiverKind::Value => ReceiverKind::Value,
+                MirReceiverKind::Borrow => ReceiverKind::Borrow,
+                MirReceiverKind::BorrowMut => ReceiverKind::BorrowMut,
+            };
+            let mut candidate_substitutions = substitutions.clone();
+            let type_matches = crate::sema::type_pattern_matches(
+                &expected.ty,
+                &actual.ty,
+                &type_params,
+                &mut candidate_substitutions,
+            );
+            let retains_named_default_contract = !actual.default_erased;
+            if (retains_named_default_contract && actual.name != expected.name)
+                || actual.passing != expected_passing
+                || (retains_named_default_contract
+                    && actual.has_default != expected.default_function.is_some())
+                || !type_matches
+            {
+                return Err(format!(
+                    "invalid MIR function operand `{name}` in `{}` has parameter {} that does not match declaration",
+                    caller.name, index + 1
+                ));
+            }
+            substitutions = candidate_substitutions;
+        }
+        let mut candidate_substitutions = substitutions;
+        if !crate::sema::type_pattern_matches(
+            &callee.return_type,
+            return_type,
+            &type_params,
+            &mut candidate_substitutions,
+        ) {
+            return Err(format!(
+                "invalid MIR function operand `{name}` in `{}` has a return type that does not match declaration",
+                caller.name
+            ));
+        }
+        Ok(())
+    }
+
+    fn operand_type(
+        &self,
+        function: &MirFunction,
+        operand: &Operand,
+    ) -> std::result::Result<Option<Type>, String> {
+        match operand {
+            Operand::Place(place) | Operand::MovePlace(place) => self.place_type(function, place),
+            Operand::Duration(_) => Ok(Some(Type::named("Duration"))),
+            Operand::Float(_) => Ok(Some(Type::named("float64"))),
+            Operand::Bool(_) => Ok(Some(Type::named("bool"))),
+            Operand::String(_) => Ok(Some(Type::named("str"))),
+            Operand::Unit => Ok(Some(Type::Unit)),
+            Operand::Function { signature, .. } => Ok(Some((**signature).clone())),
+            Operand::Int(_) => Ok(None),
+        }
+    }
+
+    fn member_receiver_passing(
+        &self,
+        function: &MirFunction,
+        object: &Operand,
+        trait_name: Option<&str>,
+        field: &str,
+    ) -> std::result::Result<Option<MirReceiverKind>, String> {
+        let Some(receiver_type) = self.operand_type(function, object)? else {
+            return Ok(None);
+        };
+        if trait_name.is_none() {
+            if let Type::Named(name, _) = &receiver_type {
+                if let Some(method) = self
+                    .classes
+                    .get(name.as_str())
+                    .and_then(|class| class.methods.iter().find(|method| method.name == field))
+                {
+                    return Ok(method.receiver);
+                }
+                if let Some(member) = BuiltinMember::resolve(name, field) {
+                    return Ok(Some(lower_receiver_kind(member.receiver_passing())));
+                }
+            }
+        }
+        let mut passings = Vec::new();
+        for trait_impl in self.trait_impls {
+            if trait_name.is_some_and(|name| trait_impl.trait_name != name) {
+                continue;
+            }
+            let matches_receiver = if matches!(receiver_type, Type::TypeParam(_)) {
+                true
+            } else {
+                let mut type_params = BTreeSet::new();
+                collect_type_params_from_type(&trait_impl.for_type, &mut type_params);
+                let mut substitutions = HashMap::new();
+                crate::sema::type_pattern_matches(
+                    &trait_impl.for_type,
+                    &receiver_type,
+                    &type_params,
+                    &mut substitutions,
+                )
+            };
+            if !matches_receiver {
+                continue;
+            }
+            if let Some(receiver) = trait_impl
+                .methods
+                .iter()
+                .find(|method| method.name == field)
+                .and_then(|method| method.receiver)
+            {
+                passings.push(receiver);
+            }
+        }
+        Ok(if passings.contains(&MirReceiverKind::BorrowMut) {
+            Some(MirReceiverKind::BorrowMut)
+        } else if passings.contains(&MirReceiverKind::Value) {
+            Some(MirReceiverKind::Value)
+        } else if passings.contains(&MirReceiverKind::Borrow) {
+            Some(MirReceiverKind::Borrow)
+        } else {
+            None
+        })
+    }
+
+    fn bind_call_args<'b>(
+        &self,
+        callee: &MirFunction,
+        args: &'b [MirArg],
+    ) -> std::result::Result<Vec<Option<&'b MirArg>>, String> {
+        let mut bound = vec![None; callee.params.len()];
+        let mut next_positional = 0usize;
+        for arg in args {
+            let index = if let Some(name) = arg.name.as_deref() {
+                callee
+                    .params
+                    .iter()
+                    .position(|param| param.name == name)
+                    .ok_or_else(|| {
+                        format!(
+                            "invalid MIR call to `{}` has unknown argument `{name}`",
+                            callee.name
+                        )
+                    })?
+            } else {
+                while next_positional < bound.len() && bound[next_positional].is_some() {
+                    next_positional += 1;
+                }
+                if next_positional >= bound.len() {
+                    return Err(format!(
+                        "invalid MIR call to `{}` has too many arguments",
+                        callee.name
+                    ));
+                }
+                let index = next_positional;
+                next_positional += 1;
+                index
+            };
+            if bound[index].replace(arg).is_some() {
+                return Err(format!(
+                    "invalid MIR call to `{}` binds argument `{}` more than once",
+                    callee.name, callee.params[index].name
+                ));
+            }
+        }
+        Ok(bound)
+    }
+
+    fn bind_and_validate_call_args<'b>(
+        &self,
+        caller: &MirFunction,
+        callee: &MirFunction,
+        args: &'b [MirArg],
+    ) -> std::result::Result<Vec<Option<&'b MirArg>>, String> {
+        let bound = self.bind_call_args(callee, args)?;
+        for (index, (param, arg)) in callee.params.iter().zip(&bound).enumerate() {
+            let Some(arg) = arg else {
+                if param.default_function.is_none() {
+                    return Err(format!(
+                        "invalid MIR call to `{}` in `{}` omits required parameter `{}`",
+                        callee.name, caller.name, param.name
+                    ));
+                }
+                continue;
+            };
+            match param.passing {
+                MirReceiverKind::BorrowMut => {
+                    let Operand::Place(place) = &arg.value else {
+                        return Err(format!(
+                            "invalid MIR call to `{}` in `{}` binds mutable parameter `{}` to a non-place operand",
+                            callee.name, caller.name, param.name
+                        ));
+                    };
+                    let Some(writeback_place) = arg.writeback_place.as_deref() else {
+                        return Err(format!(
+                            "invalid MIR call to `{}` in `{}` requires a mutable writeback place for parameter `{}`",
+                            callee.name, caller.name, param.name
+                        ));
+                    };
+                    if writeback_place != place {
+                        return Err(format!(
+                            "invalid MIR call to `{}` in `{}` redirects argument `{place}` to unrelated mutable writeback place `{writeback_place}`",
+                            callee.name, caller.name
+                        ));
+                    }
+                }
+                MirReceiverKind::Value | MirReceiverKind::Borrow => {
+                    if arg.writeback_place.is_some() {
+                        return Err(format!(
+                            "invalid MIR call to `{}` in `{}` supplies writeback for non-mutable parameter {} `{}`",
+                            callee.name,
+                            caller.name,
+                            index + 1,
+                            param.name
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(bound)
+    }
+
+    fn bound_returned_view_for_function(
+        &self,
+        caller: &MirFunction,
+        callee: &MirFunction,
+        args: &[MirArg],
+        receiver_origin: Option<&str>,
+    ) -> std::result::Result<Option<BoundReturnedViewContract>, String> {
+        let bound = self.bind_and_validate_call_args(caller, callee, args)?;
+        let Some(contract) = self.returned_views.get(callee.name.as_str()) else {
+            return Ok(None);
+        };
+        let origin = match contract.origin {
+            ReturnedViewOriginSlot::Receiver => receiver_origin.ok_or_else(|| {
+                format!(
+                    "invalid MIR call to returned-view method `{}` has no addressable receiver origin",
+                    callee.name
+                )
+            })?,
+            ReturnedViewOriginSlot::Param(index) => {
+                let arg = bound.get(index).copied().flatten().ok_or_else(|| {
+                    format!(
+                        "invalid MIR call to `{}` omits returned-view origin parameter `{}`",
+                        callee.name, callee.params[index].name
+                    )
+                })?;
+                let Operand::Place(place) = &arg.value else {
+                    return Err(format!(
+                        "invalid MIR call to `{}` binds its returned-view origin to a non-place operand",
+                        callee.name
+                    ));
+                };
+                if callee.params[index].passing == MirReceiverKind::BorrowMut
+                    && arg.writeback_place.as_deref() != Some(place.as_str())
+                {
+                    return Err(format!(
+                        "invalid MIR call to `{}` has returned-view origin `{place}` but a different mutable writeback place",
+                        callee.name
+                    ));
+                }
+                place
+            }
+        };
+        validate_canonical_mir_place(caller, origin)?;
+        Ok(Some(BoundReturnedViewContract {
+            callees: vec![callee.name.clone()].into(),
+            origin: origin.to_string(),
+            mutable: contract.mutable,
+            projections: contract.projections.clone(),
+        }))
+    }
+
+    fn member_function_candidates(
+        &self,
+        caller: &MirFunction,
+        object: &Operand,
+        trait_name: Option<&str>,
+        field: &str,
+    ) -> std::result::Result<Vec<&'a MirFunction>, String> {
+        let Some(receiver_type) = self.operand_type(caller, object)? else {
+            return Ok(Vec::new());
+        };
+        if matches!(receiver_type, Type::TypeParam(_)) && trait_name.is_none() {
+            return Err(format!(
+                "invalid MIR generic member call `{field}` in `{}` requires an authoritative trait identity",
+                caller.name
+            ));
+        }
+        if trait_name.is_none() {
+            if let Type::Named(name, _) = &receiver_type {
+                if let Some(method) = self
+                    .classes
+                    .get(name.as_str())
+                    .and_then(|class| class.methods.iter().find(|method| method.name == field))
+                {
+                    let function = self
+                        .functions
+                        .get(method.function_name.as_str())
+                        .ok_or_else(|| {
+                            format!(
+                                "invalid MIR method `{}.{field}` references missing function `{}`",
+                                name, method.function_name
+                            )
+                        })?;
+                    return Ok(vec![*function]);
+                }
+            }
+        }
+        let mut function_names = BTreeSet::new();
+        for trait_impl in self.trait_impls {
+            if trait_name.is_some_and(|name| trait_impl.trait_name != name) {
+                continue;
+            }
+            let matches_receiver = if matches!(receiver_type, Type::TypeParam(_)) {
+                true
+            } else {
+                let mut type_params = BTreeSet::new();
+                collect_type_params_from_type(&trait_impl.for_type, &mut type_params);
+                let mut substitutions = HashMap::new();
+                crate::sema::type_pattern_matches(
+                    &trait_impl.for_type,
+                    &receiver_type,
+                    &type_params,
+                    &mut substitutions,
+                )
+            };
+            if matches_receiver {
+                if let Some(method) = trait_impl
+                    .methods
+                    .iter()
+                    .find(|method| method.name == field)
+                {
+                    function_names.insert(method.function_name.as_str());
+                }
+            }
+        }
+        function_names
+            .into_iter()
+            .map(|name| {
+                self.functions.get(name).copied().ok_or_else(|| {
+                    format!("invalid MIR trait method references missing function `{name}`")
+                })
+            })
+            .collect()
+    }
+
+    fn pending_call(
+        &self,
+        caller: &MirFunction,
+        callee: &CallTarget,
+        args: &[MirArg],
+    ) -> std::result::Result<ValidatedPendingCall, String> {
+        let (identity, candidates, receiver_origin) = match callee {
+            CallTarget::Name(name) => (
+                name.clone(),
+                self.functions
+                    .get(name.as_str())
+                    .copied()
+                    .into_iter()
+                    .collect(),
+                None,
+            ),
+            CallTarget::Value(Operand::Function { name, signature }) => {
+                self.validate_named_function_operand(caller, name, signature)?;
+                (
+                    name.clone(),
+                    self.functions
+                        .get(name.as_str())
+                        .copied()
+                        .into_iter()
+                        .collect(),
+                    None,
+                )
+            }
+            CallTarget::Value(_) => ("<indirect>".to_string(), Vec::new(), None),
+            CallTarget::Extern(call) => (format!("extern {}", call.symbol), Vec::new(), None),
+            CallTarget::Member {
+                object,
+                field,
+                receiver_place,
+            } => {
+                let object_origin = match object {
+                    Operand::Place(place) => Some(place.as_str()),
+                    _ => None,
+                };
+                if let (Some(receiver_place), Some(object_origin)) =
+                    (receiver_place.as_deref(), object_origin)
+                {
+                    if receiver_place != object_origin {
+                        return Err(format!(
+                            "invalid MIR member call `{field}` redirects receiver `{object_origin}` to unrelated writeback place `{receiver_place}`"
+                        ));
+                    }
+                }
+                let receiver_origin = object_origin;
+                (
+                    format!("member {field}"),
+                    self.member_function_candidates(caller, object, None, field)?,
+                    receiver_origin,
+                )
+            }
+            CallTarget::TraitMember {
+                object,
+                trait_name,
+                field,
+                receiver_place,
+            } => {
+                let object_origin = match object {
+                    Operand::Place(place) => Some(place.as_str()),
+                    _ => None,
+                };
+                if let (Some(receiver_place), Some(object_origin)) =
+                    (receiver_place.as_deref(), object_origin)
+                {
+                    if receiver_place != object_origin {
+                        return Err(format!(
+                            "invalid MIR trait member call `{trait_name}.{field}` redirects receiver `{object_origin}` to unrelated writeback place `{receiver_place}`"
+                        ));
+                    }
+                }
+                (
+                    format!("trait member {trait_name}.{field}"),
+                    self.member_function_candidates(caller, object, Some(trait_name), field)?,
+                    object_origin,
+                )
+            }
+        };
+        if let CallTarget::Member {
+            object,
+            field,
+            receiver_place,
+        }
+        | CallTarget::TraitMember {
+            object,
+            field,
+            receiver_place,
+            ..
+        } = callee
+        {
+            for candidate in &candidates {
+                match candidate.receiver {
+                    Some(MirReceiverKind::BorrowMut) => {
+                        let Operand::Place(place) = object else {
+                            return Err(format!(
+                                "invalid MIR member call `{field}` in `{}` binds a mutable receiver to a non-place operand",
+                                caller.name
+                            ));
+                        };
+                        let Some(writeback_place) = receiver_place.as_deref() else {
+                            return Err(format!(
+                                "invalid MIR member call `{field}` in `{}` requires a mutable receiver writeback place",
+                                caller.name
+                            ));
+                        };
+                        if writeback_place != place {
+                            return Err(format!(
+                                "invalid MIR member call `{field}` in `{}` redirects receiver `{place}` to unrelated writeback place `{writeback_place}`",
+                                caller.name
+                            ));
+                        }
+                    }
+                    Some(MirReceiverKind::Value | MirReceiverKind::Borrow) => {}
+                    None => {
+                        return Err(format!(
+                            "invalid MIR member call `{field}` in `{}` targets a method without a receiver",
+                            caller.name
+                        ));
+                    }
+                }
+            }
+        }
+        let mut contracts = Vec::new();
+        for candidate in candidates {
+            let Some(contract) =
+                self.bound_returned_view_for_function(caller, candidate, args, receiver_origin)?
+            else {
+                return Ok(ValidatedPendingCall {
+                    identity,
+                    returned_view: None,
+                });
+            };
+            contracts.push(contract);
+        }
+        if contracts.is_empty() {
+            return Ok(ValidatedPendingCall {
+                identity,
+                returned_view: None,
+            });
+        }
+        let bound_origin = contracts[0].origin.clone();
+        if contracts
+            .iter()
+            .any(|contract| contract.origin != bound_origin)
+        {
+            return Err(format!(
+                "invalid MIR call `{identity}` has inconsistent returned-view bound origins"
+            ));
+        }
+        let mutable = contracts.iter().all(|contract| contract.mutable);
+        let mut projections = contracts
+            .iter()
+            .flat_map(|contract| contract.projections.iter().cloned())
+            .collect::<Vec<_>>();
+        projections.sort();
+        projections.dedup();
+        let mut callees = contracts
+            .iter()
+            .flat_map(|contract| contract.callees.iter().cloned())
+            .collect::<Vec<_>>();
+        callees.sort();
+        callees.dedup();
+        Ok(ValidatedPendingCall {
+            identity,
+            returned_view: Some(BoundReturnedViewContract {
+                callees: callees.into(),
+                origin: bound_origin,
+                mutable,
+                projections: projections.into(),
+            }),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BoundReturnedViewContract {
+    callees: std::sync::Arc<[String]>,
+    origin: String,
+    mutable: bool,
+    projections: std::sync::Arc<[String]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ValidatedPendingCall {
+    identity: String,
+    returned_view: Option<BoundReturnedViewContract>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PendingLoanHandoff {
+    IncomingCall(ValidatedPendingCall),
+    OutgoingReturn,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ValidatedLoanState {
+    loans: ValidatedLoans,
+    ended: BTreeSet<String>,
+    pending_handoff: Option<PendingLoanHandoff>,
+    active_path_bytes: usize,
+    active_name_bytes: usize,
+}
+
+pub(crate) fn mir_place_paths_overlap(left: &str, right: &str) -> bool {
+    let is_segment_prefix = |prefix: &str, place: &str| {
+        place == prefix
+            || place
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.starts_with('.'))
+    };
+    is_segment_prefix(left, right) || is_segment_prefix(right, left)
+}
+
+fn validated_sorted_sources_overlap(left: &[String], right: &[String]) -> bool {
+    let mut left_index = 0usize;
+    let mut right_index = 0usize;
+    while left_index < left.len() && right_index < right.len() {
+        let left_source = &left[left_index];
+        let right_source = &right[right_index];
+        if mir_place_paths_overlap(left_source, right_source) {
+            return true;
+        }
+        if left_source < right_source {
+            left_index += 1;
+        } else {
+            right_index += 1;
+        }
+    }
+    false
+}
+
+fn validated_source_is_within_origins(source: &str, origins: &[String]) -> bool {
+    source
+        .match_indices('.')
+        .map(|(index, _)| &source[..index])
+        .chain(std::iter::once(source))
+        .any(|prefix| {
+            origins
+                .binary_search_by(|origin| origin.as_str().cmp(prefix))
+                .is_ok()
+        })
+}
+
+fn validated_loan_sources(
+    place: &str,
+    state: &ValidatedLoans,
+) -> std::result::Result<Vec<String>, String> {
+    let (root, suffix) = place.split_once('.').unwrap_or((place, ""));
+    let Some(loan) = state.get(root) else {
+        return Ok(vec![place.to_string()]);
+    };
+    let expanded_path_bytes = loan.sources.iter().fold(0usize, |total, source| {
+        total.saturating_add(
+            source
+                .len()
+                .saturating_add((!suffix.is_empty()) as usize)
+                .saturating_add(suffix.len()),
+        )
+    });
+    if expanded_path_bytes > MAX_VALIDATED_EXPANDED_LOAN_PATH_BYTES {
+        return Err(format!(
+            "expanded MIR loan place `{place}` exceeds the loan-path byte limit of {}",
+            MAX_VALIDATED_EXPANDED_LOAN_PATH_BYTES
+        ));
+    }
+    let mut sources = loan
+        .sources
+        .iter()
+        .map(|source| {
+            if suffix.is_empty() {
+                source.clone()
+            } else {
+                format!("{source}.{suffix}")
+            }
+        })
+        .collect::<Vec<_>>();
+    sources.sort();
+    sources.dedup();
+    Ok(sources)
+}
+
+fn validate_active_loan_path_budget(
+    function: &MirFunction,
+    loan: &str,
+    state: &ValidatedLoanState,
+    new_path_bytes: usize,
+) -> std::result::Result<(), String> {
+    if state.loans.len() >= MAX_VALIDATED_ACTIVE_LOANS {
+        return Err(format!(
+            "invalid MIR loan `{loan}` in `{}` exceeds the active loan descriptor limit of {}",
+            function.name, MAX_VALIDATED_ACTIVE_LOANS
+        ));
+    }
+    if state.active_name_bytes.saturating_add(loan.len()) > MAX_VALIDATED_ACTIVE_LOAN_NAME_BYTES {
+        return Err(format!(
+            "invalid MIR loan `{loan}` in `{}` exceeds the active loan-name byte limit of {}",
+            function.name, MAX_VALIDATED_ACTIVE_LOAN_NAME_BYTES
+        ));
+    }
+    if state.active_path_bytes.saturating_add(new_path_bytes)
+        > MAX_VALIDATED_EXPANDED_LOAN_PATH_BYTES
+    {
+        return Err(format!(
+            "invalid MIR loan `{loan}` in `{}` exceeds the active loan-path byte limit of {}",
+            function.name, MAX_VALIDATED_EXPANDED_LOAN_PATH_BYTES
+        ));
+    }
+    Ok(())
+}
+
+fn insert_validated_loan(state: &mut ValidatedLoanState, name: String, loan: ValidatedLoan) {
+    let path_bytes = loan
+        .sources
+        .iter()
+        .map(String::len)
+        .fold(0usize, usize::saturating_add);
+    if let Some(parent) = loan.parent.as_deref() {
+        let parent = state
+            .loans
+            .get_mut(parent)
+            .expect("validated reborrow parents remain active");
+        parent.active_children = parent.active_children.saturating_add(1);
+    }
+    state.active_path_bytes = state.active_path_bytes.saturating_add(path_bytes);
+    state.active_name_bytes = state.active_name_bytes.saturating_add(name.len());
+    state.loans.insert(name, loan);
+}
+
+fn remove_validated_loan(state: &mut ValidatedLoanState, name: &str) -> Option<ValidatedLoan> {
+    let loan = state.loans.remove(name)?;
+    if let Some(parent) = loan.parent.as_deref() {
+        let parent = state
+            .loans
+            .get_mut(parent)
+            .expect("validated reborrow parents end after their children");
+        parent.active_children = parent.active_children.saturating_sub(1);
+    }
+    let path_bytes = loan
+        .sources
+        .iter()
+        .map(String::len)
+        .fold(0usize, usize::saturating_add);
+    state.active_path_bytes = state.active_path_bytes.saturating_sub(path_bytes);
+    state.active_name_bytes = state.active_name_bytes.saturating_sub(name.len());
+    Some(loan)
+}
+
+fn validated_loan_ancestors(loan: &str, state: &ValidatedLoans) -> BTreeSet<String> {
+    let mut ancestors = BTreeSet::new();
+    let mut current = Some(loan);
+    while let Some(name) = current {
+        let Some(parent) = state.get(name).and_then(|loan| loan.parent.as_deref()) else {
+            break;
+        };
+        if !ancestors.insert(parent.to_string()) {
+            break;
+        }
+        current = Some(parent);
+    }
+    ancestors
+}
+
+fn validated_loan_has_child(loan: &str, state: &ValidatedLoans) -> bool {
+    state
+        .get(loan)
+        .is_some_and(|descriptor| descriptor.active_children != 0)
+}
+
+fn validated_loan_is_suspended(loan: &str, state: &ValidatedLoans) -> bool {
+    state.get(loan).is_some_and(|loan| loan.mutable) && validated_loan_has_child(loan, state)
+}
+
+fn validated_loan_has_returned_ancestor(loan: &str, state: &ValidatedLoans) -> bool {
+    let mut current = Some(loan);
+    let mut seen = BTreeSet::new();
+    while let Some(name) = current {
+        if !seen.insert(name) {
+            return false;
+        }
+        let Some(descriptor) = state.get(name) else {
+            return false;
+        };
+        if descriptor.returned_descriptor {
+            return true;
+        }
+        current = descriptor.parent.as_deref();
+    }
+    false
+}
+
+fn validate_new_loan_overlap(
+    function: &MirFunction,
+    loan_name: &str,
+    sources: &[String],
+    mutable: bool,
+    parent: Option<&str>,
+    state: &ValidatedLoans,
+) -> std::result::Result<(), String> {
+    let ancestors = parent
+        .map(|parent| {
+            let mut ancestors = validated_loan_ancestors(parent, state);
+            ancestors.insert(parent.to_string());
+            ancestors
+        })
+        .unwrap_or_default();
+    for (active_name, active) in state {
+        if ancestors.contains(active_name) {
+            continue;
+        }
+        if !mutable && !active.mutable {
+            continue;
+        }
+        let overlaps = validated_sorted_sources_overlap(sources, &active.sources);
+        if overlaps {
+            return Err(format!(
+                "invalid MIR loan `{loan_name}` in `{}` overlaps active {} loan `{active_name}`",
+                function.name,
+                if active.mutable { "mutable" } else { "shared" },
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_mir_loan_name(function: &MirFunction, loan: &str) -> std::result::Result<(), String> {
+    if loan.contains('.') {
+        return Err(format!(
+            "invalid MIR loan descriptor `{loan}` in `{}` must be one undotted local identifier",
+            function.name
+        ));
+    }
+    validate_canonical_mir_identifier(function, loan, true)
+}
+
+fn escaped_mir_name(name: &str) -> String {
+    name.chars().flat_map(char::escape_default).collect()
+}
+
+fn validate_canonical_mir_identifier(
+    function: &MirFunction,
+    identifier: &str,
+    allow_temporary: bool,
+) -> std::result::Result<(), String> {
+    let canonical_source_identifier = || {
+        let mut bytes = identifier.bytes();
+        bytes
+            .next()
+            .is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+            && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+    };
+    let canonical_temporary = || {
+        let Some(index) = identifier.strip_prefix("%t") else {
+            return false;
+        };
+        !index.is_empty()
+            && index.bytes().all(|byte| byte.is_ascii_digit())
+            && index
+                .parse::<usize>()
+                .is_ok_and(|parsed| parsed.to_string() == index)
+    };
+    if identifier.len() > MAX_VALIDATED_MIR_IDENTIFIER_BYTES
+        || !(canonical_source_identifier() || allow_temporary && canonical_temporary())
+    {
+        return Err(format!(
+            "non-canonical MIR identifier `{}` in `{}`",
+            escaped_mir_name(identifier),
+            function.name
+        ));
+    }
+    Ok(())
+}
+
+fn validate_canonical_mir_place(
+    function: &MirFunction,
+    place: &str,
+) -> std::result::Result<(), String> {
+    if place.is_empty() || place.split('.').any(str::is_empty) {
+        return Err(format!(
+            "invalid empty MIR place segment in `{place}` in `{}`",
+            function.name
+        ));
+    }
+    let mut segments = place.split('.');
+    validate_canonical_mir_identifier(function, segments.next().unwrap_or_default(), true)?;
+    for segment in segments {
+        if segment.bytes().all(|byte| byte.is_ascii_digit()) {
+            let canonical = segment
+                .parse::<usize>()
+                .map_err(|_| format!("invalid MIR tuple projection `{segment}` in `{place}`"))?
+                .to_string();
+            if canonical != segment {
+                return Err(format!(
+                    "non-canonical MIR tuple projection `{segment}` in `{place}` in `{}`",
+                    function.name
+                ));
+            }
+        } else {
+            validate_canonical_mir_identifier(function, segment, false)?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum LoanPlaceAccess {
+    Read,
+    Move,
+    Mutate,
+}
+
+fn validate_loan_place_access(
+    function: &MirFunction,
+    place: &str,
+    access: LoanPlaceAccess,
+    state: &ValidatedLoanState,
+) -> std::result::Result<(), String> {
+    validate_canonical_mir_place(function, place)?;
+    let root = place.split('.').next().unwrap_or_default();
+    if let Some(loan) = state.loans.get(root) {
+        if validated_loan_is_suspended(root, &state.loans) {
+            return Err(format!(
+                "invalid MIR in `{}` uses suspended parent loan `{root}`",
+                function.name
+            ));
+        }
+        return match access {
+            LoanPlaceAccess::Read => Ok(()),
+            LoanPlaceAccess::Mutate if loan.mutable => Ok(()),
+            LoanPlaceAccess::Mutate => Err(format!(
+                "invalid MIR in `{}` mutates through shared loan `{root}`",
+                function.name
+            )),
+            LoanPlaceAccess::Move => Err(format!(
+                "invalid MIR in `{}` moves through active loan `{root}`",
+                function.name
+            )),
+        };
+    }
+    if state.ended.contains(root) {
+        return Err(format!(
+            "invalid MIR in `{}` uses ended loan `{root}`",
+            function.name
+        ));
+    }
+    let sources = validated_loan_sources(place, &state.loans)?;
+    for active in state.loans.values() {
+        if validated_sorted_sources_overlap(&sources, &active.sources) {
+            match access {
+                LoanPlaceAccess::Read if !active.mutable => {}
+                LoanPlaceAccess::Read => {
+                    return Err(format!(
+                        "invalid MIR in `{}` reads place `{place}` locked by a mutable loan",
+                        function.name
+                    ))
+                }
+                LoanPlaceAccess::Move => {
+                    return Err(format!(
+                        "invalid MIR in `{}` moves locked place `{place}`",
+                        function.name
+                    ))
+                }
+                LoanPlaceAccess::Mutate => {
+                    return Err(format!(
+                        "invalid MIR in `{}` mutates locked place `{place}`",
+                        function.name
+                    ))
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_loan_operand(
+    function: &MirFunction,
+    operand: &Operand,
+    _context: &MirLoanValidationContext<'_>,
+    state: &ValidatedLoanState,
+) -> std::result::Result<(), String> {
+    match operand {
+        Operand::Place(place) => {
+            validate_loan_place_access(function, place, LoanPlaceAccess::Read, state)
+        }
+        Operand::MovePlace(place) => {
+            validate_loan_place_access(function, place, LoanPlaceAccess::Move, state)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_loan_rvalue(
+    function: &MirFunction,
+    value: &Rvalue,
+    context: &MirLoanValidationContext<'_>,
+    state: &ValidatedLoanState,
+) -> std::result::Result<(), String> {
+    let operands = |values: &[Operand]| -> std::result::Result<(), String> {
+        for value in values {
+            validate_loan_operand(function, value, context, state)?;
+        }
+        Ok(())
+    };
+    match value {
+        Rvalue::Use(value)
+        | Rvalue::Unary { value, .. }
+        | Rvalue::Cast { value, .. }
+        | Rvalue::Try { value }
+        | Rvalue::TupleElement { tuple: value, .. }
+        | Rvalue::VariantPayload {
+            scrutinee: value, ..
+        } => validate_loan_operand(function, value, context, state),
+        Rvalue::Member { object, field } => {
+            validate_canonical_mir_identifier(function, field, false)?;
+            validate_loan_operand(function, object, context, state)
+        }
+        Rvalue::ModuleConstant { .. } => Ok(()),
+        Rvalue::Closure { captures, .. } => {
+            for capture in captures {
+                validate_canonical_mir_identifier(function, &capture.name, true)?;
+                validate_loan_operand(function, &capture.value, context, state)?;
+                match capture.passing {
+                    MirReceiverKind::Value => {
+                        if capture.resolve_source_at_capture {
+                            return Err(format!(
+                                "invalid MIR value closure capture `{}` in `{}` requests returned-view source resolution",
+                                capture.name, function.name
+                            ));
+                        }
+                        if capture.source_place.is_some() {
+                            return Err(format!(
+                                "invalid MIR value closure capture `{}` in `{}` has a borrowed source place",
+                                capture.name, function.name
+                            ));
+                        }
+                    }
+                    MirReceiverKind::Borrow | MirReceiverKind::BorrowMut => {
+                        let source = capture.source_place.as_deref().ok_or_else(|| {
+                            format!(
+                                "invalid MIR borrowed closure capture `{}` in `{}` has no source place",
+                                capture.name, function.name
+                            )
+                        })?;
+                        validate_canonical_mir_place(function, source)?;
+                        let Operand::Place(captured_place) = &capture.value else {
+                            return Err(format!(
+                                "invalid MIR borrowed closure capture `{}` in `{}` does not read a place",
+                                capture.name, function.name
+                            ));
+                        };
+                        let captured_root = captured_place.split('.').next().unwrap_or_default();
+                        let loan = state.loans.get(captured_root);
+                        let returned_source =
+                            validated_loan_has_returned_ancestor(captured_root, &state.loans);
+                        if returned_source
+                            && loan.is_some_and(|loan| loan.sources.len() > 1)
+                            && (!capture.resolve_source_at_capture || source != captured_place)
+                        {
+                            return Err(format!(
+                                "invalid MIR borrowed closure capture `{}` in `{}` must resolve its returned-view selected source at capture time",
+                                capture.name, function.name
+                            ));
+                        }
+                        if capture.resolve_source_at_capture
+                            && (!returned_source || source != captured_place)
+                        {
+                            return Err(format!(
+                                "invalid MIR borrowed closure capture `{}` in `{}` requires an active returned-view descriptor",
+                                capture.name, function.name
+                            ));
+                        }
+                        if capture.passing == MirReceiverKind::BorrowMut {
+                            if loan.is_some_and(|loan| !loan.mutable) {
+                                return Err(format!(
+                                    "invalid mutable MIR closure capture `{}` in `{}` escalates shared loan `{captured_root}`",
+                                    capture.name, function.name
+                                ));
+                            }
+                            if loan.is_none()
+                                && !context.root_allows_mutable_loan(function, captured_root)
+                            {
+                                return Err(format!(
+                                    "invalid mutable MIR closure capture `{}` in `{}` escalates shared input `{captured_root}`",
+                                    capture.name, function.name
+                                ));
+                            }
+                        }
+                        let source_matches_capture = source == captured_place
+                            || loan.is_some()
+                                && validated_loan_sources(captured_place, &state.loans)?
+                                    .iter()
+                                    .any(|candidate| candidate == source);
+                        if !source_matches_capture {
+                            return Err(format!(
+                                "invalid MIR borrowed closure capture `{}` in `{}` has unrelated source `{source}`",
+                                capture.name, function.name
+                            ));
+                        }
+                        if source == captured_place {
+                            validate_loan_place_access(
+                                function,
+                                source,
+                                LoanPlaceAccess::Read,
+                                state,
+                            )?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        Rvalue::FormatString { parts } => {
+            for part in parts {
+                match part {
+                    MirFormatPart::Literal(_) => {}
+                    MirFormatPart::Value(value) | MirFormatPart::Formatted { value, .. } => {
+                        validate_loan_operand(function, value, context, state)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        Rvalue::StartTask {
+            stack_size,
+            task_group,
+            function: task_function,
+            args,
+            ..
+        } => {
+            if let Some(stack_size) = stack_size {
+                validate_loan_operand(function, stack_size, context, state)?;
+            }
+            validate_loan_operand(function, task_group, context, state)?;
+            validate_loan_operand(function, task_function, context, state)?;
+            for arg in args {
+                validate_loan_operand(function, &arg.value, context, state)?;
+                if let Some(place) = &arg.writeback_place {
+                    validate_loan_place_access(function, place, LoanPlaceAccess::Mutate, state)?;
+                }
+            }
+            Ok(())
+        }
+        Rvalue::Binary { left, right, .. } => operands(&[left.clone(), right.clone()]),
+        Rvalue::Call { callee, args } => {
+            match callee {
+                CallTarget::Name(_) | CallTarget::Extern(_) => {}
+                CallTarget::Value(value) => validate_loan_operand(function, value, context, state)?,
+                CallTarget::Member {
+                    object,
+                    field,
+                    receiver_place,
+                }
+                | CallTarget::TraitMember {
+                    object,
+                    field,
+                    receiver_place,
+                    ..
+                } => {
+                    validate_canonical_mir_identifier(function, field, false)?;
+                    validate_loan_operand(function, object, context, state)?;
+                    let trait_name = match callee {
+                        CallTarget::TraitMember { trait_name, .. } => Some(trait_name.as_str()),
+                        _ => None,
+                    };
+                    let receiver_passing =
+                        context.member_receiver_passing(function, object, trait_name, field)?;
+                    let operand_place = match object {
+                        Operand::Place(place) | Operand::MovePlace(place) => Some(place.as_str()),
+                        _ => None,
+                    };
+                    if let (Some(receiver_place), Some(operand_place)) =
+                        (receiver_place.as_deref(), operand_place)
+                    {
+                        if receiver_place != operand_place {
+                            return Err(format!(
+                                "invalid MIR member call `{field}` in `{}` redirects receiver `{operand_place}` to unrelated writeback place `{receiver_place}`",
+                                function.name
+                            ));
+                        }
+                    }
+                    if receiver_passing == Some(MirReceiverKind::BorrowMut) {
+                        let Some(operand_place) = operand_place else {
+                            return Err(format!(
+                                "invalid MIR member call `{field}` in `{}` binds a mutable receiver to a non-place operand",
+                                function.name
+                            ));
+                        };
+                        let Some(writeback_place) = receiver_place.as_deref() else {
+                            return Err(format!(
+                                "invalid MIR member call `{field}` in `{}` requires a mutable receiver writeback place",
+                                function.name
+                            ));
+                        };
+                        if writeback_place != operand_place {
+                            return Err(format!(
+                                "invalid MIR member call `{field}` in `{}` redirects receiver `{operand_place}` to unrelated writeback place `{writeback_place}`",
+                                function.name
+                            ));
+                        }
+                    }
+                    if let Some(place) = receiver_place.as_deref().or(operand_place) {
+                        validate_loan_place_access(
+                            function,
+                            place,
+                            if receiver_passing == Some(MirReceiverKind::BorrowMut) {
+                                LoanPlaceAccess::Mutate
+                            } else {
+                                LoanPlaceAccess::Read
+                            },
+                            state,
+                        )?;
+                    }
+                }
+            }
+            for arg in args {
+                validate_loan_operand(function, &arg.value, context, state)?;
+                if let Some(place) = &arg.writeback_place {
+                    validate_loan_place_access(function, place, LoanPlaceAccess::Mutate, state)?;
+                }
+            }
+            let _ = context.pending_call(function, callee, args)?;
+            Ok(())
+        }
+        Rvalue::VecLiteral { elements, .. }
+        | Rvalue::TupleLiteral { elements, .. }
+        | Rvalue::SetLiteral { elements, .. }
+        | Rvalue::EnumVariant {
+            payloads: elements, ..
+        } => operands(elements),
+        Rvalue::TupleTakeElement { place, .. } => {
+            validate_loan_place_access(function, place, LoanPlaceAccess::Move, state)
+        }
+        Rvalue::MapLiteral { entries, .. } => {
+            for entry in entries {
+                validate_loan_operand(function, &entry.key, context, state)?;
+                validate_loan_operand(function, &entry.value, context, state)?;
+            }
+            Ok(())
+        }
+        Rvalue::Construct { fields, .. } => {
+            for field in fields {
+                validate_loan_operand(function, &field.value, context, state)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_loan_terminator(
+    function: &MirFunction,
+    terminator: &Terminator,
+    context: &MirLoanValidationContext<'_>,
+    state: &ValidatedLoanState,
+) -> std::result::Result<(), String> {
+    match terminator {
+        Terminator::Return(value) => validate_loan_operand(function, value, context, state),
+        Terminator::Goto(_) | Terminator::Unreachable => Ok(()),
+        Terminator::Branch { condition, .. } => {
+            validate_loan_operand(function, condition, context, state)
+        }
+        Terminator::ForRange { iterable, .. } => {
+            validate_loan_operand(function, iterable, context, state)
+        }
+        Terminator::Match { scrutinee, .. } => {
+            validate_loan_operand(function, scrutinee, context, state)
+        }
+        Terminator::AssertFail {
+            message, captures, ..
+        } => {
+            if let Some(message) = message {
+                validate_loan_operand(function, message, context, state)?;
+            }
+            for capture in captures {
+                validate_loan_operand(function, &capture.value, context, state)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_loan_instruction(
+    function: &MirFunction,
+    instruction: &Instruction,
+    known_roots: &BTreeSet<String>,
+    context: &MirLoanValidationContext<'_>,
+    budget: &mut ValidatedLoanBudget,
+    state: &mut ValidatedLoanState,
+) -> std::result::Result<(), String> {
+    if state.pending_handoff == Some(PendingLoanHandoff::OutgoingReturn)
+        && !matches!(
+            instruction,
+            Instruction::EndLoan { .. }
+                | Instruction::PopCleanup { .. }
+                | Instruction::Assign {
+                    value: Rvalue::Use(_),
+                    ..
+                }
+                | Instruction::Safepoint
+        )
+    {
+        return Err(format!(
+            "invalid MIR in `{}` executes a non-cleanup instruction after returning a loan",
+            function.name
+        ));
+    }
+    if matches!(
+        &state.pending_handoff,
+        Some(PendingLoanHandoff::IncomingCall(_))
+    ) && !matches!(instruction, Instruction::BeginReturnedLoan { .. })
+    {
+        state.pending_handoff = None;
+    }
+    match instruction {
+        Instruction::BeginLoan {
+            loan,
+            source,
+            mutable,
+        } => {
+            validate_mir_loan_name(function, loan)?;
+            validate_canonical_mir_place(function, source)?;
+            if state.loans.contains_key(loan) {
+                return Err(format!(
+                    "invalid MIR in `{}` begins already-active loan `{loan}`",
+                    function.name
+                ));
+            }
+            let source_root = source.split('.').next().unwrap_or_default();
+            if loan == source_root {
+                return Err(format!(
+                    "invalid MIR loan `{loan}` in `{}` shadows its source root",
+                    function.name
+                ));
+            }
+            if state.loans.contains_key(source_root) {
+                return Err(format!(
+                    "invalid MIR loan `{loan}` in `{}` must use Reborrow for parent `{source_root}`",
+                    function.name
+                ));
+            }
+            if !known_roots.contains(source_root) {
+                return Err(format!(
+                    "invalid MIR loan `{loan}` in `{}` has unknown source `{source}`",
+                    function.name
+                ));
+            }
+            if *mutable && !context.root_allows_mutable_loan(function, source_root) {
+                return Err(format!(
+                    "invalid mutable MIR loan `{loan}` in `{}` escalates shared input `{source_root}`",
+                    function.name
+                ));
+            }
+            let sources = vec![source.clone()];
+            context.validate_projected_loan_type(function, loan, source)?;
+            validate_active_loan_path_budget(function, loan, state, source.len())?;
+            validate_new_loan_overlap(function, loan, &sources, *mutable, None, &state.loans)?;
+            state.ended.remove(loan);
+            insert_validated_loan(
+                state,
+                loan.clone(),
+                ValidatedLoan {
+                    sources: sources.into(),
+                    mutable: *mutable,
+                    parent: None,
+                    returned_descriptor: false,
+                    active_children: 0,
+                },
+            );
+        }
+        Instruction::BeginReturnedLoan {
+            loan,
+            origin,
+            projections,
+            mutable,
+        } => {
+            validate_mir_loan_name(function, loan)?;
+            validate_canonical_mir_place(function, origin)?;
+            if state.loans.contains_key(loan) || projections.is_empty() {
+                return Err(format!(
+                    "invalid returned MIR loan `{loan}` in `{}` has no unique inactive descriptor",
+                    function.name
+                ));
+            }
+            for projection in projections {
+                let synthetic = if projection.is_empty() {
+                    origin.clone()
+                } else {
+                    format!("{origin}.{projection}")
+                };
+                validate_canonical_mir_place(function, &synthetic)?;
+            }
+            let pending_call = match state.pending_handoff.take() {
+                Some(PendingLoanHandoff::IncomingCall(call)) => call,
+                _ => {
+                    return Err(format!(
+                        "invalid returned MIR loan `{loan}` in `{}` has no immediately preceding call handoff",
+                        function.name
+                    ))
+                }
+            };
+            let Some(authoritative) = pending_call.returned_view else {
+                return Err(format!(
+                    "invalid returned MIR loan `{loan}` in `{}` follows call `{}` which does not return a view",
+                    function.name, pending_call.identity
+                ));
+            };
+            if origin != &authoritative.origin {
+                return Err(format!(
+                    "invalid returned MIR loan `{loan}` in `{}` names origin `{origin}`, but callee `{}` has bound origin `{}`",
+                    function.name,
+                    authoritative.callees.join(" | "),
+                    authoritative.origin
+                ));
+            }
+            if *mutable && !authoritative.mutable {
+                return Err(format!(
+                    "invalid returned MIR loan `{loan}` in `{}` forges mutable capability from shared callee `{}`",
+                    function.name,
+                    authoritative.callees.join(" | ")
+                ));
+            }
+            let unique_projections = projections.iter().cloned().collect::<BTreeSet<_>>();
+            let authoritative_projections = authoritative
+                .projections
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            // A monomorphized or otherwise specialized caller may know that
+            // only a subset of a generic callee's conservative alternatives
+            // is reachable. Narrowing cannot grant access outside the
+            // callee's authoritative projection set, while requiring exact
+            // equality would reject those legitimate specialized descriptors.
+            if !unique_projections.is_subset(&authoritative_projections) {
+                return Err(format!(
+                    "invalid returned MIR loan `{loan}` in `{}` does not match callee `{}` projection contract",
+                    function.name,
+                    authoritative.callees.join(" | ")
+                ));
+            }
+            let origin_root = origin.split('.').next().unwrap_or_default();
+            if loan == origin_root {
+                return Err(format!(
+                    "invalid returned MIR loan `{loan}` in `{}` shadows its origin root",
+                    function.name
+                ));
+            }
+            let parent = state
+                .loans
+                .contains_key(origin_root)
+                .then(|| origin_root.to_string());
+            if parent.is_none() && !known_roots.contains(origin_root) {
+                return Err(format!(
+                    "invalid returned MIR loan `{loan}` in `{}` has unknown origin `{origin}`",
+                    function.name
+                ));
+            }
+            if *mutable
+                && parent
+                    .as_deref()
+                    .and_then(|parent| state.loans.get(parent))
+                    .is_some_and(|parent| !parent.mutable)
+            {
+                return Err(format!(
+                    "invalid mutable returned MIR loan `{loan}` in `{}` escalates shared parent `{origin_root}`",
+                    function.name
+                ));
+            }
+            if *mutable
+                && parent.is_none()
+                && !context.root_allows_mutable_loan(function, origin_root)
+            {
+                return Err(format!(
+                    "invalid mutable returned MIR loan `{loan}` in `{}` escalates shared input `{origin_root}`",
+                    function.name
+                ));
+            }
+            let origin_sources = validated_loan_sources(origin, &state.loans)?;
+            let alternative_count = origin_sources
+                .len()
+                .saturating_mul(unique_projections.len());
+            if alternative_count > MAX_VALIDATED_LOAN_ALTERNATIVES {
+                return Err(format!(
+                    "invalid returned MIR loan `{loan}` in `{}` exceeds the alternative limit of {}",
+                    function.name, MAX_VALIDATED_LOAN_ALTERNATIVES
+                ));
+            }
+            let expanded_path_bytes = origin_sources
+                .iter()
+                .flat_map(|origin_source| {
+                    unique_projections.iter().map(move |projection| {
+                        origin_source
+                            .len()
+                            .saturating_add((!projection.is_empty()) as usize)
+                            .saturating_add(projection.len())
+                    })
+                })
+                .fold(0usize, usize::saturating_add);
+            if expanded_path_bytes > MAX_VALIDATED_EXPANDED_LOAN_PATH_BYTES {
+                return Err(format!(
+                    "invalid returned MIR loan `{loan}` in `{}` exceeds the expanded loan-path byte limit of {}",
+                    function.name, MAX_VALIDATED_EXPANDED_LOAN_PATH_BYTES
+                ));
+            }
+            budget.reserve(function, loan, expanded_path_bytes)?;
+            validate_active_loan_path_budget(function, loan, state, expanded_path_bytes)?;
+            let mut sources = Vec::new();
+            for origin_source in origin_sources {
+                for projection in &unique_projections {
+                    let source = if projection.is_empty() {
+                        origin_source.clone()
+                    } else {
+                        format!("{origin_source}.{projection}")
+                    };
+                    context.validate_projected_loan_type(function, loan, &source)?;
+                    sources.push(source);
+                }
+            }
+            sources.sort();
+            sources.dedup();
+            validate_new_loan_overlap(
+                function,
+                loan,
+                &sources,
+                *mutable,
+                parent.as_deref(),
+                &state.loans,
+            )?;
+            state.ended.remove(loan);
+            insert_validated_loan(
+                state,
+                loan.clone(),
+                ValidatedLoan {
+                    sources: sources.into(),
+                    mutable: *mutable,
+                    parent,
+                    returned_descriptor: true,
+                    active_children: 0,
+                },
+            );
+        }
+        Instruction::Reborrow {
+            loan,
+            parent,
+            projection,
+            mutable,
+        } => {
+            validate_mir_loan_name(function, loan)?;
+            let synthetic_projection = if projection.is_empty() {
+                "__loan_root".to_string()
+            } else {
+                format!("__loan_root.{projection}")
+            };
+            validate_canonical_mir_place(function, &synthetic_projection)?;
+            if state.loans.contains_key(loan) {
+                return Err(format!(
+                    "invalid MIR in `{}` begins already-active reborrow `{loan}`",
+                    function.name
+                ));
+            }
+            let Some(parent_loan) = state.loans.get(parent) else {
+                return Err(format!(
+                    "invalid MIR reborrow `{loan}` in `{}` has inactive parent `{parent}`",
+                    function.name
+                ));
+            };
+            if *mutable && !parent_loan.mutable {
+                return Err(format!(
+                    "invalid mutable MIR reborrow `{loan}` in `{}` escalates shared parent `{parent}`",
+                    function.name
+                ));
+            }
+            let expanded_path_bytes = parent_loan.sources.iter().fold(0usize, |total, source| {
+                total.saturating_add(
+                    source
+                        .len()
+                        .saturating_add((!projection.is_empty()) as usize)
+                        .saturating_add(projection.len()),
+                )
+            });
+            budget.reserve(function, loan, expanded_path_bytes)?;
+            validate_active_loan_path_budget(function, loan, state, expanded_path_bytes)?;
+            let mut sources = parent_loan
+                .sources
+                .iter()
+                .map(|source| {
+                    if projection.is_empty() {
+                        source.clone()
+                    } else {
+                        format!("{source}.{projection}")
+                    }
+                })
+                .collect::<Vec<_>>();
+            sources.sort();
+            sources.dedup();
+            for source in &sources {
+                context.validate_projected_loan_type(function, loan, source)?;
+            }
+            validate_new_loan_overlap(
+                function,
+                loan,
+                &sources,
+                *mutable,
+                Some(parent),
+                &state.loans,
+            )?;
+            state.ended.remove(loan);
+            insert_validated_loan(
+                state,
+                loan.clone(),
+                ValidatedLoan {
+                    sources: sources.into(),
+                    mutable: *mutable,
+                    parent: Some(parent.clone()),
+                    returned_descriptor: false,
+                    active_children: 0,
+                },
+            );
+        }
+        Instruction::ReadLoan { target, loan } => {
+            validate_canonical_mir_place(function, loan)?;
+            let root = loan.split('.').next().unwrap_or_default();
+            if !state.loans.contains_key(root) {
+                return Err(format!(
+                    "invalid MIR in `{}` reads inactive loan `{root}`",
+                    function.name
+                ));
+            }
+            if validated_loan_is_suspended(root, &state.loans) {
+                return Err(format!(
+                    "invalid MIR in `{}` reads suspended parent loan `{root}`",
+                    function.name
+                ));
+            }
+            validate_loan_place_access(function, target, LoanPlaceAccess::Mutate, state)?;
+        }
+        Instruction::WriteLoan { loan, value } => {
+            validate_canonical_mir_place(function, loan)?;
+            let root = loan.split('.').next().unwrap_or_default();
+            let Some(active) = state.loans.get(root) else {
+                return Err(format!(
+                    "invalid MIR in `{}` writes inactive loan `{root}`",
+                    function.name
+                ));
+            };
+            if !active.mutable {
+                return Err(format!(
+                    "invalid MIR in `{}` writes through shared loan `{root}`",
+                    function.name
+                ));
+            }
+            if validated_loan_has_child(root, &state.loans) {
+                return Err(format!(
+                    "invalid MIR in `{}` writes suspended parent loan `{root}`",
+                    function.name
+                ));
+            }
+            validate_loan_rvalue(function, value, context, state)?;
+        }
+        Instruction::EndLoan { loan } => {
+            if validated_loan_has_child(loan, &state.loans) {
+                return Err(format!(
+                    "invalid MIR in `{}` ends parent loan `{loan}` before its child",
+                    function.name
+                ));
+            }
+            if remove_validated_loan(state, loan).is_none() {
+                return Err(format!(
+                    "invalid MIR in `{}` ends inactive loan `{loan}`",
+                    function.name
+                ));
+            }
+            state.ended.insert(loan.clone());
+        }
+        Instruction::ReturnLoan { loan, origin } => {
+            validate_canonical_mir_place(function, loan)?;
+            validate_canonical_mir_place(function, origin)?;
+            let loan_root = loan.split('.').next().unwrap_or_default();
+            let origin_root = origin.split('.').next().unwrap_or_default();
+            if !known_roots.contains(origin_root) {
+                return Err(format!(
+                    "invalid returned MIR loan in `{}` names unknown origin `{origin}`",
+                    function.name
+                ));
+            }
+            let returns_borrowed_input =
+                function.params.iter().any(|param| {
+                    param.name == loan_root && param.passing != MirReceiverKind::Value
+                }) || (loan_root == "self"
+                    && function
+                        .receiver
+                        .is_some_and(|receiver| receiver != MirReceiverKind::Value));
+            if !state.loans.contains_key(loan_root) && !returns_borrowed_input {
+                return Err(format!(
+                    "invalid returned MIR loan `{loan}` in `{}` returns inactive loan `{loan_root}`",
+                    function.name
+                ));
+            }
+            let sources = validated_loan_sources(loan, &state.loans)?;
+            let origins = validated_loan_sources(origin, &state.loans)?;
+            if !sources
+                .iter()
+                .all(|source| validated_source_is_within_origins(source, &origins))
+            {
+                return Err(format!(
+                    "invalid returned MIR loan `{loan}` in `{}` has no projection within origin `{origin}`",
+                    function.name,
+                ));
+            }
+            if state.loans.contains_key(loan_root)
+                && validated_loan_has_child(loan_root, &state.loans)
+            {
+                return Err(format!(
+                    "invalid returned MIR loan `{loan}` in `{}` still has an active child",
+                    function.name
+                ));
+            }
+            if remove_validated_loan(state, loan_root).is_some() {
+                state.ended.insert(loan_root.to_string());
+            }
+            state.pending_handoff = Some(PendingLoanHandoff::OutgoingReturn);
+        }
+        Instruction::Assign { target, value } => {
+            validate_loan_rvalue(function, value, context, state)?;
+            validate_loan_place_access(function, target, LoanPlaceAccess::Mutate, state)?;
+            if let Rvalue::Call { callee, args } = value {
+                state.pending_handoff = Some(PendingLoanHandoff::IncomingCall(
+                    context.pending_call(function, callee, args)?,
+                ));
+            }
+        }
+        Instruction::Eval { value } => validate_loan_operand(function, value, context, state)?,
+        Instruction::PushCleanup { place } => {
+            validate_loan_place_access(function, place, LoanPlaceAccess::Read, state)?;
+        }
+        Instruction::PopCleanup { place, .. } => {
+            validate_loan_place_access(function, place, LoanPlaceAccess::Mutate, state)?;
+        }
+        Instruction::Safepoint => {}
+    }
+    Ok(())
+}
+
+fn mir_successors(terminator: &Terminator) -> Vec<&str> {
+    match terminator {
+        Terminator::Goto(label) => vec![label],
+        Terminator::Branch {
+            then_label,
+            else_label,
+            ..
+        } => vec![then_label, else_label],
+        Terminator::ForRange {
+            body_label,
+            exit_label,
+            ..
+        } => vec![body_label, exit_label],
+        Terminator::Match {
+            arms, otherwise, ..
+        } => arms
+            .iter()
+            .map(|arm| arm.label.as_str())
+            .chain(std::iter::once(otherwise.as_str()))
+            .collect(),
+        Terminator::Return(_) | Terminator::AssertFail { .. } | Terminator::Unreachable => {
+            Vec::new()
+        }
+    }
+}
+
+fn validate_function_loan_flow(
+    function: &MirFunction,
+    context: &MirLoanValidationContext<'_>,
+) -> std::result::Result<(), String> {
+    for param in &function.params {
+        validate_canonical_mir_identifier(function, &param.name, false)?;
+    }
+    for local in &function.local_types {
+        validate_canonical_mir_identifier(function, &local.name, true)?;
+    }
+    let mut blocks = BTreeMap::new();
+    for block in &function.blocks {
+        if blocks.insert(block.label.as_str(), block).is_some() {
+            return Err(format!(
+                "invalid MIR function `{}` has duplicate block label `{}`",
+                function.name, block.label
+            ));
+        }
+    }
+    if !blocks.contains_key(function.entry.as_str()) {
+        return Err(format!(
+            "invalid MIR function `{}` has missing entry block `{}`",
+            function.name, function.entry
+        ));
+    }
+    for block in &function.blocks {
+        for successor in mir_successors(&block.terminator) {
+            if !blocks.contains_key(successor) {
+                return Err(format!(
+                    "invalid MIR function `{}` branches to unknown block `{successor}` from block `{}`",
+                    function.name, block.label
+                ));
+            }
+        }
+    }
+    let mut known_roots = function
+        .params
+        .iter()
+        .map(|param| param.name.clone())
+        .chain(function.local_types.iter().map(|local| local.name.clone()))
+        .collect::<BTreeSet<_>>();
+    if function.receiver.is_some() {
+        known_roots.insert("self".to_string());
+    }
+    let mut incoming = BTreeMap::<String, ValidatedLoanState>::new();
+    incoming.insert(function.entry.clone(), ValidatedLoanState::default());
+    let mut pending = vec![function.entry.clone()];
+    let mut budget = ValidatedLoanBudget::default();
+    while let Some(label) = pending.pop() {
+        let block = blocks[label.as_str()];
+        let mut state = incoming[&label].clone();
+        for instruction in &block.instructions {
+            validate_loan_instruction(
+                function,
+                instruction,
+                &known_roots,
+                context,
+                &mut budget,
+                &mut state,
+            )?;
+        }
+        if matches!(
+            &state.pending_handoff,
+            Some(PendingLoanHandoff::IncomingCall(_))
+        ) {
+            state.pending_handoff = None;
+        }
+        if state.pending_handoff == Some(PendingLoanHandoff::OutgoingReturn)
+            && !matches!(
+                block.terminator,
+                Terminator::Return(_) | Terminator::Goto(_)
+            )
+        {
+            return Err(format!(
+                "invalid MIR function `{}` transfers a returned loan without returning",
+                function.name
+            ));
+        }
+        validate_loan_terminator(function, &block.terminator, context, &state)?;
+        if matches!(block.terminator, Terminator::Return(_))
+            && context.returned_views.contains_key(function.name.as_str())
+            && state.pending_handoff != Some(PendingLoanHandoff::OutgoingReturn)
+        {
+            return Err(format!(
+                "invalid MIR returned-view function `{}` returns without a returned-loan handoff",
+                function.name
+            ));
+        }
+        if matches!(block.terminator, Terminator::Return(_)) && !state.loans.is_empty() {
+            return Err(format!(
+                "invalid MIR function `{}` returns with active loans: {}",
+                function.name,
+                state.loans.keys().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        for successor in mir_successors(&block.terminator) {
+            if !blocks.contains_key(successor) {
+                return Err(format!(
+                    "invalid MIR function `{}` branches to unknown block `{successor}`",
+                    function.name
+                ));
+            }
+            match incoming.get(successor).cloned() {
+                Some(existing)
+                    if existing.loans != state.loans
+                        || existing.pending_handoff != state.pending_handoff =>
+                {
+                    return Err(format!(
+                        "invalid MIR function `{}` reaches block `{successor}` with inconsistent active loans",
+                        function.name
+                    ));
+                }
+                Some(mut existing) => {
+                    let previous_len = existing.ended.len();
+                    existing.ended.extend(state.ended.iter().cloned());
+                    if existing.ended.len() != previous_len {
+                        incoming.insert(successor.to_string(), existing);
+                        pending.push(successor.to_string());
+                    }
+                }
+                None => {
+                    incoming.insert(successor.to_string(), state.clone());
+                    pending.push(successor.to_string());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates the loan/control-flow invariants before either backend observes
+/// MIR. This is deliberately run for source-produced and deserialized modules
+/// alike so public MIR cannot manufacture authority unavailable in Aura.
+pub(crate) fn validate_loan_flow(module: &MirModule) -> std::result::Result<(), String> {
+    let context = MirLoanValidationContext::new(module)?;
+    for function in module.functions.iter().chain(module.top_level.iter()) {
+        validate_function_loan_flow(function, &context)?;
+    }
+    Ok(())
 }
 
 pub fn lower(program: &Program) -> MirModule {
@@ -1547,6 +4120,13 @@ fn lower_default_function(
     })
 }
 
+fn grouped_mir_expr(expr: &Expr) -> &Expr {
+    match &expr.kind {
+        ExprKind::Group(inner) => grouped_mir_expr(inner),
+        _ => expr,
+    }
+}
+
 fn lower_top_level(program: &Program) -> Vec<MirFunction> {
     let mut lowerer = Lowerer::new(
         program,
@@ -1587,6 +4167,18 @@ struct PendingAssertionCapture {
     value: Operand,
 }
 
+#[derive(Clone)]
+struct ReturnedViewCallee {
+    decl: crate::ast::FunctionDecl,
+    receiver: Option<Expr>,
+    module_name: String,
+    type_param_bounds: BTreeMap<String, Vec<crate::sema::TraitBound>>,
+    param_types: Vec<Type>,
+    return_type: Type,
+    receiver_type: Option<Type>,
+    trait_name: Option<String>,
+}
+
 struct Lowerer<'a> {
     program: &'a Program,
     function_name: &'a str,
@@ -1604,11 +4196,19 @@ struct Lowerer<'a> {
     with_stack: Vec<String>,
     match_writeback_stack: Vec<MatchWritebackState>,
     local_types: std::collections::BTreeMap<String, Type>,
+    /// Original type-parameter identity for roots whose projection-summary
+    /// context has already substituted a concrete type. Calls through these
+    /// roots must still dispatch through the declaration's trait bound.
+    specialized_bound_roots: BTreeMap<String, String>,
     non_owning_roots: BTreeSet<String>,
     scoped_names: Vec<std::collections::HashMap<String, String>>,
     generated_functions: Vec<MirFunction>,
     view_sources: BTreeMap<String, String>,
+    returned_view_descriptors: BTreeSet<String>,
+    lowered_returned_view_origins: BTreeMap<(usize, usize), String>,
+    loan_source_names: BTreeMap<String, String>,
     loan_scopes: Vec<Vec<String>>,
+    needed_after_current_stmt: BTreeSet<String>,
     view_return_origin: Option<String>,
 }
 
@@ -1772,11 +4372,16 @@ impl<'a> Lowerer<'a> {
             with_stack: Vec::new(),
             match_writeback_stack: Vec::new(),
             local_types: std::collections::BTreeMap::new(),
+            specialized_bound_roots: BTreeMap::new(),
             non_owning_roots: BTreeSet::new(),
             scoped_names: Vec::new(),
             generated_functions: Vec::new(),
             view_sources: BTreeMap::new(),
+            returned_view_descriptors: BTreeSet::new(),
+            lowered_returned_view_origins: BTreeMap::new(),
+            loan_source_names: BTreeMap::new(),
             loan_scopes: Vec::new(),
+            needed_after_current_stmt: BTreeSet::new(),
             view_return_origin: None,
         }
     }
@@ -2112,6 +4717,22 @@ impl<'a> Lowerer<'a> {
             .iter()
             .map(|capture| {
                 let place = self.render_local_name(&capture.name);
+                let returned_source = self.view_has_returned_descriptor_ancestor(&place);
+                let source_place = matches!(
+                    capture.mode,
+                    ClosureCaptureMode::SharedView | ClosureCaptureMode::MutableView
+                )
+                .then(|| {
+                    if returned_source {
+                        place.clone()
+                    } else if self.view_sources.contains_key(&place)
+                        && !self.needed_after_current_stmt.contains(&place)
+                    {
+                        self.canonical_view_source(&place)
+                    } else {
+                        place.clone()
+                    }
+                });
                 MirClosureCapture {
                     name: capture.name.clone(),
                     value: match capture.mode {
@@ -2129,11 +4750,8 @@ impl<'a> Lowerer<'a> {
                             MirReceiverKind::Value
                         }
                     },
-                    source_place: matches!(
-                        capture.mode,
-                        ClosureCaptureMode::SharedView | ClosureCaptureMode::MutableView
-                    )
-                    .then_some(place),
+                    source_place,
+                    resolve_source_at_capture: returned_source,
                 }
             })
             .collect::<Vec<_>>();
@@ -2496,41 +5114,176 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_stmts(&mut self, statements: &[Stmt]) {
+        self.lower_stmts_with_inherited_endings(statements, BTreeSet::new());
+    }
+
+    fn lower_stmts_with_inherited_endings(
+        &mut self,
+        statements: &[Stmt],
+        mut inherited_endings: BTreeSet<String>,
+    ) {
         self.loan_scopes.push(Vec::new());
         for (index, stmt) in statements.iter().enumerate() {
-            if !self.lower_stmt(stmt) {
+            let needed_after = self
+                .view_sources
+                .keys()
+                .filter(|loan| {
+                    let source_name = self
+                        .loan_source_names
+                        .get(*loan)
+                        .map(String::as_str)
+                        .unwrap_or(loan);
+                    statements[index + 1..]
+                        .iter()
+                        .any(|later| crate::sema::stmt_references_name(later, source_name))
+                })
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            self.needed_after_current_stmt = needed_after.clone();
+            if !self.lower_stmt(stmt, &needed_after) {
+                self.needed_after_current_stmt.clear();
                 break;
             }
-            let ending = self
-                .loan_scopes
-                .last()
-                .into_iter()
-                .flatten()
+            self.needed_after_current_stmt.clear();
+            loop {
+                let ending = self
+                    .loan_scopes
+                    .last()
+                    .into_iter()
+                    .flatten()
+                    .filter(|loan| {
+                        let source_name = self
+                            .loan_source_names
+                            .get(*loan)
+                            .map(String::as_str)
+                            .unwrap_or(loan);
+                        !statements[index + 1..]
+                            .iter()
+                            .any(|later| crate::sema::stmt_references_name(later, source_name))
+                            && !self.loan_has_active_descendant(loan)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if ending.is_empty() {
+                    break;
+                }
+                for loan in ending.into_iter().rev() {
+                    if self.view_sources.remove(&loan).is_some() {
+                        self.returned_view_descriptors.remove(&loan);
+                        self.emit(Instruction::EndLoan { loan: loan.clone() });
+                    }
+                    if let Some(scope) = self.loan_scopes.last_mut() {
+                        scope.retain(|active| active != &loan);
+                    }
+                }
+            }
+            let ending_inherited = inherited_endings
+                .iter()
                 .filter(|loan| {
+                    let source_name = self
+                        .loan_source_names
+                        .get(*loan)
+                        .map(String::as_str)
+                        .unwrap_or(loan);
                     !statements[index + 1..]
                         .iter()
-                        .any(|later| crate::sema::stmt_references_name(later, loan))
+                        .any(|later| crate::sema::stmt_references_name(later, source_name))
+                        && !self.loan_has_active_descendant(loan)
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            for loan in ending {
-                if self.view_sources.remove(&loan).is_some() {
+            for loan in ending_inherited.into_iter().rev() {
+                if self.view_sources.contains_key(&loan) {
                     self.emit(Instruction::EndLoan { loan: loan.clone() });
                 }
-                if let Some(scope) = self.loan_scopes.last_mut() {
-                    scope.retain(|active| active != &loan);
-                }
+                inherited_endings.remove(&loan);
             }
         }
         if !self.current_terminated() {
+            for loan in inherited_endings.iter().rev() {
+                if self.view_sources.contains_key(loan) {
+                    self.emit(Instruction::EndLoan { loan: loan.clone() });
+                }
+            }
             let scoped_views = self.loan_scopes.last().cloned().unwrap_or_default();
             for loan in scoped_views.into_iter().rev() {
                 if self.view_sources.remove(&loan).is_some() {
+                    self.returned_view_descriptors.remove(&loan);
                     self.emit(Instruction::EndLoan { loan });
                 }
             }
         }
         self.loan_scopes.pop();
+    }
+
+    fn remove_loans_from_lowering_state(&mut self, loans: &BTreeSet<String>) {
+        for loan in loans {
+            self.view_sources.remove(loan);
+            self.returned_view_descriptors.remove(loan);
+            for scope in &mut self.loan_scopes {
+                scope.retain(|active| active != loan);
+            }
+        }
+    }
+
+    fn canonical_view_source(&self, place: &str) -> String {
+        let mut current = place.to_string();
+        let mut seen = BTreeSet::new();
+        loop {
+            let (root, suffix) = current
+                .split_once('.')
+                .map_or((current.as_str(), ""), |(root, suffix)| (root, suffix));
+            if !seen.insert(root.to_string()) {
+                return current;
+            }
+            let Some(source) = self.view_sources.get(root) else {
+                return current;
+            };
+            current = if suffix.is_empty() {
+                source.clone()
+            } else {
+                format!("{source}.{suffix}")
+            };
+        }
+    }
+
+    fn view_has_returned_descriptor_ancestor(&self, place: &str) -> bool {
+        let mut current = place.split('.').next().unwrap_or_default();
+        let mut seen = BTreeSet::new();
+        while seen.insert(current.to_string()) {
+            if self.returned_view_descriptors.contains(current) {
+                return true;
+            }
+            let Some(source) = self.view_sources.get(current) else {
+                return false;
+            };
+            current = source.split('.').next().unwrap_or_default();
+        }
+        false
+    }
+
+    fn loan_has_active_descendant(&self, ancestor: &str) -> bool {
+        self.view_sources.keys().any(|candidate| {
+            if candidate == ancestor {
+                return false;
+            }
+            let mut current = candidate.as_str();
+            let mut seen = BTreeSet::new();
+            while seen.insert(current.to_string()) {
+                let Some(source) = self.view_sources.get(current) else {
+                    return false;
+                };
+                let parent = source.split('.').next().unwrap_or_default();
+                if parent == ancestor {
+                    return true;
+                }
+                if !self.view_sources.contains_key(parent) {
+                    return false;
+                }
+                current = parent;
+            }
+            false
+        })
     }
 
     fn emit_loan_cleanup_from(&mut self, depth: usize, except: Option<&str>) {
@@ -2544,43 +5297,98 @@ impl<'a> Lowerer<'a> {
             .cloned()
             .collect::<Vec<_>>();
         for loan in loans {
-            if self.view_sources.remove(&loan).is_some() {
+            if self.view_sources.contains_key(&loan) {
                 self.emit(Instruction::EndLoan { loan });
             }
         }
     }
 
-    fn lower_stmt(&mut self, stmt: &Stmt) -> bool {
+    fn lower_stmt(&mut self, stmt: &Stmt, needed_after: &BTreeSet<String>) -> bool {
         match stmt {
             Stmt::Assign(assign) => {
                 self.lower_assign(assign);
                 true
             }
             Stmt::View(view) => {
-                let ty = self.infer_expr_type(&view.source);
+                let ty = self.infer_expr_type(&view.source).or_else(|| {
+                    let ExprKind::Call { callee, .. } = &grouped_mir_expr(&view.source).kind else {
+                        return None;
+                    };
+                    self.returned_view_callee_decl(callee)
+                        .map(|callee| callee.return_type)
+                });
+                let loan_name = if self.scoped_names.last().is_some() {
+                    if let Some(existing) = self.scoped_local_name(&view.name) {
+                        existing.to_string()
+                    } else {
+                        let slot = ty
+                            .clone()
+                            .map(|ty| self.new_typed_temp(ty))
+                            .unwrap_or_else(|| self.new_temp());
+                        self.scoped_names
+                            .last_mut()
+                            .expect("checked scoped view declaration")
+                            .insert(view.name.clone(), slot.clone());
+                        slot
+                    }
+                } else {
+                    view.name.clone()
+                };
                 if let Some(ty) = ty.clone() {
-                    self.local_types.entry(view.name.clone()).or_insert(ty);
+                    self.local_types.entry(loan_name.clone()).or_insert(ty);
                 }
                 let returned_source = self.returned_view_source(&view.source);
-                let source = if let Some(source) = self.render_place_expr_option(&view.source) {
+                let mut returned_descriptor = false;
+                // A returned-view call can be followed by a direct child
+                // projection (`choose(pair).value`). Handle that before the
+                // generic place renderer, which cannot name the call result
+                // and would otherwise invent an unusable `<expr>.value` path.
+                let source = if returned_source.is_some() {
+                    let source = self
+                        .lower_returned_view_into_loan(
+                            &view.source,
+                            &loan_name,
+                            view.mutable,
+                            ty.as_ref(),
+                        )
+                        .expect("checked returned-view source should lower into a loan");
+                    returned_descriptor = true;
+                    source
+                } else if let Some(source) = self.render_place_expr_option(&view.source) {
                     source
                 } else {
-                    let (origin, projections) = returned_source
-                        .clone()
-                        .expect("checked returned-view calls retain an addressable origin");
-                    let _ = self.lower_expr(&view.source);
+                    // Keep this checked-invariant failure diagnostic rather
+                    // than process-fatal. The empty projection set is rejected
+                    // by shared MIR validation before either backend runs.
+                    let lowered = self.lower_expr_with_expected(&view.source, ty.as_ref());
+                    let origin = match lowered {
+                        Operand::Place(place) | Operand::MovePlace(place) => place,
+                        value => {
+                            let place = ty
+                                .clone()
+                                .map(|ty| self.new_typed_temp(ty))
+                                .unwrap_or_else(|| self.new_temp());
+                            self.emit(Instruction::Assign {
+                                target: place.clone(),
+                                value: Rvalue::Use(value),
+                            });
+                            place
+                        }
+                    };
                     self.emit(Instruction::BeginReturnedLoan {
-                        loan: view.name.clone(),
+                        loan: loan_name.clone(),
                         origin: origin.clone(),
-                        projections,
+                        projections: Vec::new(),
                         mutable: view.mutable,
                     });
+                    returned_descriptor = true;
                     origin
                 };
                 let root = source.split('.').next().unwrap_or(source.as_str());
-                if returned_source.is_some() {
+                if returned_descriptor {
                     // The call above transfers the exact selected projection
                     // into the new caller-side descriptor.
+                    self.returned_view_descriptors.insert(loan_name.clone());
                 } else if self.view_sources.contains_key(root) {
                     let projection = source
                         .strip_prefix(root)
@@ -2588,21 +5396,23 @@ impl<'a> Lowerer<'a> {
                         .trim_start_matches('.')
                         .to_string();
                     self.emit(Instruction::Reborrow {
-                        loan: view.name.clone(),
+                        loan: loan_name.clone(),
                         parent: root.to_string(),
                         projection,
                         mutable: view.mutable,
                     });
                 } else {
                     self.emit(Instruction::BeginLoan {
-                        loan: view.name.clone(),
+                        loan: loan_name.clone(),
                         source: source.clone(),
                         mutable: view.mutable,
                     });
                 }
-                self.view_sources.insert(view.name.clone(), source);
+                self.view_sources.insert(loan_name.clone(), source);
+                self.loan_source_names
+                    .insert(loan_name.clone(), view.name.clone());
                 if let Some(scope) = self.loan_scopes.last_mut() {
-                    scope.push(view.name.clone());
+                    scope.push(loan_name);
                 }
                 true
             }
@@ -2622,9 +5432,41 @@ impl<'a> Lowerer<'a> {
                 true
             }
             Stmt::Return(return_stmt) => {
+                let mut returned_call_loan = None;
                 let value = if let Some(value) = &return_stmt.value {
                     let return_type = self.return_type.clone();
-                    self.lower_expr_for_owned_value(value, Some(&return_type))
+                    if return_stmt.view.is_some() && self.returned_view_source(value).is_some() {
+                        // Consume the callee's handoff before an ordinary
+                        // member read can separate it from BeginReturnedLoan.
+                        // Any child projection is then represented as a real
+                        // reborrow of that returned descriptor.
+                        let loan = self.new_typed_temp(return_type.clone());
+                        let source = self
+                            .lower_returned_view_into_loan(
+                                value,
+                                &loan,
+                                return_stmt.view == Some(crate::ast::ViewKind::Mutable),
+                                Some(&return_type),
+                            )
+                            .expect("checked returned-view return should lower into a loan");
+                        self.view_sources.insert(loan.clone(), source);
+                        self.loan_source_names.insert(loan.clone(), loan.clone());
+                        if self
+                            .returned_view_call_root(value)
+                            .is_some_and(|(_, projection)| projection.is_empty())
+                        {
+                            self.returned_view_descriptors.insert(loan.clone());
+                        }
+                        let target = self.new_typed_temp(return_type);
+                        self.emit(Instruction::ReadLoan {
+                            target: target.clone(),
+                            loan: loan.clone(),
+                        });
+                        returned_call_loan = Some(loan);
+                        Operand::Place(target)
+                    } else {
+                        self.lower_expr_for_owned_value(value, Some(&return_type))
+                    }
                 } else {
                     Operand::Unit
                 };
@@ -2632,7 +5474,16 @@ impl<'a> Lowerer<'a> {
                 let mut returned_loan = None;
                 if return_stmt.view.is_some() {
                     if let Some(value) = &return_stmt.value {
-                        if let Some(loan) = self.render_place_expr_option(value) {
+                        if let Some(loan) = returned_call_loan {
+                            self.emit(Instruction::ReturnLoan {
+                                loan: loan.clone(),
+                                origin: self
+                                    .view_return_origin
+                                    .clone()
+                                    .expect("checked view returns declare an origin"),
+                            });
+                            returned_loan = Some(loan);
+                        } else if let Some(loan) = self.render_place_expr_option(value) {
                             let root = loan.split('.').next().unwrap_or(loan.as_str());
                             if self.view_sources.contains_key(root) {
                                 returned_loan = Some(root.to_string());
@@ -2644,6 +5495,30 @@ impl<'a> Lowerer<'a> {
                                     .clone()
                                     .expect("checked view returns declare an origin"),
                             });
+                        } else if let Some((origin, projections)) = self.returned_view_source(value)
+                        {
+                            // A forwarding return consumes the callee's
+                            // transferred projection into a temporary local
+                            // descriptor, then immediately reparents that
+                            // descriptor to this function's declared origin.
+                            let loan = self.new_typed_temp(self.return_type.clone());
+                            let origin = self
+                                .take_lowered_returned_view_origin(value)
+                                .unwrap_or(origin);
+                            self.emit(Instruction::BeginReturnedLoan {
+                                loan: loan.clone(),
+                                origin: origin.clone(),
+                                projections,
+                                mutable: return_stmt.view == Some(crate::ast::ViewKind::Mutable),
+                            });
+                            self.emit(Instruction::ReturnLoan {
+                                loan: loan.clone(),
+                                origin: self
+                                    .view_return_origin
+                                    .clone()
+                                    .expect("checked view returns declare an origin"),
+                            });
+                            returned_loan = Some(loan);
                         }
                     }
                 }
@@ -2674,11 +5549,11 @@ impl<'a> Lowerer<'a> {
                 false
             }
             Stmt::If(if_stmt) => {
-                self.lower_if(if_stmt);
+                self.lower_if(if_stmt, needed_after);
                 true
             }
             Stmt::Match(match_stmt) => {
-                self.lower_match(match_stmt);
+                self.lower_match(match_stmt, needed_after);
                 true
             }
             Stmt::For(for_stmt) => {
@@ -2686,6 +5561,23 @@ impl<'a> Lowerer<'a> {
                 true
             }
             Stmt::With(with_stmt) => {
+                let ending_loans =
+                    self.view_sources
+                        .keys()
+                        .filter(|loan| !needed_after.contains(*loan))
+                        .filter(|loan| {
+                            let source_name = self
+                                .loan_source_names
+                                .get(*loan)
+                                .map(String::as_str)
+                                .unwrap_or(loan);
+                            crate::sema::expr_references_name(&with_stmt.value, source_name)
+                                || with_stmt.body.iter().any(|stmt| {
+                                    crate::sema::stmt_references_name(stmt, source_name)
+                                })
+                        })
+                        .cloned()
+                        .collect::<BTreeSet<_>>();
                 if let Some(inferred) = self.infer_expr_type(&with_stmt.value) {
                     self.local_types
                         .entry(with_stmt.binding.clone())
@@ -2701,7 +5593,30 @@ impl<'a> Lowerer<'a> {
                     place: with_stmt.binding.clone(),
                 });
                 self.with_stack.push(with_stmt.binding.clone());
-                self.lower_stmts(&with_stmt.body);
+                let body_endings = ending_loans
+                    .iter()
+                    .filter(|loan| {
+                        let source_name = self
+                            .loan_source_names
+                            .get(*loan)
+                            .map(String::as_str)
+                            .unwrap_or(loan);
+                        with_stmt
+                            .body
+                            .iter()
+                            .any(|stmt| crate::sema::stmt_references_name(stmt, source_name))
+                    })
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                for loan in ending_loans
+                    .iter()
+                    .rev()
+                    .filter(|loan| !body_endings.contains(*loan))
+                {
+                    self.emit(Instruction::EndLoan { loan: loan.clone() });
+                }
+                self.lower_stmts_with_inherited_endings(&with_stmt.body, body_endings);
+                self.remove_loans_from_lowering_state(&ending_loans);
                 if !self.current_terminated() {
                     self.emit(Instruction::PopCleanup {
                         place: with_stmt.binding.clone(),
@@ -2906,12 +5821,13 @@ impl<'a> Lowerer<'a> {
             .unwrap_or_else(|| inferred_right_ty.clone());
 
         let result = self.new_typed_temp(Type::named("bool"));
-        if let Some(field) = self.operator_field_for_binary(op, left, right) {
+        if let Some((trait_name, field)) = self.operator_trait_member_for_binary(op, left, right) {
             self.emit(Instruction::Assign {
                 target: result.clone(),
                 value: Rvalue::Call {
-                    callee: CallTarget::Member {
+                    callee: CallTarget::TraitMember {
                         object: left_value.clone(),
+                        trait_name,
                         field,
                         receiver_place: None,
                     },
@@ -3221,10 +6137,8 @@ impl<'a> Lowerer<'a> {
         }
 
         let value = self.lower_expr_for_owned_value(&assign.value, target_ty.as_ref());
-        if let (Some(target_ty), Operand::Place(place) | Operand::MovePlace(place)) =
-            (target_ty, &value)
-        {
-            self.local_types.insert(place.clone(), target_ty);
+        if let Some(target_ty) = target_ty {
+            self.retarget_operand_place(&value, &target_ty);
         }
         self.emit(Instruction::Assign {
             target,
@@ -3439,38 +6353,579 @@ impl<'a> Lowerer<'a> {
     }
 
     fn render_expr_place(&self, expr: &Expr) -> String {
-        match &expr.kind {
-            ExprKind::Name(name) => self.render_local_name(name),
-            ExprKind::Group(inner) => self.render_expr_place(inner),
-            ExprKind::Member { object, field } => {
-                format!("{}.{}", self.render_expr_place(object), field)
+        self.render_place_expr_option(expr)
+            .unwrap_or_else(|| "<expr>".to_string())
+    }
+
+    fn returned_view_callee_decl(&self, callee: &Expr) -> Option<ReturnedViewCallee> {
+        let callee = match &callee.kind {
+            ExprKind::Group(inner) => return self.returned_view_callee_decl(inner),
+            ExprKind::Specialize {
+                expr: inner,
+                type_args,
+            } => {
+                let info = self.returned_view_callee_decl(inner)?;
+                let type_args = type_args
+                    .iter()
+                    .map(|ty| self.lower_type_ref_with_provenance(ty))
+                    .collect::<Vec<_>>();
+                let substitutions =
+                    substitutions_from_decl_type_args(&info.decl.type_params, &type_args);
+                return Some(Self::specialize_returned_view_callee(info, &substitutions));
             }
-            _ => "<expr>".to_string(),
+            // Parenthesized callable specialization is parsed before the
+            // following call suffix is visible, so `(pick[T])(value)` retains
+            // the contextual `Index` shape instead of `Specialize`. Semantic
+            // checking has already established that the indexed expression is
+            // a callable; normalize that shape for returned-view analysis too.
+            ExprKind::Index { object, index } => {
+                let info = self.returned_view_callee_decl(object)?;
+                let type_args = self.task_type_args_from_index_expr(index)?;
+                if info.decl.type_params.is_empty()
+                    || info.decl.type_params.len() != type_args.len()
+                {
+                    return None;
+                }
+                let substitutions =
+                    substitutions_from_decl_type_args(&info.decl.type_params, &type_args);
+                return Some(Self::specialize_returned_view_callee(info, &substitutions));
+            }
+            _ => callee,
+        };
+        match &callee.kind {
+            ExprKind::Name(name) => {
+                if self.local_types.contains_key(&self.render_local_name(name)) {
+                    return None;
+                }
+                self.resolve_function_info(name)
+                    .map(|function| ReturnedViewCallee {
+                        decl: function.decl.clone(),
+                        receiver: None,
+                        module_name: function.module_name.clone(),
+                        type_param_bounds: function.type_param_bounds.clone(),
+                        param_types: function.signature.params.clone(),
+                        return_type: function.signature.return_type.clone(),
+                        receiver_type: None,
+                        trait_name: None,
+                    })
+            }
+            ExprKind::Member { object, field } => {
+                if let Some((module_path, function_name)) = self.qualified_module_item(callee) {
+                    let function = self.module_namespace(&module_path).and_then(|namespace| {
+                        namespace
+                            .functions
+                            .get(&function_name)
+                            .or_else(|| namespace.all_functions.get(&function_name))
+                    });
+                    return function.map(|function| ReturnedViewCallee {
+                        decl: function.decl.clone(),
+                        receiver: None,
+                        module_name: function.module_name.clone(),
+                        type_param_bounds: function.type_param_bounds.clone(),
+                        param_types: function.signature.params.clone(),
+                        return_type: function.signature.return_type.clone(),
+                        receiver_type: None,
+                        trait_name: None,
+                    });
+                }
+                let receiver_ty = self.infer_expr_type(object)?;
+                let authoritative_trait_name = self.bounded_trait_member_identity(object, field);
+                if authoritative_trait_name.is_none() {
+                    if let Type::Named(class_name, class_args) = &receiver_ty {
+                        if let Some(class) = self.resolve_class_info(class_name) {
+                            if let Some(method) = class.methods.get(field) {
+                                let substitutions = substitutions_from_decl_type_args(
+                                    &class.decl.type_params,
+                                    class_args,
+                                );
+                                let mut type_param_bounds = class.type_param_bounds.clone();
+                                type_param_bounds.extend(method.type_param_bounds.clone());
+                                return Some(ReturnedViewCallee {
+                                    decl: method.decl.clone(),
+                                    receiver: Some((**object).clone()),
+                                    module_name: class.module_name.clone(),
+                                    type_param_bounds,
+                                    param_types: method
+                                        .signature
+                                        .params
+                                        .iter()
+                                        .map(|ty| substitute_type(ty, &substitutions))
+                                        .collect(),
+                                    return_type: substitute_type(
+                                        &method.signature.return_type,
+                                        &substitutions,
+                                    ),
+                                    receiver_type: Some(receiver_ty.clone()),
+                                    trait_name: None,
+                                });
+                            }
+                        }
+                    }
+                }
+                if matches!(receiver_ty, Type::TypeParam(_)) {
+                    let (trait_name, trait_info, method, substitutions) =
+                        self.bounded_trait_method_for_receiver(&receiver_ty, field)?;
+                    let mut type_param_bounds = self.type_param_bounds.clone();
+                    type_param_bounds.extend(method.type_param_bounds.clone());
+                    return Some(ReturnedViewCallee {
+                        decl: method.decl.clone(),
+                        receiver: Some((**object).clone()),
+                        module_name: trait_info.module_name.clone(),
+                        type_param_bounds,
+                        param_types: method
+                            .signature
+                            .params
+                            .iter()
+                            .map(|ty| substitute_type(ty, &substitutions))
+                            .collect(),
+                        return_type: substitute_type(&method.signature.return_type, &substitutions),
+                        receiver_type: Some(receiver_ty),
+                        trait_name: Some(trait_name),
+                    });
+                }
+                if let Some((trait_impl, method, substitutions)) = self
+                    .trait_impls_in_scope()
+                    .filter(|trait_impl| {
+                        authoritative_trait_name
+                            .as_ref()
+                            .is_none_or(|trait_name| trait_impl.trait_name == *trait_name)
+                    })
+                    .filter_map(|trait_impl| {
+                        let substitutions =
+                            self.trait_impl_substitutions(trait_impl, &receiver_ty)?;
+                        let method = trait_impl.methods.get(field)?;
+                        Some((
+                            crate::sema::trait_impl_specificity(trait_impl),
+                            trait_impl,
+                            method,
+                            substitutions,
+                        ))
+                    })
+                    .max_by_key(|(specificity, _, _, _)| *specificity)
+                    .map(|(_, trait_impl, method, substitutions)| {
+                        (trait_impl, method, substitutions)
+                    })
+                {
+                    let mut type_param_bounds = trait_impl.type_param_bounds.clone();
+                    type_param_bounds.extend(method.type_param_bounds.clone());
+                    return Some(ReturnedViewCallee {
+                        decl: method.decl.clone(),
+                        receiver: Some((**object).clone()),
+                        module_name: trait_impl.module_name.clone(),
+                        type_param_bounds,
+                        param_types: method
+                            .signature
+                            .params
+                            .iter()
+                            .map(|ty| substitute_type(ty, &substitutions))
+                            .collect(),
+                        return_type: substitute_type(&method.signature.return_type, &substitutions),
+                        receiver_type: Some(receiver_ty.clone()),
+                        trait_name: authoritative_trait_name,
+                    });
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn specialize_returned_view_callee(
+        mut callee: ReturnedViewCallee,
+        substitutions: &HashMap<String, Type>,
+    ) -> ReturnedViewCallee {
+        callee.param_types = callee
+            .param_types
+            .iter()
+            .map(|ty| substitute_type(ty, substitutions))
+            .collect();
+        callee.return_type = substitute_type(&callee.return_type, substitutions);
+        callee.receiver_type = callee
+            .receiver_type
+            .as_ref()
+            .map(|ty| substitute_type(ty, substitutions));
+        callee.type_param_bounds = callee
+            .type_param_bounds
+            .iter()
+            .map(|(name, bounds)| {
+                (
+                    name.clone(),
+                    bounds
+                        .iter()
+                        .map(|bound| substitute_trait_bound(bound, substitutions))
+                        .collect(),
+                )
+            })
+            .collect();
+        callee
+    }
+
+    fn specialize_returned_view_callee_from_args(
+        &self,
+        callee: ReturnedViewCallee,
+        args: &[Argument],
+        span: Span,
+    ) -> ReturnedViewCallee {
+        if callee.decl.type_params.is_empty() {
+            return callee;
+        }
+        let Ok(ordered) = bind_call_arguments(
+            &format!("callable `{}`", callee.decl.name),
+            &callable_params_from_decl(&callee.decl.params),
+            args,
+            span,
+            CallConvention::PositionalOrNamed,
+        ) else {
+            return callee;
+        };
+        let type_params = callee
+            .decl
+            .type_params
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut substitutions = HashMap::new();
+        for literal_pass in [false, true] {
+            for (argument, pattern) in ordered.iter().zip(callee.param_types.iter()) {
+                let Some(argument) = argument else {
+                    continue;
+                };
+                if is_integer_literal_expr(&argument.value) != literal_pass {
+                    continue;
+                }
+                let Some(actual) = self.infer_expr_type(&argument.value) else {
+                    continue;
+                };
+                let _ = crate::sema::type_pattern_matches(
+                    pattern,
+                    &actual,
+                    &type_params,
+                    &mut substitutions,
+                );
+            }
+        }
+        Self::specialize_returned_view_callee(callee, &substitutions)
+    }
+
+    fn returned_view_call_projection_set(
+        &self,
+        expr: &Expr,
+        outer_origin: &str,
+        aliases: &BTreeMap<String, Vec<String>>,
+        seen: &mut BTreeSet<String>,
+    ) -> Vec<String> {
+        let Some((expr, child_projection)) = self.returned_view_call_root(expr) else {
+            return Vec::new();
+        };
+        let ExprKind::Call { callee, args } = &expr.kind else {
+            return Vec::new();
+        };
+        let Some(callee_info) = self.returned_view_callee_decl(callee) else {
+            return Vec::new();
+        };
+        let callee_info =
+            self.specialize_returned_view_callee_from_args(callee_info, args, callee.span);
+        let decl = &callee_info.decl;
+        let Some(contract) = decl.view_return.as_ref() else {
+            return Vec::new();
+        };
+        let origin_expr = if contract.origin == "self" {
+            let Some(receiver) = callee_info.receiver.as_ref() else {
+                return Vec::new();
+            };
+            receiver
+        } else {
+            let Some(origin_index) = decl
+                .params
+                .iter()
+                .position(|param| param.name == contract.origin)
+            else {
+                return Vec::new();
+            };
+            let Ok(ordered) = bind_call_arguments(
+                &format!("callable `{}`", decl.name),
+                &callable_params_from_decl(&decl.params),
+                args,
+                callee.span,
+                CallConvention::PositionalOrNamed,
+            ) else {
+                return Vec::new();
+            };
+            let Some(argument) = ordered.get(origin_index).copied().flatten() else {
+                return Vec::new();
+            };
+            &argument.value
+        };
+        let mut bases = return_view_projection_set(origin_expr, outer_origin, aliases);
+        if bases.is_empty() {
+            bases =
+                self.returned_view_call_projection_set(origin_expr, outer_origin, aliases, seen);
+        }
+        if bases.is_empty() {
+            return Vec::new();
+        }
+        let projections = self
+            .returned_view_projections_for_decl(&callee_info, seen)
+            .into_iter()
+            .map(
+                |projection| match (projection.is_empty(), child_projection.is_empty()) {
+                    (_, true) => projection,
+                    (true, _) => child_projection.clone(),
+                    _ => format!("{projection}.{child_projection}"),
+                },
+            )
+            .collect::<Vec<_>>();
+        bases
+            .into_iter()
+            .flat_map(|base| {
+                projections.iter().cloned().map(move |projection| {
+                    match (base.is_empty(), projection.is_empty()) {
+                        (true, _) => projection,
+                        (_, true) => base.clone(),
+                        _ => format!("{base}.{projection}"),
+                    }
+                })
+            })
+            .collect()
+    }
+
+    fn collect_contextual_return_view_projections(
+        &self,
+        body: &[Stmt],
+        origin: &str,
+        aliases: &mut BTreeMap<String, Vec<String>>,
+        seen: &mut BTreeSet<String>,
+        projections: &mut Vec<String>,
+    ) {
+        for stmt in body {
+            match stmt {
+                Stmt::View(view) => {
+                    let mut selected = return_view_projection_set(&view.source, origin, aliases);
+                    if selected.is_empty() {
+                        selected = self.returned_view_call_projection_set(
+                            &view.source,
+                            origin,
+                            aliases,
+                            seen,
+                        );
+                    }
+                    if !selected.is_empty() {
+                        selected.sort();
+                        selected.dedup();
+                        aliases.insert(view.name.clone(), selected);
+                    }
+                }
+                Stmt::Return(return_stmt) if return_stmt.view.is_some() => {
+                    if let Some(value) = &return_stmt.value {
+                        let selected = return_view_projection_set(value, origin, aliases);
+                        if selected.is_empty() {
+                            projections.extend(
+                                self.returned_view_call_projection_set(
+                                    value, origin, aliases, seen,
+                                ),
+                            );
+                        } else {
+                            projections.extend(selected);
+                        }
+                    }
+                }
+                Stmt::If(if_stmt) => {
+                    for branch in &if_stmt.branches {
+                        self.collect_contextual_return_view_projections(
+                            &branch.body,
+                            origin,
+                            &mut aliases.clone(),
+                            seen,
+                            projections,
+                        );
+                    }
+                    if let Some(body) = &if_stmt.else_body {
+                        self.collect_contextual_return_view_projections(
+                            body,
+                            origin,
+                            &mut aliases.clone(),
+                            seen,
+                            projections,
+                        );
+                    }
+                }
+                Stmt::Match(match_stmt) => {
+                    for arm in &match_stmt.arms {
+                        self.collect_contextual_return_view_projections(
+                            &arm.body,
+                            origin,
+                            &mut aliases.clone(),
+                            seen,
+                            projections,
+                        );
+                    }
+                }
+                Stmt::For(for_stmt) => self.collect_contextual_return_view_projections(
+                    &for_stmt.body,
+                    origin,
+                    &mut aliases.clone(),
+                    seen,
+                    projections,
+                ),
+                Stmt::With(with_stmt) => self.collect_contextual_return_view_projections(
+                    &with_stmt.body,
+                    origin,
+                    &mut aliases.clone(),
+                    seen,
+                    projections,
+                ),
+                Stmt::While(while_stmt) => self.collect_contextual_return_view_projections(
+                    &while_stmt.body,
+                    origin,
+                    &mut aliases.clone(),
+                    seen,
+                    projections,
+                ),
+                _ => {}
+            }
+        }
+    }
+
+    fn returned_view_projections_for_decl(
+        &self,
+        callee: &ReturnedViewCallee,
+        seen: &mut BTreeSet<String>,
+    ) -> Vec<String> {
+        let decl = &callee.decl;
+        let Some(contract) = decl.view_return.as_ref() else {
+            return Vec::new();
+        };
+        let key = format!(
+            "{}:{}:{}:{}:{:?}",
+            callee.module_name, decl.name, decl.span.line, decl.span.column, callee.trait_name
+        );
+        if !seen.insert(key.clone()) {
+            return Vec::new();
+        }
+        let mut context = Lowerer::new(
+            self.program,
+            &decl.name,
+            &callee.module_name,
+            callee.return_type.clone(),
+            callee.type_param_bounds.clone(),
+        );
+        for (param, ty) in decl.params.iter().zip(&callee.param_types) {
+            context.local_types.insert(param.name.clone(), ty.clone());
+            if let TypeRefKind::Named { name, args } = &param.ty.kind {
+                if args.is_empty() && context.type_param_bounds.contains_key(name) {
+                    context
+                        .specialized_bound_roots
+                        .insert(param.name.clone(), name.clone());
+                }
+            }
+        }
+        if let Some(receiver_type) = &callee.receiver_type {
+            context
+                .local_types
+                .insert("self".to_string(), receiver_type.clone());
+        }
+        let mut projections = Vec::new();
+        context.collect_contextual_return_view_projections(
+            &decl.body,
+            &contract.origin,
+            &mut BTreeMap::new(),
+            seen,
+            &mut projections,
+        );
+        projections.sort();
+        projections.dedup();
+        if projections.is_empty() {
+            if decl.body.is_empty() {
+                if let Some(trait_name) = &callee.trait_name {
+                    for trait_impl in context
+                        .trait_impls_in_scope()
+                        .filter(|trait_impl| trait_impl.trait_name == *trait_name)
+                    {
+                        if let Some(method) = trait_impl.methods.get(&decl.name) {
+                            let mut type_param_bounds = trait_impl.type_param_bounds.clone();
+                            type_param_bounds.extend(method.type_param_bounds.clone());
+                            let implementation = ReturnedViewCallee {
+                                decl: method.decl.clone(),
+                                receiver: None,
+                                module_name: trait_impl.module_name.clone(),
+                                type_param_bounds,
+                                param_types: method.signature.params.clone(),
+                                return_type: method.signature.return_type.clone(),
+                                receiver_type: Some(trait_impl.for_type.clone()),
+                                trait_name: None,
+                            };
+                            projections.extend(
+                                context.returned_view_projections_for_decl(&implementation, seen),
+                            );
+                        }
+                    }
+                }
+                projections.sort();
+                projections.dedup();
+            }
+            // A checked forwarding SCC may have no concrete base case. Its
+            // execution will still recurse normally, but every caller-visible
+            // descriptor must remain valid. Conservatively retain the
+            // declaration's complete origin instead of emitting an empty
+            // projection set that only fails after checking.
+            if projections.is_empty() {
+                projections.push(String::new());
+            }
+        }
+        seen.remove(&key);
+        projections
+    }
+
+    fn returned_view_call_root<'b>(&self, expr: &'b Expr) -> Option<(&'b Expr, String)> {
+        match &expr.kind {
+            ExprKind::Group(inner) => self.returned_view_call_root(inner),
+            ExprKind::Member { object, field } => {
+                let (call, projection) = self.returned_view_call_root(object)?;
+                Some((
+                    call,
+                    if projection.is_empty() {
+                        field.clone()
+                    } else {
+                        format!("{projection}.{field}")
+                    },
+                ))
+            }
+            ExprKind::Index { object, index } => {
+                let ExprKind::Int(index) = index.kind else {
+                    return None;
+                };
+                let index = usize::try_from(index).ok()?;
+                let (call, projection) = self.returned_view_call_root(object)?;
+                Some((
+                    call,
+                    if projection.is_empty() {
+                        index.to_string()
+                    } else {
+                        format!("{projection}.{index}")
+                    },
+                ))
+            }
+            ExprKind::Call { .. } => Some((expr, String::new())),
+            _ => None,
         }
     }
 
     fn returned_view_source(&self, expr: &Expr) -> Option<(String, Vec<String>)> {
-        let ExprKind::Call { callee, args } = &expr.kind else {
+        let (call, _) = self.returned_view_call_root(expr)?;
+        let ExprKind::Call { callee, args } = &call.kind else {
             return None;
         };
-        let callee = match &callee.kind {
-            ExprKind::Specialize { expr, .. } => expr.as_ref(),
-            _ => callee.as_ref(),
-        };
-        let (decl, receiver) = match &callee.kind {
-            ExprKind::Name(name) => (&self.resolve_function_info(name)?.decl, None),
-            ExprKind::Member { object, field } => {
-                let Type::Named(class_name, _) = self.infer_expr_type(object)? else {
-                    return None;
-                };
-                let method = self.resolve_class_info(&class_name)?.methods.get(field)?;
-                (&method.decl, Some(&**object))
-            }
-            _ => return None,
-        };
+        let callee_info = self.returned_view_callee_decl(callee)?;
+        let callee_info =
+            self.specialize_returned_view_callee_from_args(callee_info, args, callee.span);
+        let decl = &callee_info.decl;
         let contract = decl.view_return.as_ref()?;
         let origin = if contract.origin == "self" {
-            self.render_place_expr_option(receiver?)?
+            let receiver = callee_info.receiver.as_ref()?;
+            self.render_place_expr_option(receiver).or_else(|| {
+                self.returned_view_source(receiver)
+                    .map(|(origin, _)| origin)
+            })?
         } else {
             let origin_index = decl
                 .params
@@ -3485,10 +6940,112 @@ impl<'a> Lowerer<'a> {
             )
             .ok()?;
             let origin = ordered.get(origin_index).copied().flatten()?;
-            self.render_place_expr_option(&origin.value)?
+            self.render_place_expr_option(&origin.value).or_else(|| {
+                self.returned_view_source(&origin.value)
+                    .map(|(origin, _)| origin)
+            })?
         };
-        let projections = return_view_projections(decl);
+        let projections =
+            self.returned_view_projections_for_decl(&callee_info, &mut BTreeSet::new());
         (!projections.is_empty()).then_some((origin, projections))
+    }
+
+    fn remember_lowered_returned_view_origin(&mut self, call: &Expr, loan: &str) {
+        self.lowered_returned_view_origins
+            .insert((call.span.line, call.span.column), loan.to_string());
+    }
+
+    fn take_lowered_returned_view_origin(&mut self, expr: &Expr) -> Option<String> {
+        let (call, _) = self.returned_view_call_root(expr)?;
+        if let Some(origin) = self
+            .lowered_returned_view_origins
+            .remove(&(call.span.line, call.span.column))
+        {
+            return Some(origin);
+        }
+
+        // The current call itself may have been lowered as a plain value, but
+        // one of its borrowed origin arguments can already be represented by
+        // a caller-side returned descriptor. Follow the declaration contract
+        // back to that argument so nested returned calls compose linearly.
+        let ExprKind::Call { callee, args } = &call.kind else {
+            return None;
+        };
+        let callee_info = self.returned_view_callee_decl(callee)?;
+        let callee_info =
+            self.specialize_returned_view_callee_from_args(callee_info, args, callee.span);
+        let contract = callee_info.decl.view_return.as_ref()?;
+        let origin_expr = if contract.origin == "self" {
+            callee_info.receiver.clone()?
+        } else {
+            let origin_index = callee_info
+                .decl
+                .params
+                .iter()
+                .position(|param| param.name == contract.origin)?;
+            let ordered = bind_call_arguments(
+                &format!("callable `{}`", callee_info.decl.name),
+                &callable_params_from_decl(&callee_info.decl.params),
+                args,
+                callee.span,
+                CallConvention::PositionalOrNamed,
+            )
+            .ok()?;
+            ordered.get(origin_index).copied().flatten()?.value.clone()
+        };
+        self.take_lowered_returned_view_origin(&origin_expr)
+    }
+
+    fn lower_returned_view_into_loan(
+        &mut self,
+        expr: &Expr,
+        loan: &str,
+        mutable: bool,
+        expected: Option<&Type>,
+    ) -> Option<String> {
+        let (call, child_projection) = self.returned_view_call_root(expr)?;
+        let (fallback_origin, projections) = self.returned_view_source(call)?;
+        let call_type = self
+            .infer_expr_type(call)
+            .or_else(|| expected.cloned())
+            .unwrap_or_else(|| Type::named("Unknown"));
+        let _ = self.lower_expr_with_expected(call, Some(&call_type));
+        let origin = self
+            .take_lowered_returned_view_origin(call)
+            .unwrap_or(fallback_origin);
+        if child_projection.is_empty() {
+            self.emit(Instruction::BeginReturnedLoan {
+                loan: loan.to_string(),
+                origin: origin.clone(),
+                projections,
+                mutable,
+            });
+            self.remember_lowered_returned_view_origin(call, loan);
+            return Some(origin);
+        }
+
+        let parent = self.new_typed_temp(call_type);
+        self.emit(Instruction::BeginReturnedLoan {
+            loan: parent.clone(),
+            origin: origin.clone(),
+            projections,
+            mutable,
+        });
+        self.view_sources.insert(parent.clone(), origin);
+        self.returned_view_descriptors.insert(parent.clone());
+        self.loan_source_names
+            .insert(parent.clone(), parent.clone());
+        if let Some(scope) = self.loan_scopes.last_mut() {
+            scope.push(parent.clone());
+        }
+        self.emit(Instruction::Reborrow {
+            loan: loan.to_string(),
+            parent: parent.clone(),
+            projection: child_projection.clone(),
+            mutable,
+        });
+        self.remember_lowered_returned_view_origin(call, loan);
+        Some(format!("{parent}.{child_projection}"))
     }
 
     fn lowered_writeback_place(&self, expr: &Expr, value: &Operand) -> Option<String> {
@@ -3511,10 +7068,34 @@ impl<'a> Lowerer<'a> {
         self.scoped_local_name(name).unwrap_or(name).to_string()
     }
 
-    fn lower_if(&mut self, if_stmt: &IfStmt) {
+    fn lower_if(&mut self, if_stmt: &IfStmt, needed_after: &BTreeSet<String>) {
         let after_block = self.new_block("if_end");
         let mut next_condition_block = self.current_block;
         let mut else_block_to_lower = None;
+        let mut false_cleanup_block = None;
+        let ending_loans = self
+            .view_sources
+            .keys()
+            .filter(|loan| !needed_after.contains(*loan))
+            .filter(|loan| {
+                let source_name = self
+                    .loan_source_names
+                    .get(*loan)
+                    .map(String::as_str)
+                    .unwrap_or(loan);
+                if_stmt.branches.iter().any(|branch| {
+                    crate::sema::expr_references_name(&branch.condition, source_name)
+                        || branch
+                            .body
+                            .iter()
+                            .any(|stmt| crate::sema::stmt_references_name(stmt, source_name))
+                }) || if_stmt.else_body.as_ref().is_some_and(|body| {
+                    body.iter()
+                        .any(|stmt| crate::sema::stmt_references_name(stmt, source_name))
+                })
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
 
         for (index, branch) in if_stmt.branches.iter().enumerate() {
             self.switch_to(next_condition_block);
@@ -3527,7 +7108,9 @@ impl<'a> Lowerer<'a> {
                     else_block_to_lower = Some(block);
                     block
                 } else {
-                    after_block
+                    let block = self.new_block("if_false_cleanup");
+                    false_cleanup_block = Some(block);
+                    block
                 }
             } else {
                 self.new_block("if_next")
@@ -3540,26 +7123,86 @@ impl<'a> Lowerer<'a> {
             });
 
             self.switch_to(then_block);
-            self.lower_stmts(&branch.body);
+            let body_endings = ending_loans
+                .iter()
+                .filter(|loan| {
+                    let source_name = self
+                        .loan_source_names
+                        .get(*loan)
+                        .map(String::as_str)
+                        .unwrap_or(loan);
+                    branch
+                        .body
+                        .iter()
+                        .any(|stmt| crate::sema::stmt_references_name(stmt, source_name))
+                })
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            for loan in ending_loans
+                .iter()
+                .rev()
+                .filter(|loan| !body_endings.contains(*loan))
+            {
+                self.emit(Instruction::EndLoan { loan: loan.clone() });
+            }
+            self.scoped_names.push(std::collections::HashMap::new());
+            self.lower_stmts_with_inherited_endings(&branch.body, body_endings);
             if !self.current_terminated() {
                 self.terminate(Terminator::Goto(self.label(after_block)));
             }
+            self.scoped_names.pop();
 
             next_condition_block = else_block;
         }
 
         if let (Some(else_body), Some(else_block)) = (&if_stmt.else_body, else_block_to_lower) {
             self.switch_to(else_block);
-            self.lower_stmts(else_body);
+            let body_endings = ending_loans
+                .iter()
+                .filter(|loan| {
+                    let source_name = self
+                        .loan_source_names
+                        .get(*loan)
+                        .map(String::as_str)
+                        .unwrap_or(loan);
+                    else_body
+                        .iter()
+                        .any(|stmt| crate::sema::stmt_references_name(stmt, source_name))
+                })
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            for loan in ending_loans
+                .iter()
+                .rev()
+                .filter(|loan| !body_endings.contains(*loan))
+            {
+                self.emit(Instruction::EndLoan { loan: loan.clone() });
+            }
+            self.scoped_names.push(std::collections::HashMap::new());
+            self.lower_stmts_with_inherited_endings(else_body, body_endings);
+            if !self.current_terminated() {
+                self.terminate(Terminator::Goto(self.label(after_block)));
+            }
+            self.scoped_names.pop();
+        }
+        if let Some(cleanup_block) = false_cleanup_block {
+            // The final false edge otherwise jumps directly to the join. Give
+            // it a dedicated cleanup predecessor so every join observes the
+            // same ended-loan state as the selected `then` edge.
+            self.switch_to(cleanup_block);
+            for loan in ending_loans.iter().rev() {
+                self.emit(Instruction::EndLoan { loan: loan.clone() });
+            }
             if !self.current_terminated() {
                 self.terminate(Terminator::Goto(self.label(after_block)));
             }
         }
 
         self.switch_to(after_block);
+        self.remove_loans_from_lowering_state(&ending_loans);
     }
 
-    fn lower_match(&mut self, match_stmt: &MatchStmt) {
+    fn lower_match(&mut self, match_stmt: &MatchStmt, needed_after: &BTreeSet<String>) {
         let scrutinee_ty = self.infer_expr_type(&match_stmt.scrutinee);
         let consumes_scrutinee = match_stmt.capability == ReceiverKind::Value
             && scrutinee_ty
@@ -3586,13 +7229,37 @@ impl<'a> Lowerer<'a> {
             None
         };
         let after_block = self.new_block("match_end");
+        let ending_loans = self
+            .view_sources
+            .keys()
+            .filter(|loan| !needed_after.contains(*loan))
+            .filter(|loan| {
+                let source_name = self
+                    .loan_source_names
+                    .get(*loan)
+                    .map(String::as_str)
+                    .unwrap_or(loan);
+                crate::sema::expr_references_name(&match_stmt.scrutinee, source_name)
+                    || match_stmt.arms.iter().any(|arm| {
+                        arm.guard.as_ref().is_some_and(|guard| {
+                            crate::sema::expr_references_name(guard, source_name)
+                        }) || arm
+                            .body
+                            .iter()
+                            .any(|stmt| crate::sema::stmt_references_name(stmt, source_name))
+                    })
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let unmatched_cleanup =
+            (!ending_loans.is_empty()).then(|| self.new_block("match_no_arm_cleanup"));
         let mut next_case_block = self.current_block;
 
         for (index, arm) in match_stmt.arms.iter().enumerate() {
             self.switch_to(next_case_block);
             let arm_block = self.new_block("match_arm");
             let next_block = if index + 1 == match_stmt.arms.len() {
-                after_block
+                unmatched_cleanup.unwrap_or(after_block)
             } else {
                 self.new_block("match_next")
             };
@@ -3651,7 +7318,28 @@ impl<'a> Lowerer<'a> {
                     scrutinee_ty.as_ref(),
                 );
             }
-            self.lower_stmts(&arm.body);
+            let body_endings = ending_loans
+                .iter()
+                .filter(|loan| {
+                    let source_name = self
+                        .loan_source_names
+                        .get(*loan)
+                        .map(String::as_str)
+                        .unwrap_or(loan);
+                    arm.body
+                        .iter()
+                        .any(|stmt| crate::sema::stmt_references_name(stmt, source_name))
+                })
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            for loan in ending_loans
+                .iter()
+                .rev()
+                .filter(|loan| !body_endings.contains(*loan))
+            {
+                self.emit(Instruction::EndLoan { loan: loan.clone() });
+            }
+            self.lower_stmts_with_inherited_endings(&arm.body, body_endings);
             let writeback_state = writeback_root
                 .as_ref()
                 .and_then(|_| self.match_writeback_stack.pop());
@@ -3675,7 +7363,15 @@ impl<'a> Lowerer<'a> {
             next_case_block = next_block;
         }
 
+        if let Some(cleanup_block) = unmatched_cleanup {
+            self.switch_to(cleanup_block);
+            for loan in ending_loans.iter().rev() {
+                self.emit(Instruction::EndLoan { loan: loan.clone() });
+            }
+            self.terminate(Terminator::Goto(self.label(after_block)));
+        }
         self.switch_to(after_block);
+        self.remove_loans_from_lowering_state(&ending_loans);
     }
 
     fn lower_pattern(
@@ -4204,7 +7900,10 @@ impl<'a> Lowerer<'a> {
                     })
                     .unwrap_or_else(|| Type::named("Unknown"));
                 let object = self.lower_expr_at_sequence_point(iterable, None);
-                let receiver_place = self.render_place_expr_option(iterable);
+                let receiver_place = match &object {
+                    Operand::Place(place) | Operand::MovePlace(place) => Some(place.clone()),
+                    _ => self.render_place_expr_option(iterable),
+                };
                 (object, receiver_place, element_ty)
             })
             .collect::<Vec<_>>();
@@ -4448,6 +8147,17 @@ impl<'a> Lowerer<'a> {
                         Vec::new(),
                     )
                 };
+                // Queue handles are Copy, so the sequence-point lowering above
+                // can materialize a `%tN` operand even when the source syntax
+                // names a local. The internal receive operation borrows that
+                // materialized handle; its receiver metadata must describe the
+                // operand actually being called, not an unrelated source local.
+                // This keeps generated MIR within the same no-redirection rule
+                // enforced for untrusted serialized MIR.
+                let receiver_place = match &iterable {
+                    Operand::Place(place) | Operand::MovePlace(place) => Some(place.clone()),
+                    _ => None,
+                };
                 self.terminate(Terminator::Goto(self.label(dispatch_block)));
                 self.switch_to(dispatch_block);
                 self.emit(Instruction::Assign {
@@ -4456,7 +8166,7 @@ impl<'a> Lowerer<'a> {
                         callee: CallTarget::Member {
                             object: iterable.clone(),
                             field,
-                            receiver_place: self.render_place_expr_option(&for_stmt.iterable),
+                            receiver_place,
                         },
                         args,
                     },
@@ -4535,6 +8245,10 @@ impl<'a> Lowerer<'a> {
                             self.render_place_expr_option(&for_stmt.iterable),
                         )
                     };
+                let iteration_receiver_place = match &iteration_object {
+                    Operand::Place(place) | Operand::MovePlace(place) => Some(place.clone()),
+                    _ => iteration_receiver_place,
+                };
                 self.emit(Instruction::Assign {
                     target: next_value.clone(),
                     value: Rvalue::Call {
@@ -4717,6 +8431,10 @@ impl<'a> Lowerer<'a> {
                             self.render_place_expr_option(&for_stmt.iterable),
                         )
                     };
+                let iteration_receiver_place = match &iteration_object {
+                    Operand::Place(place) | Operand::MovePlace(place) => Some(place.clone()),
+                    _ => iteration_receiver_place,
+                };
                 self.emit(Instruction::Assign {
                     target: next_value.clone(),
                     value: Rvalue::Call {
@@ -5264,22 +8982,26 @@ impl<'a> Lowerer<'a> {
             ExprKind::Specialize { expr, .. } => self.lower_expr(expr),
             ExprKind::Group(inner) => self.lower_expr(inner),
             ExprKind::Unary { op, expr: value } => {
-                if let Some(field) = self.operator_field_for_unary(*op, value) {
+                if let Some((trait_name, field)) = self.operator_trait_member_for_unary(*op, value)
+                {
                     let temp = self.new_temp_for_expr(expr);
                     let receiver_place = self.render_place_expr_option(value);
-                    let receiver_passing = unary_operator_trait(*op)
-                        .and_then(|(trait_name, method_name)| {
-                            self.trait_info_in_scope(trait_name)
-                                .and_then(|info| info.methods.get(method_name))
-                                .and_then(|method| method.decl.receiver)
-                        })
+                    let receiver_passing = self
+                        .trait_info_in_scope(&trait_name)
+                        .and_then(|info| info.methods.get(&field))
+                        .and_then(|method| method.decl.receiver)
                         .unwrap_or(ReceiverKind::Borrow);
                     let object = self.lower_expr_for_passing(value, None, receiver_passing);
+                    let receiver_place = match &object {
+                        Operand::Place(place) | Operand::MovePlace(place) => Some(place.clone()),
+                        _ => receiver_place,
+                    };
                     self.emit(Instruction::Assign {
                         target: temp.clone(),
                         value: Rvalue::Call {
-                            callee: CallTarget::Member {
+                            callee: CallTarget::TraitMember {
                                 object,
+                                trait_name,
                                 field,
                                 receiver_place,
                             },
@@ -5333,17 +9055,21 @@ impl<'a> Lowerer<'a> {
                 if matches!(op, BinaryOp::And | BinaryOp::Or) {
                     return self.lower_logical_expr(*op, left, right);
                 }
-                if let Some(field) = self.operator_field_for_binary(*op, left, right) {
+                if let Some((trait_name, field)) =
+                    self.operator_trait_member_for_binary(*op, left, right)
+                {
                     let temp = self.new_temp_for_expr(expr);
                     let receiver_place = self.render_place_expr_option(left);
-                    let receiver_passing = binary_operator_trait(*op)
-                        .and_then(|(trait_name, method_name)| {
-                            self.trait_info_in_scope(trait_name)
-                                .and_then(|info| info.methods.get(method_name))
-                                .and_then(|method| method.decl.receiver)
-                        })
+                    let receiver_passing = self
+                        .trait_info_in_scope(&trait_name)
+                        .and_then(|info| info.methods.get(&field))
+                        .and_then(|method| method.decl.receiver)
                         .unwrap_or(ReceiverKind::Borrow);
                     let object = self.lower_expr_for_passing(left, None, receiver_passing);
+                    let receiver_place = match &object {
+                        Operand::Place(place) | Operand::MovePlace(place) => Some(place.clone()),
+                        _ => receiver_place,
+                    };
                     let source_args = vec![Argument {
                         name: None,
                         value: (**right).clone(),
@@ -5353,8 +9079,9 @@ impl<'a> Lowerer<'a> {
                     self.emit(Instruction::Assign {
                         target: temp.clone(),
                         value: Rvalue::Call {
-                            callee: CallTarget::Member {
+                            callee: CallTarget::TraitMember {
                                 object,
+                                trait_name,
                                 field,
                                 receiver_place,
                             },
@@ -5455,6 +9182,13 @@ impl<'a> Lowerer<'a> {
                     }
                 }
 
+                if let Some(place) = self.render_stable_place_expr_option(expr) {
+                    let root = place.split('.').next().unwrap_or_default();
+                    if self.local_types.contains_key(root) {
+                        return Operand::Place(place);
+                    }
+                }
+
                 let object = self.lower_expr(object);
                 let temp = self.new_temp_for_expr(expr);
                 self.emit(Instruction::Assign {
@@ -5502,7 +9236,10 @@ impl<'a> Lowerer<'a> {
                     }
                     _ => self.lower_expr_at_sequence_point(index, None),
                 };
-                let receiver_place = self.render_place_expr_option(object);
+                let receiver_place = match &lowered_object {
+                    Operand::Place(place) | Operand::MovePlace(place) => Some(place.clone()),
+                    _ => self.render_place_expr_option(object),
+                };
                 let field = match object_type {
                     Some(Type::Named(name, args)) if name == "dict" && args.len() == 2 => {
                         INTERNAL_MAP_INDEX_FIELD.to_string()
@@ -5554,13 +9291,17 @@ impl<'a> Lowerer<'a> {
                     .as_deref()
                     .map(|end| self.lower_index_domain_expr(end))
                     .unwrap_or(Operand::Int(0));
+                let receiver_place = match &lowered_object {
+                    Operand::Place(place) | Operand::MovePlace(place) => Some(place.clone()),
+                    _ => self.render_place_expr_option(object),
+                };
                 self.emit(Instruction::Assign {
                     target: temp.clone(),
                     value: Rvalue::Call {
                         callee: CallTarget::Member {
                             object: lowered_object,
                             field: INTERNAL_SLICE_FIELD.to_string(),
-                            receiver_place: self.render_place_expr_option(object),
+                            receiver_place,
                         },
                         args: vec![
                             MirArg {
@@ -6608,7 +10349,10 @@ impl<'a> Lowerer<'a> {
         let needle_ty = crate::sema::membership_needle_type(&container_ty);
         let value_operand = self.lower_expr_at_sequence_point(value, needle_ty.as_ref());
         let container_operand = self.lower_expr_at_sequence_point(container, None);
-        let receiver_place = self.render_place_expr_option(container);
+        let receiver_place = match &container_operand {
+            Operand::Place(place) | Operand::MovePlace(place) => Some(place.clone()),
+            _ => self.render_place_expr_option(container),
+        };
         self.lower_membership_call(
             value_operand,
             container_operand,
@@ -6710,7 +10454,10 @@ impl<'a> Lowerer<'a> {
                         .infer_expr_type(&link.operand)
                         .unwrap_or_else(|| Type::named("Unknown"));
                     let container = self.lower_expr_at_sequence_point(&link.operand, None);
-                    let receiver_place = self.render_place_expr_option(&link.operand);
+                    let receiver_place = match &container {
+                        Operand::Place(place) | Operand::MovePlace(place) => Some(place.clone()),
+                        _ => self.render_place_expr_option(&link.operand),
+                    };
                     let contains = self.lower_membership_call(
                         left,
                         container.clone(),
@@ -6974,20 +10721,33 @@ impl<'a> Lowerer<'a> {
         passing: ReceiverKind,
     ) -> Operand {
         if matches!(passing, ReceiverKind::Borrow | ReceiverKind::BorrowMut) {
-            if let Some((origin, projections)) = self.returned_view_source(expr) {
-                let _ = self.lower_expr_with_expected(expr, expected);
+            if let Some(place) = self.render_place_expr_option(expr) {
+                let root = place.split('.').next().unwrap_or_default();
+                if self.view_sources.contains_key(root) {
+                    // Borrowing an existing view passes its descriptor (or a
+                    // stable child projection) through unchanged. Reading it
+                    // into a temporary would sever the call origin from the
+                    // mutable writeback place and manufacture owned storage.
+                    return Operand::Place(place);
+                }
+            }
+            if self.returned_view_source(expr).is_some() {
                 let ty = expected
                     .cloned()
                     .or_else(|| self.infer_expr_type(expr))
                     .unwrap_or_else(|| Type::named("Unknown"));
                 let loan = self.new_typed_temp(ty);
-                self.emit(Instruction::BeginReturnedLoan {
-                    loan: loan.clone(),
-                    origin: origin.clone(),
-                    projections,
-                    mutable: passing == ReceiverKind::BorrowMut,
-                });
+                let origin = self
+                    .lower_returned_view_into_loan(
+                        expr,
+                        &loan,
+                        passing == ReceiverKind::BorrowMut,
+                        expected,
+                    )
+                    .expect("checked returned-view argument should lower into a loan");
                 self.view_sources.insert(loan.clone(), origin);
+                self.returned_view_descriptors.insert(loan.clone());
+                self.loan_source_names.insert(loan.clone(), loan.clone());
                 if let Some(scope) = self.loan_scopes.last_mut() {
                     scope.push(loan.clone());
                 }
@@ -7833,13 +11593,17 @@ impl<'a> Lowerer<'a> {
                     .expect("`len` and `str` bind exactly one argument before lowering");
                 if name == "len" {
                     let object = self.lower_expr_at_sequence_point(&argument.value, None);
+                    let receiver_place = match &object {
+                        Operand::Place(place) | Operand::MovePlace(place) => Some(place.clone()),
+                        _ => self.render_place_expr_option(&argument.value),
+                    };
                     self.emit(Instruction::Assign {
                         target: temp.clone(),
                         value: Rvalue::Call {
                             callee: CallTarget::Member {
                                 object,
                                 field: "len".to_string(),
-                                receiver_place: self.render_place_expr_option(&argument.value),
+                                receiver_place,
                             },
                             args: Vec::new(),
                         },
@@ -8645,14 +12409,34 @@ impl<'a> Lowerer<'a> {
                 } else {
                     self.lower_expr_at_sequence_point(object, None)
                 };
+                // `lower_expr_for_passing` can materialize a Copy projection
+                // (for example, `values[0]`) into a temporary. Receiver
+                // metadata is private writeback authority, so it must follow
+                // the operand actually supplied to the call instead of a
+                // pre-materialization source spelling. Addressable mutable
+                // receivers lower to their original place and therefore keep
+                // the same writeback identity here.
+                let receiver_place = match &lowered_object {
+                    Operand::Place(place) | Operand::MovePlace(place) => Some(place.clone()),
+                    _ => receiver_place,
+                };
                 let lowered_args = self.lower_member_call_args(callee.span, object, field, args);
+                let trait_name = self.bounded_trait_member_identity(object, field);
                 self.emit(Instruction::Assign {
                     target: temp.clone(),
                     value: Rvalue::Call {
-                        callee: CallTarget::Member {
-                            object: lowered_object,
-                            field: field.clone(),
-                            receiver_place,
+                        callee: match trait_name {
+                            Some(trait_name) => CallTarget::TraitMember {
+                                object: lowered_object,
+                                trait_name,
+                                field: field.clone(),
+                                receiver_place,
+                            },
+                            None => CallTarget::Member {
+                                object: lowered_object,
+                                field: field.clone(),
+                                receiver_place,
+                            },
                         },
                         args: lowered_args,
                     },
@@ -8872,14 +12656,7 @@ impl<'a> Lowerer<'a> {
                 } else {
                     self.lower_args(args)
                 };
-                let callee_name = if self
-                    .program
-                    .functions
-                    .get(name)
-                    .is_some_and(|function| function.module_name == self.program.module_name)
-                {
-                    name.clone()
-                } else if let Some(function_info) = resolved_function {
+                let callee_name = if let Some(function_info) = resolved_function {
                     if function_info.module_name == self.program.module_name {
                         name.clone()
                     } else {
@@ -9089,7 +12866,20 @@ impl<'a> Lowerer<'a> {
             }
         }
 
-        let trait_method =
+        let trait_method = if let Some((_, _, method, substitutions)) =
+            self.bounded_trait_method_for_receiver(&receiver_type, field)
+        {
+            Some((
+                method.decl.params.clone(),
+                method.signature.param_passings.clone(),
+                method
+                    .signature
+                    .params
+                    .iter()
+                    .map(|param| substitute_type(param, &substitutions))
+                    .collect::<Vec<_>>(),
+            ))
+        } else {
             self.trait_method_for_receiver(&receiver_type, field)
                 .map(|(method, substitutions)| {
                     (
@@ -9102,7 +12892,8 @@ impl<'a> Lowerer<'a> {
                             .map(|param| substitute_type(param, &substitutions))
                             .collect::<Vec<_>>(),
                     )
-                });
+                })
+        };
 
         if let Some((params, param_passings, expected_param_types)) = trait_method {
             return self.lower_user_args_with_types(
@@ -9169,9 +12960,88 @@ impl<'a> Lowerer<'a> {
             {
                 return method.decl.receiver;
             }
+            if let Some(member) = BuiltinMember::resolve(class_name, field) {
+                return Some(member.receiver_passing());
+            }
+        }
+        if let Some((_, _, method, _)) =
+            self.bounded_trait_method_for_receiver(&receiver_type, field)
+        {
+            return method.decl.receiver;
         }
         self.trait_method_for_receiver(&receiver_type, field)
             .and_then(|(method, _)| method.decl.receiver)
+    }
+
+    fn bounded_trait_method_for_receiver(
+        &self,
+        receiver_type: &Type,
+        field: &str,
+    ) -> Option<(
+        String,
+        &crate::sema::TraitInfo,
+        &crate::sema::TraitMethodInfo,
+        HashMap<String, Type>,
+    )> {
+        let Type::TypeParam(type_param) = receiver_type else {
+            return None;
+        };
+        let self_ty = Type::TypeParam(type_param.clone());
+        let mut pending = self.type_param_bounds.get(type_param)?.clone();
+        let mut seen = Vec::new();
+        let mut matches = Vec::new();
+
+        while let Some(bound) = pending.pop() {
+            if seen.contains(&bound) {
+                continue;
+            }
+            seen.push(bound.clone());
+            let Some(trait_info) = self.trait_info_in_scope(&bound.trait_name) else {
+                continue;
+            };
+            let substitutions = crate::sema::self_type_substitutions(
+                &trait_info.decl,
+                &bound.trait_args,
+                self_ty.clone(),
+            );
+            if let Some(method) = trait_info.methods.get(field) {
+                matches.push((
+                    bound.trait_name.clone(),
+                    trait_info,
+                    method,
+                    substitutions.clone(),
+                ));
+            }
+            pending.extend(
+                trait_info
+                    .supertraits
+                    .iter()
+                    .rev()
+                    .map(|supertrait| substitute_trait_bound(supertrait, &substitutions)),
+            );
+        }
+
+        (matches.len() == 1).then(|| matches.pop()).flatten()
+    }
+
+    fn bounded_trait_member_identity(&self, object_expr: &Expr, field: &str) -> Option<String> {
+        let receiver_type = self
+            .specialized_bound_receiver_type(object_expr)
+            .or_else(|| self.infer_expr_type(object_expr))?;
+        self.bounded_trait_method_for_receiver(&receiver_type, field)
+            .map(|(trait_name, _, _, _)| trait_name)
+    }
+
+    fn specialized_bound_receiver_type(&self, object_expr: &Expr) -> Option<Type> {
+        match &object_expr.kind {
+            ExprKind::Group(inner) => self.specialized_bound_receiver_type(inner),
+            ExprKind::Name(name) => self
+                .specialized_bound_roots
+                .get(&self.render_local_name(name))
+                .cloned()
+                .map(Type::TypeParam),
+            _ => None,
+        }
     }
 
     fn lower_user_args(
@@ -9335,7 +13205,14 @@ impl<'a> Lowerer<'a> {
 
     fn retarget_operand_place(&mut self, operand: &Operand, ty: &Type) {
         if let Operand::Place(place) | Operand::MovePlace(place) = operand {
-            self.local_types.insert(place.clone(), ty.clone());
+            // `local_types` describes root storage slots only. A dotted name is
+            // a projected MIR place whose type follows from its root and class
+            // metadata; registering the whole path here both duplicates that
+            // authority and produces an identifier rejected at public MIR
+            // boundaries.
+            if !place.contains('.') {
+                self.local_types.insert(place.clone(), ty.clone());
+            }
         }
     }
 
@@ -10303,19 +14180,34 @@ impl<'a> Lowerer<'a> {
             .or_else(|| self.infer_conditional_result_type(left, right))
     }
 
-    fn operator_field_for_unary(&self, op: UnaryOp, value: &Expr) -> Option<String> {
+    fn operator_trait_member_for_unary(
+        &self,
+        op: UnaryOp,
+        value: &Expr,
+    ) -> Option<(String, String)> {
         let value_ty = self.infer_expr_type(value)?;
         (!is_builtin_unary_operator(op, &value_ty))
-            .then(|| unary_operator_trait(op).map(|(_, field)| field.to_string()))
+            .then(|| {
+                unary_operator_trait(op)
+                    .map(|(trait_name, field)| (trait_name.to_string(), field.to_string()))
+            })
             .flatten()
     }
 
-    fn operator_field_for_binary(&self, op: BinaryOp, left: &Expr, right: &Expr) -> Option<String> {
+    fn operator_trait_member_for_binary(
+        &self,
+        op: BinaryOp,
+        left: &Expr,
+        right: &Expr,
+    ) -> Option<(String, String)> {
         let left_ty = self.infer_expr_type(left)?;
         let right_ty = self.infer_expr_type(right)?;
         let (left_ty, right_ty) = adjusted_binary_operand_types(left, left_ty, right, right_ty);
         (!is_builtin_binary_operator(op, &left_ty, &right_ty))
-            .then(|| binary_operator_trait(op).map(|(_, field)| field.to_string()))
+            .then(|| {
+                binary_operator_trait(op)
+                    .map(|(trait_name, field)| (trait_name.to_string(), field.to_string()))
+            })
             .flatten()
     }
 
@@ -11141,20 +15033,43 @@ impl<'a> Lowerer<'a> {
 
     fn render_place_expr_option(&self, expr: &Expr) -> Option<String> {
         match &expr.kind {
-            ExprKind::Name(_) | ExprKind::Group(_) | ExprKind::Member { .. } => {
-                let rendered = self.render_expr_place(expr);
-                if rendered == "<expr>" {
-                    None
-                } else {
-                    Some(rendered)
-                }
-            }
+            ExprKind::Name(name) => Some(self.render_local_name(name)),
+            ExprKind::Group(inner) => self.render_place_expr_option(inner),
+            ExprKind::Member { object, field } => self
+                .render_place_expr_option(object)
+                .map(|object| format!("{object}.{field}")),
             ExprKind::Index { object, index } => {
                 let ExprKind::Int(index) = index.kind else {
                     return None;
                 };
                 let index = usize::try_from(index).ok()?;
                 self.render_place_expr_option(object)
+                    .map(|object| format!("{object}.{index}"))
+            }
+            _ => None,
+        }
+    }
+
+    /// Renders only projections that the physical MIR place model can follow
+    /// directly. ADR-0038 admits class fields and tuple positions, but not
+    /// list indexes or dictionary keys—even when their source index is a
+    /// constant. Collection indexing must therefore stay an explicit MIR
+    /// member call before a following field projection is evaluated.
+    fn render_stable_place_expr_option(&self, expr: &Expr) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Name(name) => Some(self.render_local_name(name)),
+            ExprKind::Group(inner) => self.render_stable_place_expr_option(inner),
+            ExprKind::Member { object, field } => self
+                .render_stable_place_expr_option(object)
+                .map(|object| format!("{object}.{field}")),
+            ExprKind::Index { object, index }
+                if matches!(self.infer_expr_type(object), Some(Type::Tuple(_))) =>
+            {
+                let ExprKind::Int(index) = index.kind else {
+                    return None;
+                };
+                let index = usize::try_from(index).ok()?;
+                self.render_stable_place_expr_option(object)
                     .map(|object| format!("{object}.{index}"))
             }
             _ => None,
@@ -11248,7 +15163,16 @@ impl<'a> Lowerer<'a> {
                 receiver_place: Some(receiver_place),
             } => {
                 place_paths_overlap(receiver_place, place)
-                    && self.member_call_mutates_receiver(object, field)
+                    && self.member_call_mutates_receiver(object, None, field)
+            }
+            CallTarget::TraitMember {
+                object,
+                trait_name,
+                field,
+                receiver_place: Some(receiver_place),
+            } => {
+                place_paths_overlap(receiver_place, place)
+                    && self.member_call_mutates_receiver(object, Some(trait_name), field)
             }
             _ => false,
         };
@@ -11260,19 +15184,51 @@ impl<'a> Lowerer<'a> {
             })
     }
 
-    fn member_call_mutates_receiver(&self, object: &Operand, field: &str) -> bool {
+    fn member_call_mutates_receiver(
+        &self,
+        object: &Operand,
+        trait_name: Option<&str>,
+        field: &str,
+    ) -> bool {
         let Some(receiver_type) = self.infer_operand_type(object) else {
             return false;
         };
-        if let Type::Named(receiver_name, _) = &receiver_type {
-            if let Some(class) = self.resolve_class_info(receiver_name) {
-                if let Some(method) = class.methods.get(field) {
-                    return method.decl.receiver == Some(ReceiverKind::BorrowMut);
+        if trait_name.is_none() {
+            if let Type::Named(receiver_name, _) = &receiver_type {
+                if let Some(class) = self.resolve_class_info(receiver_name) {
+                    if let Some(method) = class.methods.get(field) {
+                        return method.decl.receiver == Some(ReceiverKind::BorrowMut);
+                    }
+                }
+                if let Some(builtin_member) = BuiltinMember::resolve(receiver_name, field) {
+                    return builtin_member.receiver_passing() == ReceiverKind::BorrowMut;
                 }
             }
-            if let Some(builtin_member) = BuiltinMember::resolve(receiver_name, field) {
-                return builtin_member.receiver_passing() == ReceiverKind::BorrowMut;
-            }
+        }
+        if let (Some(trait_name), Type::TypeParam(_)) = (trait_name, &receiver_type) {
+            return self
+                .trait_info_in_scope(trait_name)
+                .and_then(|trait_info| trait_info.methods.get(field))
+                .is_some_and(|method| method.decl.receiver == Some(ReceiverKind::BorrowMut));
+        }
+        if let Some(trait_name) = trait_name {
+            return self
+                .trait_impls_in_scope()
+                .filter(|trait_impl| trait_impl.trait_name == trait_name)
+                .filter_map(|trait_impl| {
+                    let substitutions =
+                        self.trait_impl_substitutions(trait_impl, &receiver_type)?;
+                    let method = trait_impl.methods.get(field)?;
+                    Some((
+                        crate::sema::trait_impl_specificity(trait_impl),
+                        method,
+                        substitutions,
+                    ))
+                })
+                .max_by_key(|(specificity, _, _)| *specificity)
+                .is_some_and(|(_, method, _)| {
+                    method.decl.receiver == Some(ReceiverKind::BorrowMut)
+                });
         }
         self.trait_method_for_receiver(&receiver_type, field)
             .is_some_and(|(method, _)| method.decl.receiver == Some(ReceiverKind::BorrowMut))
