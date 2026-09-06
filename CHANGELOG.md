@@ -10,7 +10,10 @@ in this file.
 - Enable Cranelift speed optimization, validated by the full forced-backend gate.
 - Tune release artifacts with fat LTO, one codegen unit, stripped compiler
   symbols, platform section collection and user debug/local-symbol stripping;
-  preserve unwinding and Aura source diagnostics. Size measurements pending.
+  preserve unwinding and Aura source diagnostics. On the measured arm64 macOS
+  host, tuned compiler/hello/worker executables are 29.35%/93.29%/84.54% smaller
+  than clean v0.3.3-preview builds; see the Performance chapter for byte counts
+  and provenance.
 - Add pinned Rust baseline programs and lanes to all three timing harnesses,
   protocol smoke checks, and clean-ref executable-size tooling. Timings deferred.
 - Document the native semantic boundary and incremental Batch 1 builder plan.

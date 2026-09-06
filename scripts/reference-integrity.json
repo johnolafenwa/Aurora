@@ -142,9 +142,14 @@
   },
   "blocks": {
     "docs/manual/performance.md#bash-1": {
-      "sha256": "f894196f700b61a6d53ad6085b32491b8fcb1d5af79a3d966135f54573997a22",
+      "sha256": "18440010019a1b2dc80b580433aac5e3ba56e8a2b4f8e46c84aa1e9d2368d4af",
       "mode": "illustrative",
       "reason": "Benchmark orchestration command that requires the pinned measurement host and a clean detached checkout."
+    },
+    "docs/manual/performance.md#bash-2": {
+      "sha256": "39533cfa8d2d906de15f8e166531d5af1b99847a02e1d06e0a5d841ff077f2ed",
+      "mode": "illustrative",
+      "reason": "Clean-ref executable-size orchestration requires full detached release builds; the runner is tested separately and its three-profile measurement is recorded in the work evidence."
     },
     "docs/manual/assertions.md#aura-1": {
       "sha256": "0d9e541caf7e08e73d098ddb3e77795743be6c4d9a0dbf7fde4d365ea7611acc",

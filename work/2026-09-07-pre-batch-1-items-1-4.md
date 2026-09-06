@@ -16,18 +16,19 @@ Branch: `codex/pre-batch-1-foundations`. Preserve the existing personal file,
 - Enforced floors remain 96.30/97.21/94.71.
 - Test-first flag regression failed with `None` versus `Speed` as expected.
 - Test-first platform-link regression failed because the helper was absent.
-- Implementation and all required gates are in progress.
+- Implementation and local gates are complete; final-head size evidence and
+  hosted integration remain in progress.
 
 ## Remaining work
 
-Complete items 1–4, local gates, clean-ref size measurements, documentation,
-branch hosted CI, merge-commit PR, main hosted CI, measurement handoff, cleanup.
+Complete final-head size measurements and publication, final documentation
+checks, branch hosted CI, merge-commit PR, main hosted CI, handoff, and cleanup.
 
 ## Verification notes
 
 - All nine Rust workloads pass one exact protocol/checksum smoke run; no timing
   is published. Standalone `cargo audit` found no vulnerabilities in 10 packages.
-- Python runner/size/provenance tests pass (43). Release packaging tests pass (36).
+- Python runner/size/provenance tests pass (44). Release packaging tests pass (36).
 - Reference gate exposed a pre-existing post-publication metadata test that still
   required an unreleased 0.3.3 changelog. Updated it to require the published
   2026-09-06 entry and new 0.3.4 unreleased section; manifest versions stay 0.3.3.
@@ -93,3 +94,27 @@ branch hosted CI, merge-commit PR, main hosted CI, measurement handoff, cleanup.
 - Full local gates are green (parallel build-state failures classified above);
   remaining work is clean-ref size publication, final docs checks, hosted branch
   CI, merge, hosted main CI, handoff, and final cleanup.
+
+## Executable-size evidence
+
+The initial clean-ref measurement uses v0.3.3-preview and implementation commit
+`11ce755dd97386c2aa230ba16b5f7e26a675e2cf`. The final branch head is confirmed
+separately before integration. The canonical raw report is
+`work/2026-09-07-pre-batch-1-executable-sizes.json`.
+
+| Subject | Before bytes | After default bytes | After tuned bytes | Reduction |
+| --- | ---: | ---: | ---: | ---: |
+| `aura` compiler | 15,424,032 | 15,866,008 | 10,897,392 | 29.35% |
+| Native hello world | 23,646,792 | 1,702,088 | 1,586,968 | 93.29% |
+| Retrying-worker stand-in | 23,715,816 | 4,049,240 | 3,666,600 | 84.54% |
+
+All three clean builds passed standalone hello/worker execution with identical
+source bytes and full output, and Cargo unavailable. The tuned profile uses fat
+LTO; no fallback to thin was needed locally. All size worktrees and target trees
+were removed after hashing. Timing measurements remain pending after reboot.
+
+- Final documentation gates passed after registering the new size-command fence:
+  Manual reference replay (129 verified Aura blocks), 340 tutorial fences,
+  generated LLM check, production docs build, 15 identity tests, 36 packaging
+  tests, and repository hygiene. The fence is orchestration metadata; no
+  language fixture expectation was changed.

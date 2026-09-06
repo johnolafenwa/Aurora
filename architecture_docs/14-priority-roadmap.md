@@ -89,7 +89,9 @@ The backend direction is recorded in
   tests, and hosted protocol smoke verification delivered. Timing remains pending.
 - Item 4: release profile, section collection and post-link local/debug stripping,
   plus clean-ref size tooling delivered. Link/strip steps pass local packaging,
-  standalone diagnostics, cache, and release-profile checks; size publication follows.
+  standalone diagnostics, cache, and release-profile checks. The
+  [executable-size table](../docs/manual/performance.md#executable-size) is published
+  with clean-ref provenance and a default-profile control.
 - Items 5 and 6 retain their recorded scope and status above.
 
 ## Priority Batches

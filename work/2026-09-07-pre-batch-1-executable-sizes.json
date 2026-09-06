@@ -1,0 +1,291 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-06T21:32:19.223508+00:00",
+  "host": "macOS-26.5.2-arm64-arm-64bit",
+  "machine": "arm64",
+  "runner_sha256": "622048c07851658abef8ada5113aae297bde0e0e774f87b5b078a912315a4cdb",
+  "measurements": [
+    {
+      "ref": "v0.3.3-preview",
+      "commit": "d3cc6b96104dd597687a98e9624f800a0cb3cf1e",
+      "profile": "release",
+      "profile_overrides": {
+        "CARGO_PROFILE_RELEASE_PANIC": "unwind"
+      },
+      "build_command": [
+        "cargo",
+        "+1.95.0",
+        "build",
+        "--release",
+        "--locked",
+        "-p",
+        "aura"
+      ],
+      "link_query_command": [
+        "cargo",
+        "+1.95.0",
+        "rustc",
+        "--release",
+        "--locked",
+        "-p",
+        "aura-compiler",
+        "--lib",
+        "--",
+        "--print",
+        "native-static-libs"
+      ],
+      "program_builds": [
+        [
+          "/var/folders/v9/fdd3rcn92b16ngnbyc64fw3w0000gn/T/aura-size-t1utba3y/checkout/target-measured/installed/bin/aura",
+          "build",
+          "--backend",
+          "direct",
+          "-o",
+          "/var/folders/v9/fdd3rcn92b16ngnbyc64fw3w0000gn/T/aura-size-t1utba3y/checkout/target-measured/hello_world",
+          "/var/folders/v9/fdd3rcn92b16ngnbyc64fw3w0000gn/T/aura-size-t1utba3y/checkout/target-measured/hello_world.au"
+        ],
+        [
+          "/var/folders/v9/fdd3rcn92b16ngnbyc64fw3w0000gn/T/aura-size-t1utba3y/checkout/target-measured/installed/bin/aura",
+          "build",
+          "--backend",
+          "direct",
+          "-o",
+          "/var/folders/v9/fdd3rcn92b16ngnbyc64fw3w0000gn/T/aura-size-t1utba3y/checkout/target-measured/reference_agent_standin",
+          "/var/folders/v9/fdd3rcn92b16ngnbyc64fw3w0000gn/T/aura-size-t1utba3y/checkout/examples/agents/retrying_network_worker.au"
+        ]
+      ],
+      "subjects": {
+        "aura": {
+          "bytes": 15424032,
+          "sha256": "bf5e0448bd34206a0cf1396bbf394967255c2b7dd28495edfd8fef35946157e5"
+        },
+        "hello_world": {
+          "bytes": 23646792,
+          "sha256": "e8e2c9b9c191d1b6994611fe1dc9922ffbfab07824c6b38c47a5e573214cfd55"
+        },
+        "reference_agent_standin": {
+          "bytes": 23715816,
+          "sha256": "82067ffac8ac988fd41ff3f382d207b537231e38aa3e2481516f37ddce84602c"
+        }
+      },
+      "sources": {
+        "hello_world": {
+          "path": "examples/basics/hello_world.au",
+          "bytes": 23,
+          "sha256": "51d2693342000ac090e8817796032592050e0f0b88d4d3a7ab1112058a169673"
+        },
+        "reference_agent_standin": {
+          "path": "examples/agents/retrying_network_worker.au",
+          "bytes": 4402,
+          "sha256": "059b40af6705d5f8af7704cb633f8900b4d3188d0866853edb99ac3db4d65644"
+        }
+      },
+      "standalone_verification": {
+        "hello_world": {
+          "returncode": 0,
+          "stdout": "Hello, world!\n",
+          "cargo_unavailable": true
+        },
+        "reference_agent_standin": {
+          "returncode": 0,
+          "stdout": "recover request 1\nrecover retry 4ms\nrecover request 2\nrecover result 200\nrate request 1\nrate retry 6ms\nrate request 2\nrate result 429\nexhaust request 1\nexhaust retry 3ms\nexhaust request 2\nexhaust retry 5ms\nexhaust request 3\nexhaust result 503\nrequests 7\n",
+          "cargo_unavailable": true
+        }
+      },
+      "toolchain": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: aarch64-apple-darwin\nrelease: 1.95.0\nLLVM version: 22.1.2\n",
+      "linker": "Apple clang version 21.0.0 (clang-2100.1.1.101)\nTarget: arm64-apple-darwin25.5.0\nThread model: posix\nInstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin\n",
+      "hello_before_input_policy": "identical single-print bytes staged outside the before source tree",
+      "reference_agent": "retrying_network_worker is the stand-in until pre-Batch-1 item 6"
+    },
+    {
+      "ref": "11ce755dd97386c2aa230ba16b5f7e26a675e2cf",
+      "commit": "11ce755dd97386c2aa230ba16b5f7e26a675e2cf",
+      "profile": "cargo-default",
+      "profile_overrides": {
+        "CARGO_PROFILE_RELEASE_PANIC": "unwind",
+        "CARGO_PROFILE_RELEASE_OPT_LEVEL": "3",
+        "CARGO_PROFILE_RELEASE_LTO": "false",
+        "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "16",
+        "CARGO_PROFILE_RELEASE_STRIP": "none",
+        "CARGO_PROFILE_RELEASE_DEBUG": "0"
+      },
+      "build_command": [
+        "cargo",
+        "+1.95.0",
+        "build",
+        "--release",
+        "--locked",
+        "-p",
+        "aura"
+      ],
+      "link_query_command": [
+        "cargo",
+        "+1.95.0",
+        "rustc",
+        "--release",
+        "--locked",
+        "-p",
+        "aura-compiler",
+        "--lib",
+        "--",
+        "--print",
+        "native-static-libs"
+      ],
+      "program_builds": [
+        [
+          "/var/folders/v9/fdd3rcn92b16ngnbyc64fw3w0000gn/T/aura-size-aj0vrtwr/checkout/target-default/installed/bin/aura",
+          "build",
+          "--backend",
+          "direct",
+          "-o",
+          "/var/folders/v9/fdd3rcn92b16ngnbyc64fw3w0000gn/T/aura-size-aj0vrtwr/checkout/target-default/hello_world",
+          "/var/folders/v9/fdd3rcn92b16ngnbyc64fw3w0000gn/T/aura-size-aj0vrtwr/checkout/examples/basics/hello_world.au"
+        ],
+        [
+          "/var/folders/v9/fdd3rcn92b16ngnbyc64fw3w0000gn/T/aura-size-aj0vrtwr/checkout/target-default/installed/bin/aura",
+          "build",
+          "--backend",
+          "direct",
+          "-o",
+          "/var/folders/v9/fdd3rcn92b16ngnbyc64fw3w0000gn/T/aura-size-aj0vrtwr/checkout/target-default/reference_agent_standin",
+          "/var/folders/v9/fdd3rcn92b16ngnbyc64fw3w0000gn/T/aura-size-aj0vrtwr/checkout/examples/agents/retrying_network_worker.au"
+        ]
+      ],
+      "subjects": {
+        "aura": {
+          "bytes": 15866008,
+          "sha256": "35ff4de130dfc77e1158464579e0e9c78f7090a96c0c43dd45278708e403a77c"
+        },
+        "hello_world": {
+          "bytes": 1702088,
+          "sha256": "453e4f2a7b90eff49bc18eba9d0199b7727a1ab8156c8575431234ae3ee94103"
+        },
+        "reference_agent_standin": {
+          "bytes": 4049240,
+          "sha256": "cbee7211f80b043195a0a3e8cd587c464cec76fd7b86dc231f9050015712ab44"
+        }
+      },
+      "sources": {
+        "hello_world": {
+          "path": "examples/basics/hello_world.au",
+          "bytes": 23,
+          "sha256": "51d2693342000ac090e8817796032592050e0f0b88d4d3a7ab1112058a169673"
+        },
+        "reference_agent_standin": {
+          "path": "examples/agents/retrying_network_worker.au",
+          "bytes": 4402,
+          "sha256": "059b40af6705d5f8af7704cb633f8900b4d3188d0866853edb99ac3db4d65644"
+        }
+      },
+      "standalone_verification": {
+        "hello_world": {
+          "returncode": 0,
+          "stdout": "Hello, world!\n",
+          "cargo_unavailable": true
+        },
+        "reference_agent_standin": {
+          "returncode": 0,
+          "stdout": "recover request 1\nrecover retry 4ms\nrecover request 2\nrecover result 200\nrate request 1\nrate retry 6ms\nrate request 2\nrate result 429\nexhaust request 1\nexhaust retry 3ms\nexhaust request 2\nexhaust retry 5ms\nexhaust request 3\nexhaust result 503\nrequests 7\n",
+          "cargo_unavailable": true
+        }
+      },
+      "toolchain": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: aarch64-apple-darwin\nrelease: 1.95.0\nLLVM version: 22.1.2\n",
+      "linker": "Apple clang version 21.0.0 (clang-2100.1.1.101)\nTarget: arm64-apple-darwin25.5.0\nThread model: posix\nInstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin\n",
+      "hello_before_input_policy": "identical single-print bytes staged outside the before source tree",
+      "reference_agent": "retrying_network_worker is the stand-in until pre-Batch-1 item 6"
+    },
+    {
+      "ref": "11ce755dd97386c2aa230ba16b5f7e26a675e2cf",
+      "commit": "11ce755dd97386c2aa230ba16b5f7e26a675e2cf",
+      "profile": "release",
+      "profile_overrides": {
+        "CARGO_PROFILE_RELEASE_PANIC": "unwind"
+      },
+      "build_command": [
+        "cargo",
+        "+1.95.0",
+        "build",
+        "--release",
+        "--locked",
+        "-p",
+        "aura"
+      ],
+      "link_query_command": [
+        "cargo",
+        "+1.95.0",
+        "rustc",
+        "--release",
+        "--locked",
+        "-p",
+        "aura-compiler",
+        "--lib",
+        "--",
+        "--print",
+        "native-static-libs"
+      ],
+      "program_builds": [
+        [
+          "/var/folders/v9/fdd3rcn92b16ngnbyc64fw3w0000gn/T/aura-size-eu201cu6/checkout/target-measured/installed/bin/aura",
+          "build",
+          "--backend",
+          "direct",
+          "-o",
+          "/var/folders/v9/fdd3rcn92b16ngnbyc64fw3w0000gn/T/aura-size-eu201cu6/checkout/target-measured/hello_world",
+          "/var/folders/v9/fdd3rcn92b16ngnbyc64fw3w0000gn/T/aura-size-eu201cu6/checkout/examples/basics/hello_world.au"
+        ],
+        [
+          "/var/folders/v9/fdd3rcn92b16ngnbyc64fw3w0000gn/T/aura-size-eu201cu6/checkout/target-measured/installed/bin/aura",
+          "build",
+          "--backend",
+          "direct",
+          "-o",
+          "/var/folders/v9/fdd3rcn92b16ngnbyc64fw3w0000gn/T/aura-size-eu201cu6/checkout/target-measured/reference_agent_standin",
+          "/var/folders/v9/fdd3rcn92b16ngnbyc64fw3w0000gn/T/aura-size-eu201cu6/checkout/examples/agents/retrying_network_worker.au"
+        ]
+      ],
+      "subjects": {
+        "aura": {
+          "bytes": 10897392,
+          "sha256": "80e6d690464a5d7d5203edb55ba0d3a9c2af52f38983e55c73f6fdb435da2c88"
+        },
+        "hello_world": {
+          "bytes": 1586968,
+          "sha256": "2ebf27a46c7db7b1787821391e87d90d368d285d50a002ca95e73face21bbe95"
+        },
+        "reference_agent_standin": {
+          "bytes": 3666600,
+          "sha256": "52e976378144341e296afe46704ea85a450c2d97b13d995d04bcaa8c42a202ba"
+        }
+      },
+      "sources": {
+        "hello_world": {
+          "path": "examples/basics/hello_world.au",
+          "bytes": 23,
+          "sha256": "51d2693342000ac090e8817796032592050e0f0b88d4d3a7ab1112058a169673"
+        },
+        "reference_agent_standin": {
+          "path": "examples/agents/retrying_network_worker.au",
+          "bytes": 4402,
+          "sha256": "059b40af6705d5f8af7704cb633f8900b4d3188d0866853edb99ac3db4d65644"
+        }
+      },
+      "standalone_verification": {
+        "hello_world": {
+          "returncode": 0,
+          "stdout": "Hello, world!\n",
+          "cargo_unavailable": true
+        },
+        "reference_agent_standin": {
+          "returncode": 0,
+          "stdout": "recover request 1\nrecover retry 4ms\nrecover request 2\nrecover result 200\nrate request 1\nrate retry 6ms\nrate request 2\nrate result 429\nexhaust request 1\nexhaust retry 3ms\nexhaust request 2\nexhaust retry 5ms\nexhaust request 3\nexhaust result 503\nrequests 7\n",
+          "cargo_unavailable": true
+        }
+      },
+      "toolchain": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: aarch64-apple-darwin\nrelease: 1.95.0\nLLVM version: 22.1.2\n",
+      "linker": "Apple clang version 21.0.0 (clang-2100.1.1.101)\nTarget: arm64-apple-darwin25.5.0\nThread model: posix\nInstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin\n",
+      "hello_before_input_policy": "identical single-print bytes staged outside the before source tree",
+      "reference_agent": "retrying_network_worker is the stand-in until pre-Batch-1 item 6"
+    }
+  ],
+  "process_helper_sha256": "bbf4bca940b38bc84101ba4eaf93e568b16edafd91dc298d071ea96be52330de"
+}

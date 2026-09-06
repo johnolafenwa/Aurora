@@ -13687,10 +13687,17 @@ Its SHA-linked summary has SHA-256
 
 The repository benchmark runner records commands, source and binary hashes,
 raw observations, medians, dispersion, host inventory, boot identity, and the
-environment policy. Run the maintained harness with:
+environment policy. From a clean detached checkout on the pinned measurement
+host, run the maintained harness with its Rust lanes:
 
 ```bash
-npm run bench:release-performance
+npm run bench:release-performance -- \
+  --label foundations-after-rust \
+  --aura target/release/aura \
+  --python /Applications/Xcode.app/Contents/Developer/usr/bin/python3 \
+  --pairs 11 \
+  --raw-json /tmp/aura-foundations-after-release-raw.json \
+  --summary-json /tmp/aura-foundations-after-release-summary.json
 ```
 
 The scalable-runtime and numeric-Array harnesses provide the deeper scheduler,
@@ -13698,15 +13705,46 @@ memory, and kernel evidence referenced by their Manual chapters.
 
 ## Executable Size
 
-The 0.3.4 foundations size tool builds clean detached refs with Rust 1.95.0,
-records exact executable byte counts and SHA-256 hashes, and removes each build
-tree after hashing. Subjects are the compiler, a single-print hello world, and
-`examples/agents/retrying_network_worker.au`, used as the reference-agent stand-in
-until pre-Batch-1 item 6 lands. The before ref is `v0.3.3-preview`. The after
-comparison includes Cargo-default and tuned release-profile builds in separate
-targets. The tuned profile retains unwinding and runtime diagnostic metadata.
+The pre-Batch-1 implementation reduces executable sizes while retaining panic
+unwinding and Aura's embedded diagnostic metadata. Counts below are exact bytes
+from separate clean detached builds; the table counts each executable, while
+installed toolchains also ship the separate runtime archive.
 
-Size measurements are pending completion of the local semantic gates.
+| Executable | Before: v0.3.3-preview, Cargo default | After: Cargo default | After: tuned release | Reduction from before |
+| --- | ---: | ---: | ---: | ---: |
+| `aura` compiler | 15,424,032 | 15,866,008 | 10,897,392 | 29.35% |
+| Native hello world | 23,646,792 | 1,702,088 | 1,586,968 | 93.29% |
+| Retrying-worker stand-in | 23,715,816 | 4,049,240 | 3,666,600 | 84.54% |
+
+The tuned profile uses level 3, fat LTO, one codegen unit, no debug data, and
+stripped compiler symbols. The after-default control restores Cargo's default
+release values through `CARGO_PROFILE_RELEASE_*` overrides in a separate target
+directory; it retains the new Cranelift flag and user-executable link/strip steps.
+Both after columns use macOS unused-section removal and debug/local-symbol
+stripping of user binaries. The runtime archive retains its linkable symbols.
+
+Provenance: Mac14,9 / Apple M2 Pro, arm64, macOS 26.5.2; Rust 1.95.0
+(`59807616e`, LLVM 22.1.2); Apple clang 21.0.0 (`clang-2100.1.1.101`). The before
+ref is `v0.3.3-preview` (`d3cc6b96104dd597687a98e9624f800a0cb3cf1e`). The after
+comparison uses the delivered pre-Batch-1 implementation. Exact measured commits,
+commands, profile overrides, source and executable SHA-256 hashes, and standalone
+output are retained in the [versioned raw evidence](https://github.com/johnolafenwa/Aura/blob/main/work/2026-09-07-pre-batch-1-executable-sizes.json).
+
+The hello input is `examples/basics/hello_world.au`, a single print. Because the
+before ref predates that file, the tool stages identical source bytes in its
+build area. `examples/agents/retrying_network_worker.au` is the reference-agent
+stand-in until pre-Batch-1 item 6 lands. Both subjects produce identical output
+across all three builds with Cargo unavailable during standalone execution.
+Each detached checkout and target directory is removed after hashing.
+
+Reproduce from the desired after checkout:
+
+```bash
+python3 scripts/bench-binary-size.py \
+  --before-ref v0.3.3-preview \
+  --after-ref "$(git rev-parse HEAD)" \
+  --output /tmp/aura-executable-sizes.json
+```
 
 ## Pending measurements
 

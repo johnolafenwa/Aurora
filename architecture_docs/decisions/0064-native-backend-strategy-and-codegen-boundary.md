@@ -2,7 +2,7 @@
 
 - Status: Accepted direction; detailed design pending
 - Date: 2026-09-06
-- Implementation: Pre-Batch-1 items 1–4 delivered; size publication in progress; timings pending
+- Implementation: Pre-Batch-1 items 1–4 delivered; timings pending
 - Roadmap: Pre-Batch-1 foundations; incremental boundary work from Batch 1;
   release-backend decision in Batch 7
 - Related: ADR-0031, ADR-0038, ADR-0041, and ADR-0058
@@ -136,3 +136,9 @@ protocol smoke checks establish correctness only. The separate executable-size
 measurement records byte counts and hashes at clean refs, including an after
 build with Cargo's default release profile restored through environment overrides.
 `retrying_network_worker.au` is the reference-agent stand-in until item 6 lands.
+
+The [executable-size table](../../docs/manual/performance.md#executable-size)
+records before/default-after/tuned-after builds with hashes and clean-ref
+provenance. Tuned executable reductions from v0.3.3-preview are 29.35% for the
+compiler, 93.29% for hello world, and 84.54% for the retrying-worker stand-in.
+No flag or link step was reverted. No timing result is published here.
