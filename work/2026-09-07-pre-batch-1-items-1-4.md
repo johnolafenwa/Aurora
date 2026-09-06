@@ -118,3 +118,16 @@ were removed after hashing. Timing measurements remain pending after reboot.
   generated LLM check, production docs build, 15 identity tests, 36 packaging
   tests, and repository hygiene. The fence is orchestration metadata; no
   language fixture expectation was changed.
+
+## Hosted verification
+
+- PR: https://github.com/johnolafenwa/Aura/pull/6.
+- Initial hosted CI at `9f24820` failed on both hosts in the existing scalable
+  runner test: its integer-helper mock returned empty output and expected the
+  old label. The stricter integer runner correctly requires `10000000` plus a
+  newline. This same failure was present in an earlier local log and was missed
+  when the surrounding shell command's final status was inspected.
+- Updated only that mock and its current label, preserving checksum validation.
+  All 100 benchmark-tooling tests now pass together. No language fixture or
+  runtime behavior changed. The final CI head's sizes will be reconfirmed before
+  merge; the current table was confirmed at `9f24820`.
