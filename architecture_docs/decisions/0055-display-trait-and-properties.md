@@ -1,20 +1,22 @@
 # ADR-0055: Display trait and read-only properties
 
-- Status: Proposed
+- Status: Accepted direction; detailed design pending
+- Ratified direction: 2026-09-06, user approval of the priority roadmap
 - Date: 2026-08-02
 - Version target: Aura 0.4
 - Implementation: Not started
 - Roadmap decision: Batch S1, design-only checkpoint
-- Depends on: ADR-0053
+- Parser coordination: ADR-0053; ordinary decorator execution is not a prerequisite
 - Related: ADR-0004, ADR-0013, ADR-0015, ADR-0016, ADR-0022,
   ADR-0028, ADR-0030, ADR-0033, ADR-0038, ADR-0046, and ADR-0052
 
 ## Decision boundary
 
-This ADR is a proposed language and library design. User-defined display and
-property descriptors are not implemented. The `@property` surface depends on
-the decorator parser work, and both features require separate implementation
-authorization after ratification.
+The user approved one shared Display contract and initial read-only computed
+properties. Neither feature is implemented. Property syntax may land before
+ordinary decorator execution, and Display can be implemented independently of
+properties. Remaining details in this baseline are listed at the end. See the
+[approved roadmap](../14-priority-roadmap.md).
 
 ## Context
 
@@ -43,7 +45,8 @@ with access semantics, not ordinary function rebinding.
 - parsing display text back into a value
 - a debugging/repr protocol distinct from Display
 - locale-sensitive or process-global formatting
-- mutation, I/O, or consumption through the Display receiver
+- mutation or consumption through the shared Display receiver
+- a general compiler-enforced purity/effect system
 - user implementations for foreign nominal types or builtin types
 - blanket Display implementations
 - numeric format interpretation for arbitrary custom Display values
@@ -140,9 +143,10 @@ or propagate the rendering trap; no partial string becomes observable.
 `print(value)` first renders the complete value and newline into temporary
 owned text. Only after rendering succeeds does it perform one logical output
 write. The runtime retries host-level partial writes as needed under the
-ordinary output contract. If rendering traps, `print` writes zero bytes for
-that call. If the output write itself fails, its existing I/O failure behavior
-applies after the complete text has been rendered.
+ordinary output contract. If rendering traps, the outer `print` performs no
+final output write. This does not roll back side effects performed inside
+user display code. If the output write itself fails, its existing I/O failure
+behavior applies after the complete text has been rendered.
 
 A trap from a nested Display implementation preserves its ordinary Aura call
 chain and adds the structural path being rendered, such as
@@ -218,6 +222,13 @@ their returned value has a matching callable type.
 
 ## Capability and ownership interactions
 
+The approved API convention uses properties for computed reads and explicit
+methods for mutation, I/O, and expensive work. A shared receiver enforces
+access to that receiver; it is not a proof of whole-function purity. A method
+could otherwise call an I/O function or affect separately accessible state.
+This ADR does not introduce an effect checker or claim to reject every such
+operation. Any stronger enforcement requires a separate effect contract.
+
 Display and property getters receive shared access. They may call other shared
 methods and read fields. The checker rejects mutation, moving a non-Copy field,
 passing the receiver or one of its places as `mut` or `own`, or creating a view
@@ -284,14 +295,15 @@ is syntactic; their semantics remain a dedicated checked member kind.
 ## Implementation adoption
 
 Display implementations and read-only properties are additive source features.
-Existing declarations require no rewrite. Implementation adds the single
-`Display` contract and the single compiler-defined `@property` form atomically
+Implementation adds the single `Display` contract and the single
+compiler-defined `@property` form in independently deliverable feature families
 across parsing, checking, both backends, formatting, the language server,
 reference material, examples, and tutorials.
 
 Adoption depends on coherent trait resolution, the callable and closure model,
-ADR-0053 decorator parsing, shared-receiver capability enforcement, stable
-structural rendering, cycle detection, and complete-output staging. ADR-0056
+shared decorator-shaped parsing for properties, shared-receiver capability
+enforcement, stable structural rendering, cycle detection, and complete-output
+staging. ADR-0056
 uses the property descriptor and getter declaration identity when attaching
 documentation.
 
@@ -315,7 +327,8 @@ property lookup always use matching versioned contracts.
   stack limits
 - ownership: non-Copy shared rendering, no hidden clone/move, forbidden
   mutation/capability escape, owned result cleanup, and task Transfer checks
-- output: complete staging, rendering trap writes zero bytes, host partial-write
+- output: complete staging, rendering trap prevents the outer final write,
+  no claimed rollback of user-code effects, host partial-write
   retry, output failure, concurrent print call atomicity, and cleanup paths
 - formatting: fill/alignment/width/precision/`s`, Unicode scalar counting,
   truncation-before-padding, rejected numeric flags, and once-only evaluation
@@ -332,16 +345,14 @@ property lookup always use matching versioned contracts.
 - parity: byte-identical MIR/direct rendering, diagnostics, property results,
   cleanup traces, format behavior, and forced-backend output
 
-## Ratification questions
+## Ratification and remaining design
 
-1. Ratify one local-nominal Display implementation per concrete type, stricter
-   than ordinary trait overlap selection?
-2. Ratify a shared `display(self) -> str` contract as the single dispatcher for
-   `print`, `str`, default f-strings, and recursive aggregate rendering?
-3. Ratify `<cycle Type>` for structural cycles and ordinary stack-limit
-   behavior for recursion written inside a custom Display implementation?
-4. Ratify render-before-write atomicity for each `print` call?
-5. Is the string-only explicit format subset sufficient for custom Display
-   values in the first implementation?
-6. Ratify compiler-descriptor `@property` as shared, zero-argument, read-only,
-   class-only, and unavailable in traits for the first implementation?
+Accepted on 2026-09-06: one shared Display contract for `print`, `str`, and
+f-strings; initial read-only properties; explicit methods for mutation, I/O,
+and expensive actions; and no unsupported purity guarantee from a shared
+receiver. Display and property delivery may be separated from full decorators.
+
+Remaining details include Display coherence/locality, cycle rendering, exact
+format subsets, concurrent output atomicity, property eligibility and result
+capabilities, and any future effect enforcement. The sections above retain the
+baseline for these details, with the corrected side-effect boundary.

@@ -1,5 +1,10 @@
 # ADR-0026: Minimal tuples
 
+> Approved next extension (2026-09-06): [ADR-0063](0063-everyday-syntax-and-pattern-ergonomics.md)
+> records tuple trailing-comma consistency and richer unpacking/rest patterns.
+> Source ownership and grouping distinctions remain requirements; the new
+> forms are not yet implemented.
+
 - Status: Accepted
 - Date: 2026-07-24
 - Amended: 2026-07-26 (B3.0-c structural tuple equality and inequality)

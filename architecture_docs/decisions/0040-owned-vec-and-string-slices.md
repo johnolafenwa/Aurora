@@ -1,5 +1,9 @@
 # ADR-0040: Owned Vec and String slices
 
+> Approved next extension (2026-09-06): [ADR-0061](0061-collection-element-loans-and-slice-views.md)
+> adds slice views with explicit lifetime rules. Existing owned slices remain
+> copies; this approval does not silently change them into aliases.
+
 - Status: Accepted
 - Date: 2026-07-31
 - Roadmap decision: Batch 6, Phase 7.2

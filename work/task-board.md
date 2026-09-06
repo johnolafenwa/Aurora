@@ -1,6 +1,18 @@
 # Task Board
 
-Last updated: 2026-08-19
+Last updated: 2026-09-06
+
+## Approved roadmap ADR reconciliation (complete)
+
+- Authorized scope: update design records to reflect the user's approved
+  roadmap decisions; no compiler/runtime implementation or release changes.
+- Updated ADR-0052–0056 and added ADR-0058–0063 for the previously unrecorded
+  callable, initialization, context-manager, collection-loan, schema, and
+  everyday-syntax directions. Related historical ADRs link to future extensions.
+- Verification: 29 documents and 97 relative links/anchors checked; index,
+  future-implementation status, fences, whitespace, and superseded wording
+  checks pass. Detailed feature design and implementation remain future work.
+- Work note: `work/2026-09-06-approved-roadmap-adrs.md`.
 
 ## ADR-0038 loans and views (complete)
 

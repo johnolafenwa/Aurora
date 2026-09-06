@@ -1,5 +1,11 @@
 # ADR-0051: Import aliases and keyword-only parameter disposition
 
+> Approved next extensions (2026-09-06): [ADR-0058](0058-first-class-callables-and-binding-contracts.md)
+> accepts keyword-only callability with preserved binding metadata, resolving
+> the direction of the deferral below. [ADR-0063](0063-everyday-syntax-and-pattern-ergonomics.md)
+> records parenthesized imports and trailing commas. Their detailed designs and
+> implementation remain pending; current import/call behavior is unchanged.
+
 - Status: Accepted
 - Date: 2026-08-02
 - Roadmap decision: Batch S1, S4.7

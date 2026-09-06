@@ -1,5 +1,9 @@
 # ADR-0013: Callable sequencing and ownership
 
+> Approved next extension (2026-09-06): [ADR-0058](0058-first-class-callables-and-binding-contracts.md)
+> records general stored closures, bound methods, call capabilities, and binding
+> metadata. This is future work beyond the implemented stages below.
+
 - Status: Accepted
 - Date: 2026-07-13
 - Roadmap decision: D13

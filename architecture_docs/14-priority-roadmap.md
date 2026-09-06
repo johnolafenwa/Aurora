@@ -15,12 +15,13 @@ These are existing foundations. Collection-element loans remain future work.
 Classes already have field-based constructors and per-instance defaults;
 `with` already manages builtin resources and eligible non-generic user classes.
 
-The five ADRs awaiting corresponding amendments are 0052 (unions), 0053 (decorators), 0054
+The five amended ADRs are 0052 (unions), 0053 (decorators), 0054
 (generators/iteration), 0055 (Display/properties), and 0056 (docstrings).
-The batches below cover all five and the missing designs identified around
-them. The approved decisions below govern this roadmap and supersede conflicting
-proposals in those ADRs. Carry them into the detailed ADRs before implementation;
-do not reopen settled choices. Exact syntax, representations, and unresolved
+ADRs 0058–0063 now record callables, initialization, context managers,
+collection loans, typed schemas, and everyday syntax. The batches below cover
+all of them. The approved decisions below are reflected in those records and
+supersede conflicting earlier proposals. Do not reopen settled choices.
+Exact syntax, representations, and unresolved
 contracts still need design. Approval records intended behavior, not implementation
 completion. See the [ADR index](decisions/README.md).
 

@@ -9,6 +9,15 @@ does not by itself claim that the implementation is complete. `Provisional`
 and `Proposed` decisions are not binding until ratified. Each ADR names the
 test locations that must prove completion.
 
+`Accepted direction; detailed design pending` records user-approved behavior
+without treating every retained design detail as ratified. Each such ADR lists
+its remaining questions and implementation status. The 2026-09-06
+[roadmap decisions](../14-priority-roadmap.md#approved-decisions) are recorded
+in ADR-0052 through ADR-0063 where relevant. Historical accepted ADRs retain
+their implemented contracts and link to future extensions; future approval
+does not change the current Manual or compiler. In particular, the global
+`Option[T]` replacement belongs to ADR-0052's later implementation family.
+
 1. [ADR-0001: Contextual `None` and `Option` equality](0001-contextual-none-and-option-equality.md)
 2. [ADR-0002: Integer division and modulo](0002-integer-division-and-modulo.md)
 3. [ADR-0003: Default integer type](0003-default-integer-type.md)
@@ -57,12 +66,18 @@ test locations that must prove completion.
 46. [ADR-0046: String literal forms and f-string format specifications](0046-string-literals-and-format-specifications.md) — Accepted for Aura 0.3 in Batch S1
 47. [ADR-0047: Integer literal bases, bitwise operators, and shifts](0047-integer-literals-bitwise-and-shifts.md) — Accepted for Aura 0.3 in Batch S1
 48. [ADR-0048: Power, rounding, divmod, and the math module](0048-power-round-divmod-and-math.md) — Accepted for Aura 0.3 in Batch S1
-49. [ADR-0049: Match guards and or-patterns](0049-match-guards-and-or-patterns.md) — Accepted for Aura 0.3; class patterns formally deferred to a future dedicated ADR
+49. [ADR-0049: Match guards and or-patterns](0049-match-guards-and-or-patterns.md) — Accepted for Aura 0.3; future class-pattern direction recorded in ADR-0063
 50. [ADR-0050: Module-level constants and deterministic initialization](0050-module-level-constants.md) — Accepted for Aura 0.3 in Batch S1
-51. [ADR-0051: Import aliases and keyword-only parameter disposition](0051-import-aliases-and-keyword-only-parameters.md) — Accepted for Aura 0.3 in Batch S1
-52. [ADR-0052: Anonymous closed union types](0052-anonymous-closed-union-types.md) — Proposed design
-53. [ADR-0053: Function decorators](0053-function-decorators.md) — Proposed design
-54. [ADR-0054: Generators and the iterator protocol](0054-generators-and-iterator-protocol.md) — Proposed design
-55. [ADR-0055: Display trait and read-only properties](0055-display-trait-and-properties.md) — Proposed design
-56. [ADR-0056: Docstrings and documentation metadata](0056-docstrings-and-documentation-metadata.md) — Proposed design
+51. [ADR-0051: Import aliases and keyword-only parameter disposition](0051-import-aliases-and-keyword-only-parameters.md) — Accepted for Aura 0.3; future call metadata in ADR-0058 and import polish in ADR-0063
+52. [ADR-0052: Anonymous closed union types](0052-anonymous-closed-union-types.md) — Accepted direction; explicit unions, optional replacement, aliases, and narrowing; detailed design pending
+53. [ADR-0053: Function decorators](0053-function-decorators.md) — Accepted direction; full callable preservation and explicit retry ownership; detailed design pending
+54. [ADR-0054: Generators and the iterator protocol](0054-generators-and-iterator-protocol.md) — Accepted direction; distinct item/end, persistent failure, close, and initial pinned frames; detailed design pending
+55. [ADR-0055: Display trait and read-only properties](0055-display-trait-and-properties.md) — Accepted direction; independent delivery and explicit effect boundary; detailed design pending
+56. [ADR-0056: Docstrings and documentation metadata](0056-docstrings-and-documentation-metadata.md) — Accepted direction; normalized presentation and field/parameter metadata; detailed design pending
 57. [ADR-0057: Clean-slate pre-adoption policy](0057-clean-slate-pre-adoption-policy.md) — Accepted as the standing pre-adoption policy
+58. [ADR-0058: First-class callables and binding contracts](0058-first-class-callables-and-binding-contracts.md) — Accepted direction; closures, bound methods, call kinds, and keyword-only metadata; detailed design pending
+59. [ADR-0059: Custom initialization and fallible factories](0059-custom-initialization.md) — Accepted direction; `__init__`, definite initialization, and named fallible factories; detailed design pending
+60. [ADR-0060: Typed context managers and cleanup](0060-typed-context-managers.md) — Accepted direction; generic/multiple managers, typed entry/exit, and failure precedence; detailed design pending
+61. [ADR-0061: Collection-element loans and slice views](0061-collection-element-loans-and-slice-views.md) — Accepted direction; contextual access, explicit owned reads, and invalidation checks; detailed design pending
+62. [ADR-0062: Typed serialization, validation, and schemas](0062-typed-serialization-validation-and-schemas.md) — Accepted direction; compile-time opt-in and shared metadata; detailed design pending
+63. [ADR-0063: Everyday syntax and pattern ergonomics](0063-everyday-syntax-and-pattern-ergonomics.md) — Accepted roadmap direction; syntax/pattern/API details pending

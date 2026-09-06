@@ -1,5 +1,9 @@
 # ADR-0049: Match guards and or-patterns
 
+> Roadmap disposition (2026-09-06): [ADR-0063](0063-everyday-syntax-and-pattern-ergonomics.md)
+> now records the approved class-pattern workstream. Detailed pattern syntax,
+> ownership, and visibility remain pending; class patterns are not implemented.
+
 - Status: Accepted; class patterns deferred
 - Date: 2026-08-02
 - Accepted at: Batch S1 checkpoint, class-pattern deferment recorded 2026-08-15
@@ -233,6 +237,6 @@ to implement a particular class-pattern spelling or representation model.
 Guards, or-patterns, and top-level catch-all binding patterns are accepted and
 implemented as Aura 0.3's pattern-polish surface. Parser, checker, decision
 tree, both backends, diagnostics, reference, examples, and tooling land
-together. Class patterns remain unimplemented and are formally deferred until
-a future dedicated ADR defines and ratifies match exposure, field visibility,
-property evaluation, ownership, mutation, and exhaustiveness behavior.
+together. Class patterns remain unimplemented. The 2026-09-06 roadmap approval
+and ADR-0063 schedule that direction; detailed match exposure, field visibility,
+property evaluation, ownership, mutation, and exhaustiveness still need design.

@@ -1,5 +1,9 @@
 # ADR-0025: Newline continuation and delimited layout
 
+> Approved next extension (2026-09-06): [ADR-0063](0063-everyday-syntax-and-pattern-ergonomics.md)
+> records consistent trailing commas and parenthesized imports. Detailed
+> grammar must preserve grouping, indentation, and evaluation rules.
+
 - Status: Accepted
 - Date: 2026-07-24
 - Roadmap decision: Phase 3.5 newline continuation

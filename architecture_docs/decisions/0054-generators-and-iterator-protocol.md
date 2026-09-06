@@ -1,6 +1,7 @@
 # ADR-0054: Generators and the iterator protocol
 
-- Status: Proposed
+- Status: Accepted direction; detailed design pending
+- Ratified direction: 2026-09-06, user approval of the priority roadmap
 - Date: 2026-08-02
 - Version target: Aura 0.4
 - Implementation: Not started
@@ -10,10 +11,15 @@
 
 ## Decision boundary
 
-This ADR is a proposed language and runtime design. `yield`, `Generator[T]`,
-`Iterator[T]`, `IntoIterator[T]`, and protocol-based loop selection are not
-implemented. Implementation requires separate authorization and a ratified
-answer to the questions at the end.
+The user approved lazy generators, a distinct item/end protocol, associated
+types, explicit idempotent close, early-exit cleanup, persistent failure state,
+and initially pinned frames. These features are not implemented. Remaining
+details are listed at the end; other sections retain their design baseline.
+See the [approved roadmap](../14-priority-roadmap.md).
+
+`Step[T]`, `Item(value)`, and `End` below are design notation for a tagged
+advancement result. Their source names and exact signatures remain to be
+specified. The separation of an item from termination is binding.
 
 ## Context
 
@@ -54,12 +60,12 @@ A function whose declared result is `Generator[T]` is a generator function and
 may contain `yield` statements:
 
 ```aura
-def read_pages(client: own Client, first: str) -> Generator[Page]:
+def read_pages(client: own Client, first: own str) -> Generator[Page]:
     mut cursor = first
     while cursor != "":
         page = client.fetch(cursor)
         cursor = page.next_cursor.clone()
-        yield own page
+        yield page
 ```
 
 `Generator[T]` requires one complete owned element type `T`. The body may use
@@ -99,11 +105,16 @@ shared non-Copy value must be converted to an independently owned value by an
 operation already valid for its type. No hidden clone occurs.
 
 After bare return or body fallthrough, the generator is exhausted. Every
-subsequent `next` returns `None` without resuming the frame. A trap propagates
-to the caller of `next`, unwinds the generator frame exactly once, marks it
-closed, and makes later `next` calls return `None`. Cancellation follows the
-same cleanup path and retains its ordinary cancellation result at the
-resumption boundary.
+subsequent `next` returns `End` without resuming the frame. Yielding `None`
+produces `Item(None)` and does not exhaust it. This distinction also applies
+when the element type is optional or itself an advancement-result type.
+
+A trap propagates to the caller of `next`, unwinds the generator frame exactly
+once, and leaves a failed state. Later advancement must still report failure;
+it cannot turn the original failure into ordinary exhaustion. The exact
+diagnostic retention/re-reporting API remains to be designed. Cancellation
+runs the same exact-once cleanup machinery and preserves its cancellation
+outcome; its subsequent-observation contract is part of the remaining design.
 
 Dropping or explicitly closing a suspended generator unwinds every active
 `with` resource and owned local in reverse nesting order exactly once. The
@@ -118,10 +129,15 @@ the generator is actively executing is rejected as an overlapping mutable
 access. Cleanup code may not yield; a yield attempted while unwinding is a
 runtime fault contained at the generator boundary.
 
+Closing a failed generator cannot clear its failure or run cleanup a second
+time. A cleanup failure cannot replace an existing body failure; preserve it
+as additional information under the resource-management direction in ADR-0060.
+
 ## Generator value properties
 
-`Generator[T]` is always non-Copy, non-cloneable, and non-Transfer, regardless
-of `T` or the captured frame values. Assignment moves it. It may live and move
+In the initial pinned-frame design, `Generator[T]` is non-Copy, non-cloneable,
+and non-Transfer, regardless of `T` or captured frame values. Assignment moves
+it. It may live and move
 within one task, but its first resume pins it to that task's current worker for
 the rest of its lifetime. A later resume from another task or worker is
 statically rejected when visible and defensively rejected by the runtime.
@@ -136,20 +152,32 @@ A generator cannot cross a task start, task result, Queue payload, supervisor,
 detached-work, module-state, or FFI boundary. A containing aggregate is also
 non-Transfer by the ordinary structural path rule.
 
+These transfer limits describe the initial frame model. They do not decide
+that future generators must remain permanently worker-affine. Scheduler work
+must either preserve the affinity of tasks holding live frames or establish
+a safe joint-migration contract before enabling migration for those tasks.
+
 ## Iterator protocol
 
 The protocol has one item type and one mutation-based advance operation:
 
 ```aura
 trait Iterator[T]:
-    def next(mut self) -> T | None
+    def next(mut self) -> Step[T]
 ```
 
-`next` mutates the iterator state and returns one owned `T`, or `None` after
-exhaustion. Implementations must remain exhausted: once `next` returns `None`,
-later calls also return `None`. A trap may close the iterator; it cannot be
-translated to end-of-iteration unless the implementation handles the failure
-before returning.
+`next` mutates iterator state and returns `Item(value)` containing one owned
+`T`, or payload-free `End`. Implementations remain exhausted after `End`.
+The tag remains distinct from every possible item, including `None` and a
+nested `End` value. This is a tagged sum, not an alias of `T | None`.
+Failed generators preserve failure as specified above.
+
+Recoverable stream errors need a detailed policy: for example, whether a
+fallible advance returns a typed result, or errors appear as explicitly typed
+items, and whether advancement may continue after such an error. No failure
+may silently become `End`. The spelling and behavior of fallible iteration
+remain unresolved; ordinary `Result` propagation is not automatically added
+to `for` by this ADR.
 
 `Generator[T]` has a compiler-provided `Iterator[T]` implementation. Its
 `next` is the resumption operation above.
@@ -171,10 +199,11 @@ specialization. Overlapping implementations use the ordinary unique-most-
 specific rule.
 
 `into_iter` consumes the source and returns an owned iterator. A type that
-offers shared iteration can expose an ordinary `iter(self) -> Generator[T]`
-method whose returned generator owns any required snapshot or whose frame uses
-an authorized in-loan relation. The first protocol implementation does not
-infer a hidden shared capability.
+offers shared iteration can expose an ordinary method returning an owned
+iterator or a generator with an explicitly created owned snapshot. Borrowing
+iterators need the detailed collection-loan and callable lifetime contracts in
+ADR-0061 and ADR-0058; this first generator model does not retain a caller loan
+across yield or infer a hidden shared capability.
 
 ## Loop and comprehension integration
 
@@ -182,8 +211,8 @@ For a `Generator[T]` expression, bare iteration moves the generator into a
 hidden mutable loop-local and repeatedly calls `Iterator.next(mut iterator)`:
 
 ```aura
-for item in read_pages(own client, first):
-    consume(own item)
+for item in read_pages(client, first):
+    consume(item)
 ```
 
 A named non-Copy generator is consumed by the loop and cannot be used
@@ -192,7 +221,8 @@ the hidden iterator and run its cleanup exactly once. Exhaustion also closes
 it. `continue` keeps the iterator alive and requests the next item.
 
 For another source with a unique `IntoIterator[T]` implementation, bare
-iteration calls `into_iter(own source)` once, stores its concrete `Iter`, and
+iteration calls `source.into_iter()` once, consuming the source through its
+owning receiver, stores its concrete `Iter`, and
 then follows the same `next` loop. The source expression is evaluated once.
 Protocol selection and associated-type resolution happen statically; no
 runtime trait object is created.
@@ -238,9 +268,13 @@ unfused generator already retains only its live frame plus the current item.
 ## Backend contract
 
 MIR and direct execution use one logical generator state machine: new,
-suspended, running, exhausted, or closed. A resume transitions suspended to
-running, and only yield transitions running back to suspended. Recursive or
+suspended, running, exhausted, closed, or failed. A resume transitions
+suspended to running, and only yield transitions running back to suspended. Recursive or
 concurrent resume while running is a runtime fault.
+
+Failed state retains its failure independently of whether frame storage has
+already been reclaimed. Repeated advancement must not resume freed storage,
+repeat cleanup, or report `End` in place of that failure.
 
 The implementation may reuse the stackful task substrate, but a generator is
 not scheduled independently. It runs synchronously inside `next` until yield,
@@ -295,7 +329,8 @@ one generator declaration/yield surface and one protocol contract.
 
 Adoption depends on the stackful coroutine runtime, worker-affine cleanup,
 callable capability analysis, associated-type support for `IntoIterator.Iter`,
-exhaustive `T | None` handling from ADR-0052, and the current loop and
+tagged advancement results that remain distinct from ADR-0052 optional items,
+and the current loop and
 comprehension lowering. Fusion remains an optimization over the same protocol
 semantics and cannot precede the unfused correctness path.
 
@@ -318,12 +353,16 @@ invalidated and rebuilt under the new versions.
   loops/matches/resources, and exact item order
 - ownership: Copy yields, non-Copy moves, shared-source rejection, moved
   generator use, active-item cleanup, and nested aggregate paths
-- termination: fallthrough, bare return, repeated `None`, explicit close,
+- termination: fallthrough, bare return, repeated `End`, explicit close,
   drop, break, continue, caller return, propagated error, trap, and cancellation
+- item identity: `Item(None)` versus `End`, optional and nested tagged items,
+  and correct exhaustion after a yielded `None`
+- failure persistence: advance after trap, close after failure, repeated
+  close/advance, cleanup failure precedence, and exact-once frame destruction
 - resources: reverse-order exact-once cleanup from every suspension point,
   failed cleanup, close idempotence, and yield-during-cleanup rejection
-- properties: Generator is always non-Copy, non-cloneable, non-Transfer, and
-  worker-affine for every `T`
+- properties: initial Generator frames are non-Copy, non-cloneable,
+  non-Transfer, and worker-affine for every `T`
 - protocol: direct Generator iteration, user `Iterator`, `IntoIterator` with
   concrete associated type, overlap/ambiguity, exhaustion stability, and
   missing implementation diagnostics
@@ -341,19 +380,16 @@ invalidated and rebuilt under the new versions.
 - parity: byte-identical MIR/direct results, diagnostics, cleanup traces, and
   forced-backend execution for every runtime row
 
-## Ratification questions
+## Ratification and remaining design
 
-1. Ratify lazy call semantics with eager argument capture and no body execution
-   before the first `next`?
-2. Ratify owned yields, bare-return-only completion, and the exclusion of
-   `send`, `yield from`, and generator return values?
-3. Ratify Generator as unconditionally non-Copy, non-cloneable, non-Transfer,
-   and worker-affine?
-4. Ratify `Iterator.next(mut self) -> T | None` and the minimal associated
-   `IntoIterator.Iter` type dependency?
-5. Ratify consuming bare protocol iteration while builtin place iteration and
-   Queue receive iteration retain their specialized contracts?
-6. Should a trap permanently close the generator and make later `next` return
-   `None`, or should every later access report the original failure state?
-7. Is explicit idempotent `close(mut self)` part of the first surface, or is
-   deterministic drop sufficient?
+Accepted on 2026-09-06: lazy generators; owned items distinct from termination,
+including `None` items; one coherent associated-type iterator model; explicit
+idempotent close; early-exit cleanup; persistent failure; and initially pinned
+live frames. The old optional-result exhaustion and failure-to-exhaustion
+proposals are superseded.
+
+Remaining details include the source name/layout of `Step[T]`, recoverable
+stream errors, repeated-failure diagnostics, cancellation observation,
+associated-type syntax/resolution, exact loop-consumption policy, yield/input
+restrictions, and scheduler migration integration. The initial non-Transfer
+model must not become an accidental permanent restriction on future designs.

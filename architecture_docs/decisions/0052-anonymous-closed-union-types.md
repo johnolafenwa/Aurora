@@ -1,6 +1,7 @@
 # ADR-0052: Anonymous closed union types
 
-- Status: Proposed
+- Status: Accepted direction; detailed design pending
+- Ratified direction: 2026-09-06, user approval of the priority roadmap
 - Date: 2026-08-02
 - Version target: Aura 0.4
 - Implementation: Not started
@@ -10,9 +11,11 @@
 
 ## Decision boundary
 
-This ADR is a proposed language design. It defines no implemented grammar,
-typing, matching, ownership, ABI, or editor behavior. Implementation requires
-separate authorization after the open questions at the end are ratified.
+The user approved explicit closed unions, replacement of `Option[T]` by
+`T | None`, type aliases, safe narrowing, and deterministic normalization.
+These features are not implemented. The ratification section distinguishes
+settled behavior from remaining details; the other sections retain the design
+baseline for those details. See the [approved roadmap](../14-priority-roadmap.md).
 
 ## Context
 
@@ -71,8 +74,11 @@ int64 | str == str | int64
 The canonical key includes the fully resolved module-qualified nominal name
 and canonical generic arguments. It is used for interface serialization,
 diagnostics, runtime tag assignment, native cache identity, and backend parity.
-Aliases, when the language gains general type aliases, are expanded before
-normalization.
+General type aliases are part of the approved type-foundation batch. Expand
+aliases before normalization; aliases name an existing type and add no runtime
+wrapper or new nominal identity. Alias declaration syntax, generic aliases,
+visibility, cycle rejection, and imported diagnostic spelling still need a
+detailed contract before implementation.
 
 A member may be any complete owned value type except another union after
 flattening, a view type, an unspecialized generic, or an FFI-only opaque view.
@@ -92,6 +98,12 @@ duplicate is removed. `None | None` is rejected as a redundant union.
 This choice gives absence the same narrowing, ownership, exhaustiveness, and
 generic-composition rules as every other closed union. One spelling also keeps
 API signatures, hover text, generated documentation, and diagnostics stable.
+
+Flattening cannot represent both absence and a present payload that is itself
+`None`. Such APIs use distinct tagged cases. In particular, ADR-0054 uses
+`Item(value)` and `End` for iterator advancement; a yielded `None` is an item.
+The replacement must audit nested optional uses and lookup APIs carrying
+optional payloads, preserving their observable distinctions with tagged cases.
 
 ## Explicit injection and inference
 
@@ -163,6 +175,11 @@ types, even when every member is individually orderable.
 
 ## Type patterns and exhaustiveness
 
+Straightforward optional-value checks must narrow access to the corresponding
+member safely. Exact condition syntax, stable-place eligibility, mutation
+invalidation, and branch-join rules remain to be specified. Such narrowing
+does not grant an ownership capability absent from the source place.
+
 `match` narrows a union with type patterns:
 
 ```aura
@@ -220,10 +237,11 @@ implementation. The compiler does not expose a user-written implementation
 for an anonymous union and does not use a common member name as implicit duck
 typing.
 
-Views and returned-view origins cannot be union members. A place containing an
-owned union may itself be viewed under the place-loan rules once that feature
-exists, and narrowing the viewed union creates a contained projection whose
-lifetime cannot outlive the parent view.
+Views and returned-view origins cannot be union members in this baseline.
+ADR-0038 already implements place loans. Union narrowing must integrate with
+that model so a contained projection cannot outlive its parent view. No union
+syntax may bypass the lifetime requirements of future callable storage in
+ADR-0058 or collection loans in ADR-0061.
 
 ## Backend and interface contract
 
@@ -270,12 +288,18 @@ for a closed sum.
 
 ## Implementation adoption
 
-If ratified, the union system lands as one atomic clean-slate feature family.
+The approved union system lands as one atomic clean-slate feature family once
+its remaining details are settled.
 `T | None` is the sole optional type spelling and `None` is its sole absence
 value. Parsing, normalization, type patterns, exhaustive matching,
 checked-interface support, both backends, compiler fixtures, examples,
 tutorials, generated reference material, editor tooling, and package tests all
 adopt that one surface together.
+
+Remove `Option[T]` and its constructors from the maintained language and library
+surface in that implementation family, including APIs and fixtures. There is no
+compatibility alias, parser support, or migration-specific diagnostic mode for
+the retired spelling. Historical records may still describe the old contract.
 
 This adoption requires the union normalizer, stable runtime tags, type-pattern
 exhaustiveness, ownership/property derivation, and checked-interface encoding
@@ -292,7 +316,10 @@ the version change.
 - normalization: recursive flattening, duplicate removal, source-order
   independence, deterministic qualified-name order, and one-member rejection
 - optional typing: sole `T | None` spelling, `None` placement, nested optional
-  normalization, and unconstrained `None` rejection
+  normalization, unconstrained `None` rejection, narrowing invalidation, and
+  distinct present-`None`/absent outcomes where the API needs both
+- aliases: expansion, equality with the named type, imports, generic policy,
+  cycle diagnostics, and normalized union identity
 - injection: every explicit expected-type position, one-time evaluation,
   unmatched and ambiguous members, and exact preservation through flow joins
 - no inference: mixed literals, branches, returns, generic inference, and
@@ -315,17 +342,15 @@ the version change.
 - parity: byte-identical MIR/direct results and diagnostics across the entire
   matrix, plus forced-backend fixtures and release archive smoke tests
 
-## Ratification questions
+## Ratification and remaining design
 
-1. Ratify `T | None` as the sole optional spelling, with no named alias?
-2. Ratify deterministic normalization as flatten, deduplicate, and canonical
-   type-key sort, including source-order-independent runtime tags?
-3. Ratify exclusion of a union cast from the first implementation, leaving
-   annotations, parameters, returns, and explicit generic arguments as the
-   injection boundaries?
-4. Ratify exact-member type patterns only, with no trait or class-hierarchy
-   pattern semantics?
-5. Ratify the all-members derivation rule for Copy, clone, Transfer, equality,
-   and hash, and the unconditional exclusion of ordering and C FFI?
-6. Is rejecting one-member normalized unions preferable to accepting them as
-   redundant but well-formed annotations?
+Accepted on 2026-09-06: explicitly typed mixed collections with a fixed member
+set, homogeneous literal inference, `T | None` as the sole optional surface,
+safe narrowing, type aliases, deterministic normalization, and static rejection
+of unsupported operations. Mixed-literal union inference is deferred.
+
+Remaining details are alias syntax and generic/recursive policy; conditional
+narrowing and invalidation; one-member normalization; exact injection/type-pattern
+rules; derived operations and FFI boundaries; and physical layout/ABI choices.
+The corresponding sections above are the design baseline for these details,
+not a claim that the user individually ratified every original proposal.

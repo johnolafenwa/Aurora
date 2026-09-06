@@ -1,5 +1,9 @@
 # ADR-0039: Comprehensions
 
+> Approved next integration (2026-09-06): [ADR-0054](0054-generators-and-iterator-protocol.md)
+> adds protocol-based sources with distinct item/end results. Existing eager
+> comprehension evaluation and cleanup remain the implemented baseline.
+
 - Status: Accepted
 - Date: 2026-07-31
 - Roadmap decision: Batch 6, Phase 7.1

@@ -1,6 +1,7 @@
 # ADR-0053: Function decorators
 
-- Status: Proposed
+- Status: Accepted direction; detailed design pending
+- Ratified direction: 2026-09-06, user approval of the priority roadmap
 - Date: 2026-08-02
 - Version target: Aura 0.4
 - Implementation: Not started
@@ -10,9 +11,11 @@
 
 ## Decision boundary
 
-This ADR is a proposed language design. Decorator syntax and its binding,
-typing, initialization, ownership, and editor behavior are not implemented.
-Implementation requires separate authorization after ratification.
+The user approved free-function decorators, repeatable wrappers, complete
+callable-contract preservation, and explicit retry ownership. Implementation
+has not started. ADR-0058 supplies the callable foundation deferred by ADR-0051.
+The ratification section identifies remaining details in the design baseline.
+See the [approved roadmap](../14-priority-roadmap.md).
 
 ## Context
 
@@ -125,6 +128,12 @@ including:
 - error/result structure and returned-view contract, if that combination is
   separately authorized
 
+`F` is a design-level contract here. The current written `def(...)` type does
+not yet encode every item in this list. ADR-0058 must define a representation
+that preserves these properties across stored and passed callable values before
+decorators rely on them. A wrapper cannot erase a keyword-only restriction or
+lose defaults through a narrower capture-free function-pointer representation.
+
 Every decorator expression must resolve to an exact transformation
 `def(F) -> F`. This notation is a compiler rule over one concrete `F`; it does
 not introduce higher-kinded types or source-level signature variables.
@@ -159,8 +168,9 @@ also be repeatable. A decorator may return a capturing closure when:
 - cleanup of its owned environment is defined for module shutdown and failed
   initialization
 
-This compiler-known decorated binding retains the closure environment and
-repeatability metadata. It is not erased to a capture-free pointer. A
+The decorated binding uses ADR-0058's general callable model to retain its
+closure environment and repeatability metadata through storage, arguments, and
+returns. It is not erased to a capture-free pointer. A
 single-use result, a closure that consumes a non-Copy capture, or a mutable
 capture is rejected at the decorator site.
 
@@ -184,7 +194,8 @@ type is not the same as a free structural function transformation.
 `@property` is a separate compiler-recognized descriptor specified by
 ADR-0055. It uses the decorator-shaped parser surface but does not evaluate a
 name called `property`, apply `def(F) -> F`, or rebind the method to an ordinary
-function value. No other compiler-special decorator exists in this design.
+function value. Its parser support may land before ordinary decorator
+execution. No other compiler-special decorator exists in this design.
 
 ## Agent-facing patterns
 
@@ -200,7 +211,7 @@ def health(request: Request) -> Response:
     ...
 
 @retry(attempts = 3)
-def call_model(request: own ModelRequest) -> Result[ModelReply, ModelError]:
+def call_model(request: ModelRequest) -> Result[ModelReply, ModelError]:
     ...
 ```
 
@@ -209,6 +220,16 @@ register metadata when its decorator expression is evaluated or may return a
 wrapper. Such effects happen under the module initialization order and the
 exact signature rule. A registration API must define duplicate registration,
 failure, task safety, and global-state policy independently.
+
+### Retry ownership
+
+Repeatability of a wrapper does not make an owned argument reusable within one
+invocation. After the wrapped call consumes `own Request`, a retry must obtain
+a fresh request through an explicit clone or reconstruction policy. Alternatively,
+the operation may take shared input when that matches its semantics. The
+compiler and library cannot silently duplicate a resource or reuse a moved value.
+Retry-policy API syntax and cloning/reconstruction capabilities are detailed
+library design work; a retry count alone is insufficient for consumed input.
 
 ## Backend and interface contract
 
@@ -263,7 +284,7 @@ need no rewrite. The parser, formatter, semantic model, module initializer,
 MIR, direct backend, language server, reference, examples, and tutorials adopt
 the `@expression` surface in one coordinated family.
 
-Adoption depends on the implemented function-value and closure model, exact
+Adoption depends on ADR-0058's implemented general callable model, exact
 callable signatures, repeatability and Transfer analysis, deterministic module
 initialization, and checked cross-module bindings. It also supplies the syntax
 dependency used by ADR-0055 properties and the metadata association required
@@ -290,6 +311,10 @@ artifacts are invalidated and rebuilt under the new versions.
   results
 - closures: repeatable capture-free results, repeatable capturing results,
   Copy and non-Copy environments, mutable-capture rejection, and destruction
+- retry: shared-input repetition, explicitly cloned/reconstructed consumed
+  input, moved-input rejection, and cleanup on failed request reconstruction
+- storage: decorated callbacks retain defaults, argument names, keyword-only
+  restrictions, environments, capabilities, and lifetime/Transfer checks
 - recursion: direct, mutual, and decorator-wrapper recursion all resolve the
   final initialized bindings; early observation is rejected
 - ownership and Transfer: copied named functions, moved intermediates,
@@ -303,15 +328,15 @@ artifacts are invalidated and rebuilt under the new versions.
 - parity: byte-identical MIR/direct output, diagnostics, initialization, trap
   cleanup, recursion, and forced-backend results
 
-## Ratification questions
+## Ratification and remaining design
 
-1. Ratify top-down decorator-expression evaluation and bottom-up application?
-2. Ratify exact concrete `def(F) -> F` preservation, including parameter
-   names, keyword-only positions, defaults, and capabilities?
-3. Ratify repeatable capturing results while excluding every consuming
-   decorator callable and consuming result?
-4. Ratify recursion through the final decorated module binding?
-5. Should ordinary method decoration remain outside the first implementation,
-   with only the compiler-defined property descriptor permitted on a method?
-6. Should checked interfaces expose decorator provenance for documentation,
-   or only the final binding contract as proposed here?
+Accepted on 2026-09-06: preserve the complete callable contract; begin with free
+functions and repeatable wrappers; defer ordinary method decoration until
+receiver binding is settled; retain source documentation after decoration;
+and require explicit ownership policies for consumed retry input.
+
+Remaining details include decorator expression/application order, recursive
+binding initialization, generic specialization limits, decorator provenance,
+and the retry library API. The original order and recursion rules above remain
+the proposed baseline. Callable representation and binding metadata are owned
+by ADR-0058; registration/schema behavior belongs to ADR-0062.

@@ -1,5 +1,10 @@
 # ADR-0016: Retained non-copy expression borrows
 
+> Approved next extension (2026-09-06): [ADR-0061](0061-collection-element-loans-and-slice-views.md)
+> generalizes contextual element access and must preserve this ADR's sibling
+> evaluation and conflict rules. Collection loans are not implemented by this
+> historical decision alone.
+
 - Status: Accepted
 - Date: 2026-07-14
 - Reference gap: later sibling mutation while an earlier non-copy place remains selected

@@ -1,5 +1,10 @@
 # ADR-0005: Method receivers
 
+> Approved next extensions (2026-09-06): [ADR-0058](0058-first-class-callables-and-binding-contracts.md)
+> defines stored bound-method direction; [ADR-0059](0059-custom-initialization.md)
+> records initializer-specific `self`. Ordinary implemented receiver semantics
+> below remain unchanged.
+
 - Status: Accepted
 - Date: 2026-07-13
 - Roadmap decision: D5

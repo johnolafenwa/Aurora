@@ -1,5 +1,10 @@
 # ADR-0001: Contextual `None` and `Option` equality
 
+> Future design amendment (2026-09-06): [ADR-0052](0052-anonymous-closed-union-types.md)
+> approves replacing `Option[T]` with `T | None`, without compatibility support.
+> The contract below remains the implemented baseline until that migration;
+> APIs distinguishing present-`None` from absence need distinct tagged cases.
+
 - Status: Accepted
 - Date: 2026-07-13
 - Roadmap decision: D1

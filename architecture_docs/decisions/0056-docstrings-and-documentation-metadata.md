@@ -1,6 +1,7 @@
 # ADR-0056: Docstrings and documentation metadata
 
-- Status: Proposed
+- Status: Accepted direction; detailed design pending
+- Ratified direction: 2026-09-06, user approval of the priority roadmap
 - Date: 2026-08-02
 - Version target: Aura 0.4
 - Implementation: Not started
@@ -9,10 +10,12 @@
 
 ## Decision boundary
 
-This ADR is a proposed compiler, interface, and language-server design.
-Docstring recognition, metadata serialization, hover presentation, and API-doc
-inputs are not implemented. Implementation requires separate authorization
-after ratification.
+The user approved Markdown docstrings, editor/generated-doc presentation with
+readable indentation normalization, documentation retained through decoration,
+and field/parameter metadata. Implementation has not started. ADR-0062 owns
+typed schema/validation behavior; documentation itself does not enable a codec.
+Remaining detailed choices are listed at the end. See the
+[approved roadmap](../14-priority-roadmap.md).
 
 ## Context
 
@@ -35,6 +38,8 @@ how size limits protect compiler and editor memory.
 - give future API-documentation tooling one stable metadata source
 - keep docstrings out of runtime evaluation and MIR
 - retain documentation through function decoration and property lowering
+- associate field and parameter metadata with stable declaration identities
+- normalize source indentation for readable hover and generated documentation
 
 ## Non-goals
 
@@ -44,8 +49,9 @@ how size limits protect compiler and editor memory.
 - mandatory parameter-tag, return-tag, or doctest syntax
 - compiling examples found inside prose
 - generating the API-documentation site in the first implementation
-- attaching docstrings to fields, enum variants, local bindings, parameters,
-  imports, implementation blocks, or arbitrary statements
+- treating arbitrary string statements after fields or parameters as metadata
+- attaching documentation to enum variants, local bindings, imports,
+  implementation blocks, or arbitrary statements in the initial baseline
 - using docstrings to change visibility, typing, ownership, or code generation
 
 ## Eligible declarations and first slots
@@ -88,13 +94,30 @@ Only the first eligible literal is metadata. A later triple-quoted literal is
 an ordinary string expression under the statement grammar and does not attach
 documentation to any declaration. A declaration may omit its docstring.
 
+## Field and parameter metadata
+
+The approved extension includes documentation metadata for fields and
+parameters, associated by stable owner/member identity through imports,
+specialization, constructor signatures, and callable wrappers. Their source
+attachment syntax remains to be designed; fields and parameters have no
+ordinary first-statement body slot, so the rules above do not implicitly
+invent one. Hover, signature help, generated docs, and ADR-0062 schema tooling
+must consume the same declaration associations.
+
+Documentation text supplies descriptions. Executable validation, serialized
+names, required/default rules, and schema opt-in require typed, explicit
+metadata under ADR-0062; prose is never executed as configuration.
+
 ## Content contract
 
 The stored text is the literal's exact logical UTF-8 content after the ordinary
-triple-string escape rules. Opening and closing delimiters are excluded. No
-automatic indentation removal, common-margin calculation, leading/trailing
-newline removal, whitespace normalization, Unicode normalization, or line
-wrapping occurs.
+triple-string escape rules. Opening and closing delimiters are excluded.
+Presentation derives a readable form by normalizing incidental source
+indentation while retaining meaningful relative indentation, especially code
+blocks and Markdown lists. The exact common-margin, tab, first-line, and
+blank-line algorithm remains to be specified and shared by editor and API-doc
+tools. Source content and semantic-interface storage are not destructively
+rewritten merely to improve presentation.
 
 Each docstring is limited to 65,536 UTF-8 bytes after escape processing. A
 checked module interface may contain at most 4,194,304 UTF-8 bytes of exported
@@ -138,6 +161,7 @@ The checked interface for a public module records:
 - the docstring of each exported class, enum, trait, and function
 - the docstring of each exported member reachable through that public API
 - stable association by declaration identity, not source offset
+- exported field/parameter documentation under the same visibility rules
 
 Private declaration docstrings remain in the current compilation's semantic
 database for local hover and are omitted from exported interfaces. A public
@@ -210,24 +234,27 @@ Hover content appears in this order:
 3. existing compiler-generated ownership, inferred-obligation, or provenance
    notes that are independently part of hover
 
-The language server preserves the docstring's logical line breaks. It does not
-reflow paragraphs or remove indentation. Control characters are escaped before
-forming the protocol payload, and raw HTML is sanitized. Relative links are
+The language server uses the shared presentation-normalization policy to remove
+incidental source indentation while preserving meaningful line breaks and
+relative indentation. It does not reflow paragraphs. Control characters are
+escaped before forming the protocol payload, and raw HTML is sanitized. Relative links are
 resolved only by a future API-doc generator; editor hover leaves them as text
 unless the client has a safe source-document base URI.
 
-Completion detail may show the first non-empty logical line, truncated at 160
+Completion detail may show the first non-empty presentation line, truncated at 160
 Unicode scalar values with an ellipsis. The full hover remains available up to
 the compile-time size limit. Signature help for a callable shows its full
-declaration docstring and does not attempt to parse parameter sections.
+declaration docstring and attaches explicit parameter metadata by declaration
+identity. It does not guess executable validation rules from prose sections.
 
 ## Future API documentation
 
 The stable input to an API-doc generator is the checked public-interface
 record: declaration identity, kind, canonical signature, visibility,
-containment, source link metadata, and exact docstring text. The generator may
-render navigation, summaries, and CommonMark, but it may not alter compiler or
-language-server semantics.
+containment, field/parameter associations, source link metadata, and exact
+docstring text. The generator uses the same presentation normalization as the
+language server. It may render navigation, summaries, and CommonMark without
+altering compiler semantics.
 
 Examples inside fenced `aura` blocks are documentation content. Executing them
 as doctests would require a separate decision defining imports, hidden setup,
@@ -274,9 +301,10 @@ Aura source can carry useful API guidance without runtime cost. Public
 interfaces become sufficient for imported hover and future API documentation,
 while private prose stays within the current source compilation.
 
-Exact whitespace preservation is simple and predictable, but authors are
-responsible for source indentation that reads well in hover. The explicit size
-limits make editor and interface memory bounded.
+Exact source-content storage preserves author intent; presentation normalization
+makes ordinary indented docstrings readable in hover and generated docs. The
+baseline size limits keep editor and interface memory bounded, subject to the
+remaining limit-policy decision.
 
 ## Implementation adoption
 
@@ -289,8 +317,11 @@ tutorials land as one coordinated feature.
 
 Adoption depends on the implemented triple-string lexer, stable declaration
 identities, public/private visibility, checked-interface serialization,
-sanitized Markdown hover, and ADR-0053/ADR-0055 association rules for decorated
-bindings and properties. Runtime backends depend only on a verified guarantee
+sanitized Markdown hover, and the shared presentation-normalization policy.
+Ordinary declaration documentation can land first; ADR-0053/ADR-0055 association
+rules apply when decorated bindings and properties land. Field/parameter
+attachment syntax can be delivered as its own coordinated metadata extension.
+Runtime backends depend only on a verified guarantee
 that metadata is absent from executable MIR.
 
 The semantic/documentation schema, checked-interface format, language-server
@@ -304,10 +335,14 @@ MIR; otherwise they are conservatively invalidated.
 - lexer/parser: both plain triple delimiters in every eligible declaration,
   comments and blank lines before the first slot, and exact owner association
 - exclusions: raw strings, f-strings, concatenation, names, ordinary strings,
-  fields, variants, parameters, imports, locals, and later statements do not
-  become docstrings
+  variants, imports, locals, and later statements do not become docstrings;
+  field/parameter prose requires its defined attachment syntax
 - content: escapes, Unicode, tabs, leading/trailing newlines, indentation,
-  empty content, delimiter preservation by formatter, and no normalization
+  empty content, and exact source content/delimiter preservation by formatter
+- presentation: normalized incidental indentation, meaningful nested/code/list
+  indentation, matching editor/API-doc results, and unmodified stored content
+- field/parameter metadata: owner association, visibility, imported signatures,
+  wrapper preservation, and separation of prose from typed schema configuration
 - limits: exactly 65,536 bytes, one-byte overflow, multibyte boundaries,
   exactly 4,194,304 exported bytes, total overflow, and private-doc exclusion
 - semantics: no expression/MIR node, no allocation or constant, no ownership
@@ -329,19 +364,16 @@ MIR; otherwise they are conservatively invalidated.
 - parity: identical absence from MIR/direct execution and byte-identical
   semantic/interface metadata and diagnostics on both compiler paths
 
-## Ratification questions
+## Ratification and remaining design
 
-1. Ratify exact logical content preservation with no indentation or blank-line
-   normalization?
-2. Ratify plain triple-quoted first-statement slots for module, class, enum,
-   trait, function, and every method kind?
-3. Are 65,536 bytes per docstring and 4,194,304 exported docstring bytes per
-   checked interface appropriate limits?
-4. Ratify public-interface serialization and local-only retention for private
-   declaration docs?
-5. Ratify source-definition documentation surviving decorators and property
-   lowering unchanged?
-6. Ratify implementation-method documentation first, trait-method fallback
-   second, and trait-method documentation for generic bound dispatch?
-7. Should CommonMark be the documented presentation format immediately, or
-   should hover treat all content as escaped plain text in the first version?
+Accepted on 2026-09-06: Markdown documentation in editor help and generated
+docs; readable presentation indentation; retained source documentation through
+decoration; and metadata for fields and parameters. The original prohibition
+on presentation normalization and exclusion of field/parameter metadata are
+superseded. Documentation carries no runtime allocation or executable semantics.
+
+Remaining details include the normalization algorithm, field/parameter source
+syntax, documentation limits, exact first-slot eligibility, interface retention,
+trait fallback, and API-doc generation commands. Public metadata and private
+retention follow the baseline above pending that detailed contract. Typed codec
+and validation rules are specified separately in ADR-0062.

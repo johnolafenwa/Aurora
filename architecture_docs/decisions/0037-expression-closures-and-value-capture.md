@@ -1,5 +1,9 @@
 # ADR-0037: Expression closures and value capture
 
+> Approved next extension (2026-09-06): [ADR-0058](0058-first-class-callables-and-binding-contracts.md)
+> carries environments and lifetime/call-kind contracts through general callable
+> storage. Its design does not remove the implemented storage restrictions yet.
+
 - Status: Accepted
 - Date: 2026-07-30
 - Accepted at: Batch 6 opening checkpoint

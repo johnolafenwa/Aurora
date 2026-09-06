@@ -1,5 +1,10 @@
 # ADR-0038: Place-based loans and views
 
+> Approved next extensions (2026-09-06): [ADR-0058](0058-first-class-callables-and-binding-contracts.md)
+> covers lifetime-bearing callable storage; [ADR-0061](0061-collection-element-loans-and-slice-views.md)
+> covers collection-element loans and slice views. The implementation status
+> below applies to this ADR's existing root/field/tuple scope only.
+
 - Status: Implemented
 - Date: 2026-07-30
 - Accepted at: Batch 6 opening checkpoint

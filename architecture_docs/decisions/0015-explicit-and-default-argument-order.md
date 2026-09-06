@@ -1,5 +1,10 @@
 # ADR-0015: Explicit and default argument evaluation order
 
+> Future integration (2026-09-06): [ADR-0058](0058-first-class-callables-and-binding-contracts.md)
+> must preserve default/binding contracts through callbacks;
+> [ADR-0059](0059-custom-initialization.md) must specify custom initializer
+> defaults and evaluation order against this implemented baseline.
+
 - Status: Accepted
 - Date: 2026-07-14
 - Reference gap: supplied/default ordering and result-capture timing

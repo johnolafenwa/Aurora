@@ -1,5 +1,10 @@
 # ADR-0021: JSON value model and codec policy
 
+> Approved next extension (2026-09-06): [ADR-0062](0062-typed-serialization-validation-and-schemas.md)
+> records opt-in typed codecs, validation, and schemas. The raw JSON contract
+> below remains the baseline. [ADR-0052](0052-anonymous-closed-union-types.md)
+> owns the future optional-result migration across APIs.
+
 - Status: Accepted
 - Date: 2026-07-23
 - Roadmap decision: Phase 3 JSON gap-fill policy

@@ -1,5 +1,11 @@
 # ADR-0044: Canonical collection surface
 
+> Approved next extensions (2026-09-06): [ADR-0052](0052-anonymous-closed-union-types.md)
+> adds explicitly typed union elements and replaces optional results;
+> [ADR-0061](0061-collection-element-loans-and-slice-views.md) adds contextual
+> indexed access and collection loans. These future changes do not alter the
+> implemented collection contract below until their implementation families land.
+
 - Status: Accepted
 - Date: 2026-08-02
 - Roadmap decision: Batch S1, Aura 0.3 Python surface
