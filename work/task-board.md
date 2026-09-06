@@ -2,6 +2,16 @@
 
 Last updated: 2026-09-06
 
+## Pre-Batch-1 foundations items 1–4 (in progress)
+
+- Scope: optimization flag, backend boundary note, Rust baseline programs and
+  runners, release profile/linking, executable-size evidence; next release 0.3.4.
+- Test-first flag and platform-link regressions reproduced the missing behavior.
+- Remaining: implementation, unchanged coverage gates and local CI, size report,
+  documentation, branch/main hosted CI and merge, measurement-session handoff.
+- No timing publication, release preparation, version bump, tag, or reboot.
+- Work note: `work/2026-09-07-pre-batch-1-items-1-4.md`.
+
 ## Priority roadmap scheduling amendment (complete)
 
 - Authorized scope: documentation-only ordering, pre-Batch-1 foundations,

@@ -107,3 +107,22 @@ npm run bench:release-performance
 
 The scalable-runtime and numeric-Array harnesses provide the deeper scheduler,
 memory, and kernel evidence referenced by their Manual chapters.
+
+## Executable Size
+
+The 0.3.4 foundations size tool builds clean detached refs with Rust 1.95.0,
+records exact executable byte counts and SHA-256 hashes, and removes each build
+tree after hashing. Subjects are the compiler, a single-print hello world, and
+`examples/agents/retrying_network_worker.au`, used as the reference-agent stand-in
+until pre-Batch-1 item 6 lands. The before ref is `v0.3.3-preview`. The after
+comparison includes Cargo-default and tuned release-profile builds in separate
+targets. The tuned profile retains unwinding and runtime diagnostic metadata.
+
+Size measurements are pending completion of the local semantic gates.
+
+## Pending measurements
+
+The Cranelift optimization-level and Rust-baseline timings will be collected in
+a post-reboot session and are not yet published. Protocol-only Rust smoke checks
+are correctness evidence, not timing results. Existing CPython and NumPy tables
+above retain their original measurements and provenance.

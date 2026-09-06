@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/aura-compiler", "crates/aura"]
+exclude = ["benchmarks/rust_baselines"]
 resolver = "2"
 
 [workspace.package]
@@ -13,3 +14,10 @@ version = "0.3.3"
 # does not cost more than the compile/link work the cache avoids.
 [profile.dev.package.sha2]
 opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+debug = false

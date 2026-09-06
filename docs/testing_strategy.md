@@ -106,7 +106,7 @@ Current repo commands:
 
 - compiler and examples
   - `npm run test:rust`
-  - equivalent to `RUST_MIN_STACK=33554432 cargo test -- --test-threads=1`
+  - equivalent to `RUST_MIN_STACK=33554432 cargo test`
 - compiler coverage
   - `npm run coverage:compiler`
   - `npm run coverage:compiler:check`
@@ -134,9 +134,9 @@ Current repo commands:
 Current enforced floor:
 
 - compiler
-  - lines: `96.01%`
-  - functions: `96.71%`
-  - regions: `93.94%`
+  - lines: `96.30%`
+  - functions: `97.21%`
+  - regions: `94.71%`
 - language server
   - statements: `100%`
   - branches: `100%`
@@ -197,3 +197,10 @@ When fixing a bug:
 3. fix the behavior
 4. run the relevant package test suites
 5. record the regression in `work/` if it was non-trivial
+
+### Native foundations and Rust references
+
+`npm run ci` also runs integer-loop and binary-size tooling unit tests and builds
+the pinned standalone Rust references for exact protocol/checksum smoke checks.
+It publishes no benchmark timing. Rust reference advisory review is recorded in
+the foundations work note; it is not part of the repository advisory gate.

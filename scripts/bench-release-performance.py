@@ -28,19 +28,20 @@ from datetime import datetime, timezone
 from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 try:
-    from scripts import benchmark_process
+    from scripts import benchmark_process, rust_baselines
 except ImportError:
     import benchmark_process
+    import rust_baselines
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PERFORMANCE_ROOT = ROOT / "benchmarks/release_performance"
-REPORT_SCHEMA_VERSION = 1
+REPORT_SCHEMA_VERSION = 2
 PAIR_COUNT = 11
 READY_TIMEOUT_SECONDS = 120.0
 COMPLETION_TIMEOUT_SECONDS = 120.0
 WHOLE_PROCESS_TIMEOUT_SECONDS = 120.0
-BUILD_TIMEOUT_SECONDS = 300.0
+BUILD_TIMEOUT_SECONDS = 1800.0
 HELPER_TIMEOUT_SECONDS = 10.0
 MAX_PROTOCOL_LINE_BYTES = 512
 COMPETING_CPU_PERCENT = 50.0
@@ -249,7 +250,7 @@ def duration_summary(values: Sequence[float]) -> Dict[str, object]:
 
 
 def paired_duration_summary(
-    aura: Sequence[float], cpython: Sequence[float]
+    aura: Sequence[float], cpython: Sequence[float], reference: str = "cpython"
 ) -> Dict[str, object]:
     if len(aura) != len(cpython) or not aura:
         raise BenchmarkError("paired duration samples must be nonempty and aligned")
@@ -263,7 +264,7 @@ def paired_duration_summary(
     ]
     return {
         "aura": aura_summary,
-        "cpython": cpython_summary,
+        reference: cpython_summary,
         "paired_ratios": ratios,
         "paired_median_ratio": statistics.median(ratios),
         "ratio_of_medians": (
@@ -295,7 +296,7 @@ def measurement_plan(repeat: int) -> List[Tuple[str, List[str]]]:
         if workload == "v6":
             lanes = v6_lane_order(repeat)
         else:
-            lanes = ["aura", "cpython"]
+            lanes = ["aura", "cpython", "rust"]
             if (repeat + position) % 2 == 1:
                 lanes.reverse()
         plan.append((workload, lanes))
@@ -476,6 +477,8 @@ def summarize_protocol_workload(
             for pair in pairs
         ]
         result[label] = paired_duration_summary(aura, cpython)
+        rust = [float(pair["workloads"][workload]["runs"]["rust"][metric]) for pair in pairs]
+        result[label + "_vs_rust"] = paired_duration_summary(aura, rust, "rust")
     result["primary_measurement"] = "protocol"
     result["performance_gate"] = None
     return result
@@ -927,6 +930,8 @@ def qualify_inputs(options: Options) -> Dict[str, object]:
             "sha256": sha256_file(options.python.resolve()),
             **python_identity(options.python.resolve()),
         },
+        "rust_sources": rust_baselines.source_identity(),
+        "rust_helper_sha256": sha256_file(ROOT / "scripts/rust_baselines.py"),
         "runner": {"path": str(runner), "sha256": sha256_file(runner)},
         "benchmark_process": {
             "path": str(process_helper.resolve()),
@@ -1043,6 +1048,7 @@ def protocol_commands(
         name: {
             "aura": [str(binaries[name])],
             "cpython": [str(python), str(contract.cpython_source)],
+            "rust": [str(binaries["rust_" + name])],
         }
         for name, contract in PROTOCOL_WORKLOADS.items()
     }
@@ -1070,7 +1076,7 @@ def run_warmups(
     for name, contract in PROTOCOL_WORKLOADS.items():
         result[name] = {
             lane: run_protocol_lane(contract, lane, protocol[name][lane])
-            for lane in ("aura", "cpython")
+            for lane in ("aura", "cpython", "rust")
         }
     result["v6"] = {
         lane: run_whole_process_lane(
@@ -1162,6 +1168,8 @@ def execute(options: Options) -> Dict[str, object]:
         binaries, builds = build_aura_workloads(
             options.aura.resolve(), pathlib.Path(directory)
         )
+        rust_binaries, rust_build = rust_baselines.build(pathlib.Path(directory) / "rust-target")
+        binaries.update({"rust_" + name: binary for name, binary in rust_binaries.items()})
         before_timing = quiet_process_inventory()
         require_quiet_process_check(
             before_timing,
@@ -1244,6 +1252,7 @@ def execute(options: Options) -> Dict[str, object]:
             "before_timing": before_timing,
             "after_timing": after_timing,
         },
+        "rust_build": rust_build,
         "builds": builds,
         "warmups": warmups,
         "pairs": pairs,

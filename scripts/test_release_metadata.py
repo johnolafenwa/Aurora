@@ -77,13 +77,16 @@ class ReleaseMetadataTests(unittest.TestCase):
         # extension entries above are their lock records; package-local lock
         # files would split dependency resolution and are not maintained.
 
-    def test_changelog_opens_the_0_3_preview_release(self) -> None:
+    def test_changelog_separates_next_work_from_published_0_3_3(self) -> None:
         changelog = (ROOT / "CHANGELOG.md").read_text()
-        self.assertIn("## 0.3.3 — Unreleased (technical preview)", changelog)
-        pending = changelog.split("## VS Code extension 0.3.3", 1)[0]
+        self.assertIn("## 0.3.4 — Unreleased (technical preview)", changelog)
+        self.assertIn("## 0.3.3 — 2026-09-06 (technical preview)", changelog)
+        self.assertNotIn("## 0.3.3 — Unreleased", changelog)
+        pending = changelog.split("## VS Code extension 0.3.4", 1)[0]
+        shipped = changelog.split("## 0.3.3 — 2026-09-06", 1)[1].split("## VS Code extension 0.3.3", 1)[0]
         self.assertNotIn("Published VS Code extension 0.3.4", pending)
-        self.assertIn("`view name = place`", pending)
-        self.assertIn("`view mut name = place`", pending)
+        self.assertIn("`view name = place`", shipped)
+        self.assertIn("`view mut name = place`", shipped)
         self.assertIn("Aura 0.3.3 is a technical preview", changelog)
         self.assertIn("## 0.3.2 — 2026-08-04 (technical preview)", changelog)
         self.assertIn("## 0.3.1 — 2026-08-04 (technical preview)", changelog)

@@ -40,6 +40,8 @@ flowchart LR
 12. [11-editor-tooling.md](11-editor-tooling.md)
 13. [12-testing-and-quality.md](12-testing-and-quality.md)
 14. [13-end-to-end-walkthrough.md](13-end-to-end-walkthrough.md)
+15. [14-priority-roadmap.md](14-priority-roadmap.md)
+16. [15-backend-boundary.md](15-backend-boundary.md)
 
 Accepted language and runtime decisions are recorded separately in
 [`decisions/`](decisions/README.md). The architecture chapters describe the

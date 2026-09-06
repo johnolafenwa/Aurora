@@ -45,8 +45,11 @@
     "docs:preview": "vitepress preview docs",
     "check:extension": "npm --prefix tools/vscode-aura run check",
     "test:extension": "npm --prefix tools/vscode-aura test",
-    "ci": "npm run check:format && npm run test:bench-scalable-runtime && npm run test:bench-numeric-arrays && npm run test:bench-release-performance && npm run test:release-packaging && npm run test:identity && npm run test:rust && npm run test:backend-parity && npm run test:lsp && npm run check:extension && npm run test:extension && npm run coverage:compiler:check && npm run coverage:lsp:check && npm run check:reference && npm run check:tutorials && npm run docs:build && npm run check:audit && npm run check:clippy && npm run check:hygiene",
-    "postinstall": "npm run build:extension"
+    "ci": "npm run check:format && npm run test:bench-scalable-runtime && npm run test:bench-numeric-arrays && npm run test:bench-release-performance && npm run test:bench-direct-integer-loops && npm run test:bench-binary-size && npm run test:rust-baselines && npm run test:release-packaging && npm run test:identity && npm run test:rust && npm run test:backend-parity && npm run test:lsp && npm run check:extension && npm run test:extension && npm run coverage:compiler:check && npm run coverage:lsp:check && npm run check:reference && npm run check:tutorials && npm run docs:build && npm run check:audit && npm run check:clippy && npm run check:hygiene",
+    "postinstall": "npm run build:extension",
+    "test:bench-direct-integer-loops": "python3 -m unittest scripts/test_bench_direct_integer_loops.py",
+    "test:bench-binary-size": "python3 -m unittest scripts/test_bench_binary_size.py",
+    "test:rust-baselines": "python3 -m unittest scripts/test_rust_baselines.py && python3 scripts/rust_baselines.py"
   },
   "devDependencies": {
     "vitepress": "2.0.0-alpha.17"

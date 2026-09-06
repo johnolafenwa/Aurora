@@ -65,6 +65,12 @@ class NumericArrayBenchmarkTests(unittest.TestCase):
                 expected_checksum=2048.0,
             )
 
+    def test_rust_array_lane_commands(self):
+        commands = bench.lane_commands({name: Path('/tmp') / name for name in
+            ('add', 'sum', 'rust_add', 'rust_sum')}, Path('/python'))
+        self.assertEqual(commands['rust_add'], ['/tmp/rust_add'])
+        self.assertEqual(bench.LANES['rust_sum']['expected_checksum'], 4096000000.0)
+
     def test_single_thread_environment_is_explicit(self) -> None:
         self.assertEqual(
             bench.SINGLE_THREAD_ENVIRONMENT,
@@ -79,7 +85,7 @@ class NumericArrayBenchmarkTests(unittest.TestCase):
         )
 
     def test_run_order_reverses_every_pair(self) -> None:
-        forward = ["aura_add", "numpy_add", "aura_sum", "numpy_sum"]
+        forward = ["aura_add", "numpy_add", "aura_sum", "numpy_sum", "rust_add", "rust_sum"]
         self.assertEqual(bench.pair_order(0), forward)
         self.assertEqual(bench.pair_order(1), list(reversed(forward)))
         self.assertEqual(bench.pair_order(10), forward)
@@ -224,7 +230,11 @@ class NumericArrayBenchmarkTests(unittest.TestCase):
                 }
             },
         ]
+        for pair in pairs:
+            pair["runs"]["rust_add"] = {"elapsed_s": 0.5}
+            pair["runs"]["rust_sum"] = {"elapsed_s": 0.75}
         summary = bench.summarize_pairs(pairs)
+        self.assertEqual(summary["add"]["aura_vs_rust"]["paired_median_ratio"], 6.0)
         self.assertEqual(summary["add"]["aura"]["samples_s"], [2.0, 4.0, 3.0])
         self.assertEqual(summary["add"]["numpy"]["samples_s"], [1.0, 2.0, 1.5])
         self.assertEqual(summary["add"]["paired_ratios"], [2.0, 2.0, 2.0])
@@ -272,7 +282,10 @@ class NumericArrayBenchmarkTests(unittest.TestCase):
             str(raw_path.resolve()),
         )
 
-    def test_execution_warms_then_runs_eleven_alternating_pairs(self) -> None:
+    @mock.patch.object(bench.rust_baselines, "source_identity", return_value={})
+    @mock.patch.object(bench.rust_baselines, "build", return_value=(
+        {name: Path("/tmp/rust") / name for name in bench.rust_baselines.CONTRACTS}, {"sources": {}}))
+    def test_execution_warms_then_runs_eleven_alternating_pairs(self, *_mocks) -> None:
         options = bench.Options(
             label="post-reboot",
             aura=Path("/tmp/aura"),
@@ -328,11 +341,11 @@ class NumericArrayBenchmarkTests(unittest.TestCase):
                                     bench, "run_lane", side_effect=fake_run
                                 ):
                                     report = bench.execute(options)
-        self.assertEqual(seen[:4], list(bench.LANES))
+        self.assertEqual(seen[:len(bench.LANES)], list(bench.LANES))
         expected_measured = [
             lane for repeat in range(11) for lane in bench.pair_order(repeat)
         ]
-        self.assertEqual(seen[4:], expected_measured)
+        self.assertEqual(seen[len(bench.LANES):], expected_measured)
         self.assertEqual(len(report["pairs"]), 11)
         self.assertTrue(report["contractual"])
         self.assertEqual(

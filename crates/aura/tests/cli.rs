@@ -14732,14 +14732,14 @@ fn aura_test_registration_timeout_retains_stdout_in_the_single_json_document() {
 }
 
 #[test]
-fn native_cache_format_carries_the_aura_identity_epoch() {
+fn native_cache_format_carries_the_link_and_strip_construction_epoch() {
     let main = include_str!("../src/main.rs");
     assert!(
-        main.contains(r#"const NATIVE_CACHE_FORMAT: &str = "aura-native-cache-v5";"#),
-        "native cache format must carry the Aura identity epoch"
+        main.contains(r#"const NATIVE_CACHE_FORMAT: &str = "aura-native-cache-v6";"#),
+        "native cache format must invalidate artifacts built before link and strip changes"
     );
     assert!(
-        !main.contains("aura-native-cache-v4"),
+        !main.contains("aura-native-cache-v5"),
         "the prior cache format must not linger in key material"
     );
 }

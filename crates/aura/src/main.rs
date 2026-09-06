@@ -2821,7 +2821,7 @@ fn native_runtime_identity_material(identity: &NativeRuntimeIdentity) -> Option<
 // The compiler-owned semantic schema version is an additional, independent
 // key component, so checked-source changes do not require a cache-container
 // format change.
-const NATIVE_CACHE_FORMAT: &str = "aura-native-cache-v5";
+const NATIVE_CACHE_FORMAT: &str = "aura-native-cache-v6";
 
 /// The exact runtime inputs that a warm native-cache lookup may reuse.
 ///
@@ -3955,6 +3955,7 @@ fn build_direct_native_binary_with_identity(
     for arg in &native_runtime.native_link_args {
         command.arg(arg);
     }
+    command.args(user_binary_link_args(std::env::consts::OS));
 
     let result = command
         .output()
@@ -3970,6 +3971,7 @@ fn build_direct_native_binary_with_identity(
             String::from_utf8_lossy(&output.stderr)
         ));
     }
+    strip_user_binary(output_path)?;
     Ok(runtime_identity)
 }
 
@@ -4029,6 +4031,7 @@ fn build_mir_runtime_binary(
     for arg in &native_runtime.native_link_args {
         command.arg(arg);
     }
+    command.args(user_binary_link_args(std::env::consts::OS));
 
     let result = command.output().map_err(|error| {
         format!(
@@ -4047,7 +4050,39 @@ fn build_mir_runtime_binary(
             String::from_utf8_lossy(&output.stderr)
         ));
     }
+    strip_user_binary(output_path)?;
     Ok(())
+}
+
+fn user_binary_strip_command(path: &Path) -> Command {
+    let mut command = Command::new("strip");
+    // Keep globals: package-authorized FFI may resolve process-global symbols.
+    command.args(["-S", "-x"]).arg(path);
+    command
+}
+
+fn strip_user_binary(path: &Path) -> std::result::Result<(), String> {
+    if !matches!(std::env::consts::OS, "macos" | "linux") {
+        return Ok(());
+    }
+    let output = user_binary_strip_command(path)
+        .output()
+        .map_err(|error| format!("failed to strip user binary: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "user binary stripping failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+fn user_binary_link_args(os: &str) -> &'static [&'static str] {
+    match os {
+        "macos" => &["-Wl,-dead_strip"],
+        "linux" => &["-Wl,--gc-sections"],
+        _ => &[],
+    }
 }
 
 fn temporary_direct_object_path(output_path: &Path) -> PathBuf {
@@ -4725,6 +4760,70 @@ mod tests {
         let path = std::env::temp_dir().join(unique);
         fs::create_dir_all(&path).expect("temp dir should exist");
         path
+    }
+
+    #[test]
+    fn user_binary_link_flags_collect_unused_sections_on_supported_hosts() {
+        assert_eq!(super::user_binary_link_args("macos"), &["-Wl,-dead_strip"]);
+        assert_eq!(
+            super::user_binary_link_args("linux"),
+            &["-Wl,--gc-sections"]
+        );
+        assert!(super::user_binary_link_args("windows").is_empty());
+    }
+
+    #[test]
+    fn user_binary_strip_command_keeps_global_symbols_for_ffi() {
+        let command = super::user_binary_strip_command(std::path::Path::new("program"));
+        assert_eq!(command.get_program(), "strip");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec!["-S", "-x", "program"]
+        );
+    }
+
+    #[test]
+    fn stripped_direct_and_mir_launchers_keep_source_frames_without_source_files() {
+        let root = unique_temp_dir("stripped-runtime-frames");
+        let source =
+            "def fail():\n    assert false, \"kept diagnostic\"\n\ndef main():\n    fail()\n";
+        let source_path = root.join("removed.au");
+        let mir = aura_compiler::lower_source_to_mir(source).unwrap();
+        for direct in [true, false] {
+            let binary = root.join(if direct { "direct" } else { "mir-launcher" });
+            if direct {
+                super::build_direct_native_binary(
+                    source_path.to_str().unwrap(),
+                    source,
+                    &mir,
+                    &binary,
+                    None,
+                )
+                .unwrap();
+            } else {
+                super::build_mir_runtime_binary(
+                    source_path.to_str().unwrap(),
+                    source,
+                    &mir,
+                    &binary,
+                )
+                .unwrap();
+            }
+            assert!(!source_path.exists());
+            let output = Command::new(&binary)
+                .current_dir(&root)
+                .env("CARGO", root.join("no-cargo"))
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("AU4001"), "{stderr}");
+            assert!(stderr.contains("kept diagnostic"), "{stderr}");
+            assert!(stderr.contains("fail"), "{stderr}");
+            assert!(stderr.contains("main"), "{stderr}");
+            assert!(stderr.contains("removed.au"), "{stderr}");
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

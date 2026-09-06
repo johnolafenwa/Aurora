@@ -10,12 +10,14 @@ process startup is not mistaken for loop cost.
 Run it with:
 
 ```bash
-npm run bench:direct-integer-loops
+npm run bench:direct-integer-loops -- \
+  --aura target/release/aura --repeats 11 \
+  --raw-json /tmp/aura-rust-integer-loops.json
 ```
 
-The reported figure is the best of several runs, which is the right statistic
-for a CPU-bound loop: the minimum is the run least disturbed by unrelated
-system activity. Both this helper and the scalable-runtime runner launch each
+The runner reports raw samples, medians, minima, and paired Aura/Rust ratios
+after one excluded warmup. Lane and width order alternate across repetitions.
+Run from a clean checkout with a freshly built compiler. Both this helper and the scalable-runtime runner launch each
 measured binary in a dedicated process group and verify that the complete
 group is reaped on success, error, timeout, or interrupt.
 
@@ -33,7 +35,7 @@ and publishes both whole-process summaries and paired
 `whole process - startup` loop estimates under
 `benchmarks.v6.startup_vs_loop`.
 
-This is report schema version 4. Schema version 3 identified each V6 run with
+The separate scalable-runtime report uses schema version 4. Schema version 3 identified each V6 run with
 a `width` field and contained only the two integer loops. Version 4 identifies
 each run with `workload` and adds the `startup` workload and split summary.
 
@@ -117,3 +119,15 @@ V6 regression. It does not change the outstanding narrow-arithmetic
 representation work. The raw report is
 `/tmp/aura-s1-post-s2-v6-face52e.json`, SHA-256
 `491d1268398c46b0c55393d7542d63a93804034ba6e8b128be67565f93fcdf64`.
+
+## Rust comparison lane (0.3.4 foundations)
+
+The runner builds pinned Rust 1.95.0 references from `benchmarks/rust_baselines/`
+with `--release --locked`, fat LTO, and one codegen unit. Report schema is now 2.
+It records source/lockfile and binary SHA-256 identities and paired Aura/Rust
+samples. Rust timing results are pending the post-reboot measurement session;
+protocol smoke checks are not published as performance evidence.
+
+See [the Rust baseline contract](../rust_baselines/README.md) for exact workload,
+allocation, arithmetic, scheduling, and protocol equivalence. The integer-loop
+lane retains its whole-process checksum protocol; other lanes use READY/GO/DONE.

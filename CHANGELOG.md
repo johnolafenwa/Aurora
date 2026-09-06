@@ -5,6 +5,18 @@ versioning for release artifacts while it remains a technical preview; a minor
 preview release may still contain source and API incompatibilities called out
 in this file.
 
+## 0.3.4 — Unreleased (technical preview)
+
+- Enable Cranelift speed optimization, validated by the full forced-backend gate.
+- Tune release artifacts with fat LTO, one codegen unit, stripped compiler
+  symbols, platform section collection and user debug/local-symbol stripping;
+  preserve unwinding and Aura source diagnostics. Size measurements pending.
+- Add pinned Rust baseline programs and lanes to all three timing harnesses,
+  protocol smoke checks, and clean-ref executable-size tooling. Timings deferred.
+- Document the native semantic boundary and incremental Batch 1 builder plan.
+- Correct the documented compiler coverage floors and `aura test` lifecycle and
+  parameterized-registration support.
+
 ## VS Code extension 0.3.4 — 2026-09-06
 
 - Added syntax highlighting and snippets for shared and mutable views,
