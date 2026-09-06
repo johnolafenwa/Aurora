@@ -606,6 +606,52 @@ fn s1_sema_final_task_specializations_preserve_matching_type_arguments() {
 }
 
 #[test]
+fn s1_sema_type_pattern_unification_rejects_callable_kind_and_capture_mismatches() {
+    let function = Type::Function {
+        params: vec![FunctionParamContract {
+            name: String::new(),
+            ty: Type::named("int64"),
+            passing: ReceiverKind::Borrow,
+            has_default: false,
+            default_erased: false,
+        }],
+        return_type: Box::new(Type::named("int64")),
+    };
+    let not_callable = unify_type_pattern(&function, &Type::named("int64"), &mut HashMap::new())
+        .expect_err("a function pattern cannot unify with a scalar");
+    assert_eq!(
+        not_callable.message,
+        "expected `def(int64) -> int64`, found `int64`"
+    );
+
+    let closure = Type::Closure {
+        params: Box::new(Vec::new()),
+        return_type: Box::new(Type::named("int64")),
+        captures: Box::new(vec![ClosureCapture {
+            name: "value".to_string(),
+            ty: Type::named("int64"),
+            mode: ClosureCaptureMode::SharedView,
+            span: Span::new(1, 1),
+        }]),
+        call_kind: ClosureCallKind::Repeatable,
+    };
+    let not_closure = unify_type_pattern(&closure, &function, &mut HashMap::new())
+        .expect_err("a closure pattern cannot unify with a written function type");
+    assert!(not_closure.message.starts_with("expected `closure def()"));
+
+    let mut different_capture = closure.clone();
+    let Type::Closure { captures, .. } = &mut different_capture else {
+        unreachable!()
+    };
+    captures[0].name = "other".to_string();
+    let capture_mismatch = unify_type_pattern(&closure, &different_capture, &mut HashMap::new())
+        .expect_err("closure capture identity participates in type-pattern unification");
+    assert!(capture_mismatch
+        .message
+        .starts_with("expected `closure def()"));
+}
+
+#[test]
 fn s1_sema_module_constants_reject_self_reentry_rebinding_mutation_and_moves() {
     let reentry = crate::check_source("VALUE: int64 = VALUE\n\ndef main():\n    pass\n")
         .expect_err("a module constant cannot re-enter its own initializer");
@@ -27951,6 +27997,45 @@ fn adr0038_tuple_view_places_reject_dynamic_negative_and_out_of_range_positions(
 }
 
 #[test]
+fn adr0038_last_use_walkers_retain_slice_comparison_and_nested_block_end_spans() {
+    for expression in [
+        "values[needle:needle]",
+        "1 < needle < needle",
+        "assert true, str(needle)",
+        "{needle: needle for item in [1]}",
+    ] {
+        let source = format!("def probe():\n    {expression}\n");
+        let module = crate::parse_source(&source).unwrap();
+        let Item::Function(function) = &module.items[0] else {
+            panic!("function expected")
+        };
+        let expected = Span::new(2, expression.rfind("needle").unwrap() + 5);
+        assert_eq!(
+            super::last_name_reference_span_in_stmt(&function.body[0], "needle"),
+            Some(expected),
+            "{expression}"
+        );
+        assert_eq!(
+            super::last_name_reference_span_in_stmt(&function.body[0], "absent"),
+            None
+        );
+    }
+    for body in [
+        "    if true:\n        pass\n    else:\n        pass\n",
+        "    if true:\n        pass\n    elif false:\n        pass\n",
+        "    match true:\n        case true:\n            pass\n        case false:\n            pass\n",
+        "    while true:\n        if false:\n            pass\n        else:\n            pass\n",
+        "    for item in [1]:\n        with TaskGroup() as group:\n            pass\n",
+    ] {
+        let source = format!("def probe():\n{body}");
+        let module = crate::parse_source(&source).unwrap();
+        let Item::Function(function) = &module.items[0] else { panic!("function expected") };
+        let (line, text) = source.lines().enumerate().last().unwrap();
+        assert_eq!(super::block_end_span(&function.body), Some(Span::new(line + 1, text.find("pass").unwrap() + 1)));
+    }
+}
+
+#[test]
 fn adr0038_statement_reference_walker_covers_every_statement_shape() {
     let module = crate::parse_source(
         r#"
@@ -28380,6 +28465,30 @@ def main():
         })
     };
 
+    let missing_ordered = required_ordered_arg(
+        &[],
+        0,
+        Span::new(1, 1),
+        "required collection argument is missing",
+    )
+    .expect_err("the shared argument helper must diagnose a missing slot");
+    assert_eq!(
+        missing_ordered.message,
+        "required collection argument is missing"
+    );
+    let missing_bound = checker
+        .bound_argument(
+            &[],
+            0,
+            Span::new(1, 2),
+            "bound collection argument is missing",
+        )
+        .expect_err("the checker argument helper must diagnose a missing slot");
+    assert_eq!(
+        missing_bound.message,
+        "internal error: bound collection argument is missing"
+    );
+
     assert!(!checker
         .is_mutable_place(&index("items", expr(ExprKind::Int(0))), &mut locals)
         .expect("list indexing is not a stable mutable place"));
@@ -28495,6 +28604,16 @@ def main():
     assert!(not_a_tuple
         .message
         .contains("cannot project tuple position"));
+    let unknown_namespace = checker
+        .resolve_member_type(
+            &Type::Module("missing.module".to_string()),
+            "value",
+            Span::new(4, 2),
+        )
+        .expect_err("module-typed values require a registered namespace");
+    assert!(unknown_namespace
+        .message
+        .contains("unknown module namespace `missing.module`"));
     let out_of_bounds = checker
         .place_path_type(
             &PlacePath::root("tuple".to_string()).with_tuple(9),
@@ -28503,6 +28622,121 @@ def main():
         )
         .expect_err("out-of-bounds tuple paths must fail");
     assert!(out_of_bounds.message.contains("tuple has no position 9"));
+    let member_index_overflow = checker
+        .type_of_member_object_expr(&index("tuple", expr(ExprKind::Int(u128::MAX))), &mut locals)
+        .expect_err("member-object tuple positions must fit usize");
+    assert_eq!(member_index_overflow.code, "AU3004");
+    assert!(member_index_overflow
+        .message
+        .contains("invalid tuple projection position"));
+    let member_index_out_of_bounds = checker
+        .type_of_member_object_expr(&index("tuple", expr(ExprKind::Int(8))), &mut locals)
+        .expect_err("member-object tuple positions must be in bounds");
+    assert_eq!(member_index_out_of_bounds.code, "AU3004");
+    assert!(member_index_out_of_bounds
+        .message
+        .contains("tuple has no position 8"));
+
+    let make_view = |parent: Option<&str>, ancestors: &[&str], last_use: Span| ViewBinding {
+        kind: crate::ast::ViewKind::Shared,
+        source: PlacePath::root("value".to_string()),
+        parent: parent.map(str::to_string),
+        ancestors: ancestors.iter().map(|name| (*name).to_string()).collect(),
+        created_at: Span::new(10, 1),
+        last_use,
+    };
+    let mut ancestor_locals = HashMap::new();
+    let mut root = local_binding(
+        Type::named("int64"),
+        true,
+        false,
+        ReceiverKind::Value,
+        false,
+        &[],
+    );
+    root.view = Some(make_view(None, &[], Span::new(20, 1)));
+    ancestor_locals.insert("root".to_string(), root);
+    let mut child = local_binding(
+        Type::named("int64"),
+        true,
+        false,
+        ReceiverKind::Value,
+        false,
+        &[],
+    );
+    child.view = Some(make_view(Some("root"), &["root"], Span::new(21, 1)));
+    ancestor_locals.insert("child".to_string(), child);
+    let mut grandchild = local_binding(
+        Type::named("int64"),
+        true,
+        false,
+        ReceiverKind::Value,
+        false,
+        &[],
+    );
+    grandchild.view = Some(make_view(Some("child"), &[], Span::new(22, 1)));
+    ancestor_locals.insert("grandchild".to_string(), grandchild);
+    assert!(checker.view_descends_from("child", "root", &ancestor_locals));
+    assert!(checker.view_descends_from("grandchild", "root", &ancestor_locals));
+    assert!(!checker.view_descends_from("root", "child", &ancestor_locals));
+    assert!(!checker.view_descends_from("missing", "root", &ancestor_locals));
+    assert_eq!(
+        checker.view_ancestor_names(Some("child"), &ancestor_locals),
+        BTreeSet::from(["child".to_string(), "root".to_string()])
+    );
+    assert!(checker
+        .view_ancestor_names(None, &ancestor_locals)
+        .is_empty());
+
+    checker.expire_views_before(Span::new(21, 2), &mut ancestor_locals);
+    assert!(ancestor_locals["root"].view.is_none());
+    assert!(ancestor_locals["child"].view.is_none());
+    assert!(ancestor_locals["grandchild"].view.is_some());
+
+    let mut cyclic_left = local_binding(
+        Type::named("int64"),
+        true,
+        false,
+        ReceiverKind::Value,
+        false,
+        &[],
+    );
+    cyclic_left.view = Some(make_view(Some("cyclic_right"), &[], Span::new(30, 1)));
+    ancestor_locals.insert("cyclic_left".to_string(), cyclic_left);
+    let mut cyclic_right = local_binding(
+        Type::named("int64"),
+        true,
+        false,
+        ReceiverKind::Value,
+        false,
+        &[],
+    );
+    cyclic_right.view = Some(make_view(Some("cyclic_left"), &[], Span::new(30, 1)));
+    ancestor_locals.insert("cyclic_right".to_string(), cyclic_right);
+    assert!(!checker.view_descends_from("cyclic_left", "absent", &ancestor_locals));
+
+    let mut branch_only = local_binding(
+        Type::named("int64"),
+        true,
+        false,
+        ReceiverKind::Value,
+        false,
+        &[],
+    );
+    branch_only.view = Some(make_view(None, &[], Span::new(40, 1)));
+    branch_only
+        .closure_loans
+        .push(make_view(None, &[], Span::new(40, 1)));
+    ancestor_locals.insert("branch_only".to_string(), branch_only);
+    checker.expire_views_unused_in_branch(
+        &[Stmt::Pass(PassStmt {
+            span: Span::new(41, 1),
+        })],
+        &BTreeMap::from([("branch_only".to_string(), Span::new(40, 1))]),
+        &mut ancestor_locals,
+    );
+    assert!(ancestor_locals["branch_only"].view.is_none());
+    assert!(ancestor_locals["branch_only"].closure_loans.is_empty());
 }
 
 #[test]
@@ -28731,6 +28965,112 @@ def main():
             .expect_err("loan-bearing closures must remain in supported direct locals");
         assert_eq!(error.code, "AU3010", "{source}: {error:?}");
     }
+}
+
+#[test]
+fn adr0038_loan_closures_reject_every_aggregate_storage_shape() {
+    for body in [
+        "    callbacks: set[def() -> int64] = {callback}\n    print(callbacks.len())\n",
+        "    callbacks: dict[def() -> int64, int64] = {callback: 1}\n    print(callbacks.len())\n",
+        "    callbacks: dict[str, def() -> int64] = {\"callback\": callback}\n    print(callbacks.len())\n",
+        "    holder = Holder(callback=callback)\n    print(holder.callback())\n",
+        "    packet = Packet.Callback(callback)\n    print(packet)\n",
+        "    packet = Option.Some(callback)\n    print(packet)\n",
+        "    packet = Option.Some((callback,))\n    print(packet)\n",
+    ] {
+        let source = format!(
+            r#"
+class Holder:
+    callback: def() -> int64
+
+enum Packet:
+    Callback(def() -> int64)
+
+def main():
+    mut value = 1
+    callback: def() -> int64 = lambda [value]: value
+{body}"#
+        );
+        let error = crate::check_source(&source)
+            .expect_err("a loan-bearing closure must not enter aggregate storage");
+        assert_eq!(error.code, "AU3010", "{source}: {error:?}");
+    }
+}
+
+#[test]
+fn adr0038_direct_calls_cannot_erase_loan_closure_regions() {
+    let error = crate::check_source(
+        r#"
+def consume(callback: own def() -> int64):
+    print(callback())
+
+def main():
+    value = 1
+    callback: def() -> int64 = lambda [value]: value
+    consume(callback)
+"#,
+    )
+    .expect_err("passing a loan-bearing closure must not erase its region at a call boundary");
+    assert_eq!(error.code, "AU3010");
+    assert!(error
+        .message
+        .contains("call cannot erase the region of a closure containing a live view"));
+}
+
+#[test]
+fn adr0038_consuming_aggregate_arguments_reject_nested_loan_closures() {
+    for (declaration, argument) in [
+        (
+            "def consume(values: own list[def() -> int64]):\n    pass",
+            "[callback]",
+        ),
+        (
+            "def consume(values: own set[def() -> int64]):\n    pass",
+            "{callback}",
+        ),
+        (
+            "def consume(values: own dict[def() -> int64, int64]):\n    pass",
+            "{callback: 1}",
+        ),
+        (
+            "def consume(values: own dict[str, def() -> int64]):\n    pass",
+            "{\"callback\": callback}",
+        ),
+    ] {
+        let source = format!(
+            r#"
+{declaration}
+
+def main():
+    value = 1
+    callback: def() -> int64 = lambda [value]: value
+    consume({argument})
+"#
+        );
+        let error = crate::check_source(&source)
+            .expect_err("an owned aggregate argument cannot erase a nested closure loan");
+        assert_eq!(error.code, "AU3010", "{source}: {error:?}");
+    }
+}
+
+#[test]
+fn adr0038_functions_cannot_return_loan_bearing_closures() {
+    let error = crate::check_source(
+        r#"
+def leak(value: int64) -> def() -> int64:
+    callback: def() -> int64 = lambda [value]: value
+    return callback
+
+def main():
+    callback = leak(1)
+    print(callback())
+"#,
+    )
+    .expect_err("an owned function return cannot carry a live view in a closure");
+    assert_eq!(error.code, "AU3010");
+    assert!(error
+        .message
+        .contains("function cannot return a closure containing a live view"));
 }
 
 #[test]
@@ -29163,6 +29503,47 @@ def main():
 }
 
 #[test]
+fn adr0038_control_flow_forwarding_summaries_keep_exact_tuple_projections() {
+    crate::check_source(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def through_match(pairs: (Pair, Pair), choose: bool) -> view int64 from pairs:
+    match choose:
+        case true:
+            return view pairs[0].left
+        case false:
+            return view pairs[0].left
+
+def through_for(pairs: (Pair, Pair)) -> view int64 from pairs:
+    for item in [1]:
+        return view pairs[0].left
+    return view pairs[0].left
+
+def through_while(pairs: (Pair, Pair), repeat: bool) -> view int64 from pairs:
+    while repeat:
+        return view pairs[0].left
+    return view pairs[0].left
+
+def main():
+    mut matched = (Pair(left=1, right=2), Pair(left=3, right=4))
+    mut iterated = (Pair(left=5, right=6), Pair(left=7, right=8))
+    mut looped = (Pair(left=9, right=10), Pair(left=11, right=12))
+    view first = through_match(matched, true)
+    view second = through_for(iterated)
+    view third = through_while(looped, false)
+    matched[1].right = 20
+    iterated[1].right = 30
+    looped[1].right = 40
+    print(first + second + third)
+"#,
+    )
+    .expect("nested control returns must preserve the exact tuple projection footprint");
+}
+
+#[test]
 fn adr0038_returned_shared_iterables_lock_their_origin() {
     let common = r#"
 def borrow_values(values: list[int64]) -> view list[int64] from values:
@@ -29528,6 +29909,126 @@ def main():
 }
 
 #[test]
+fn adr0038_returned_views_reject_nested_literal_and_call_storage_contexts() {
+    let common = r#"
+class Box:
+    value: int64
+
+class Holder:
+    value: int64
+
+def shared_box(box: Box) -> view Box from box:
+    return view box
+
+def shared_int(value: int64) -> view int64 from value:
+    return view value
+
+def keep(value: own int64) -> int64:
+    return value
+"#;
+    for body in [
+        "    stored = [shared_int(value)]\n    print(stored)\n",
+        "    stored: set[int64] = {shared_int(value)}\n    print(stored)\n",
+        "    stored = {shared_int(value): 1}\n    print(stored)\n",
+        "    stored = {\"value\": shared_int(value)}\n    print(stored)\n",
+        "    stored = ((shared_int(value),),)\n    print(stored)\n",
+        "    stored = shared_int(value) if flag else 0\n    print(stored)\n",
+        "    stored = match flag:\n        case true: shared_int(value)\n        case false: 0\n    print(stored)\n",
+        "    stored = Holder(value=shared_int(value))\n    print(stored.value)\n",
+        "    stored = Option.Some(shared_int(value))\n    print(stored)\n",
+        "    stored = keep(shared_int(value))\n    print(stored)\n",
+    ] {
+        let source = format!(
+            r#"{common}
+def main():
+    value = 1
+    flag = true
+    box = Box(value=2)
+{body}"#
+        );
+        let error = crate::check_source(&source)
+            .expect_err("a returned view must not escape into owned storage");
+        assert_eq!(error.code, "AU3010", "{source}: {error:?}");
+    }
+}
+
+#[test]
+fn adr0038_mutable_returned_view_arguments_preserve_capability_and_overlap() {
+    let common = r#"
+class Pair:
+    left: int64
+    right: int64
+
+def left(pair: mut Pair) -> view mut int64 from pair:
+    return view mut pair.left
+
+def read(value: int64):
+    print(value)
+
+def write(value: mut int64):
+    value = 9
+
+def write_two(first: mut int64, second: mut int64):
+    first = 1
+    second = 2
+"#;
+    for body in [
+        "    read(left(pair))\n",
+        "    print(left(pair))\n",
+        "    write_two(left(pair), pair.left)\n",
+        "    write_two(first=left(pair), second=pair.left)\n",
+    ] {
+        let source = format!(
+            r#"{common}
+def main():
+    mut pair = Pair(left=1, right=2)
+{body}"#
+        );
+        let error = crate::check_source(&source)
+            .expect_err("mutable returned-view arguments must retain capability and place overlap");
+        assert!(
+            matches!(error.code.as_str(), "AU3002" | "AU3010"),
+            "{source}: {error:?}"
+        );
+    }
+
+    crate::check_source(&format!(
+        r#"{common}
+def main():
+    mut pair = Pair(left=1, right=2)
+    write(left(pair))
+    print(pair.left)
+"#
+    ))
+    .expect("a mutable returned view may flow directly to a mutable parameter");
+}
+
+#[test]
+fn adr0038_recursive_projection_cycles_remain_conservative() {
+    let error = crate::check_source(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def first(pair: Pair) -> view int64 from pair:
+    return view second(pair)
+
+def second(pair: Pair) -> view int64 from pair:
+    return view first(pair)
+
+def main():
+    mut pair = Pair(left=1, right=2)
+    view selected = first(pair)
+    pair.right = 3
+    print(selected)
+"#,
+    )
+    .expect_err("a projection cycle with no concrete return must conservatively lock its origin");
+    assert_eq!(error.code, "AU3002");
+}
+
+#[test]
 fn adr0038_assignment_indices_cannot_read_mutable_returned_views() {
     let error = crate::check_source(
         r#"
@@ -29883,6 +30384,15 @@ public class LeftBox:
     public left: int64
     public right: int64
 
+    public def direct(self) -> view int64 from self:
+        return view self.left
+
+    public def forwarded(self) -> view int64 from self:
+        return view self.direct()
+
+    public def associated(value: LeftBox) -> view int64 from value:
+        return view value.left
+
 public class RightBox:
     public left: int64
     public right: int64
@@ -29902,6 +30412,9 @@ impl Alternate for LeftBox:
 public def forward[T: Project](value: T) -> view int64 from value:
     view selected = value.get()
     return view selected
+
+public def forward_twice[T: Project](value: T) -> view int64 from value:
+    return view forward(value)
 "#,
     )
     .expect("temporary specialization module should be writable");
@@ -29917,12 +30430,39 @@ def main():
     explicit_box.right = 20
     view inferred = api.forward(inferred_box)
     inferred_box.right = 40
-    print(explicit + inferred)
+    view method = explicit_box.forwarded()
+    explicit_box.right = 30
+    view associated = api.LeftBox.associated(inferred_box)
+    inferred_box.right = 50
+    view nested_generic = api.forward_twice[api.LeftBox](explicit_box)
+    explicit_box.right = 60
+    print(explicit + inferred + method + associated + nested_generic)
 "#,
     )
     .expect("temporary specialization entry should be writable");
 
-    let result = crate::check_path(&main_path);
+    crate::check_path(&main_path)
+        .expect("imported explicit and inferred calls must retain declaration-owner precision");
+
+    for (expression, expected) in [
+        (
+            "api.LeftBox.associated",
+            "associated method values are not supported",
+        ),
+        (
+            "api.forward",
+            "cannot be stored as a structural function value",
+        ),
+        ("api.LeftBox", "must be constructed with `(...)`"),
+    ] {
+        std::fs::write(
+            &main_path,
+            format!("import api\n\ndef main():\n    value = {expression}\n    print(value)\n"),
+        )
+        .expect("temporary module-member diagnostic entry should be writable");
+        let error = crate::check_path(&main_path)
+            .expect_err("imported module items cannot decay into unsupported values");
+        assert!(error.message.contains(expected), "{expression}: {error:?}");
+    }
     let _ = std::fs::remove_dir_all(&package);
-    result.expect("imported explicit and inferred calls must retain declaration-owner precision");
 }

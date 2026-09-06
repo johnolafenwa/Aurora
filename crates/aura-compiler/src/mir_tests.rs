@@ -99,6 +99,66 @@ fn add_test_returned_view_callee(
 }
 
 #[test]
+fn adr0038_returned_contract_analysis_bounds_cumulative_alias_expansion() {
+    let baseline = crate::lower_source_to_mir(
+        "def borrow(origin: int64) -> view int64 from origin:\n    return view origin\n\ndef main():\n    value = 1\n    view selected = borrow(value)\n    print(selected)\n",
+    )
+    .expect("ordinary returned view should lower");
+    assert_eq!(crate::run_mir(&baseline).unwrap().stdout, "1\n");
+    for encoding in ["begin", "reborrow", "returned"] {
+        let mut module = baseline.clone();
+        let function = module
+            .functions
+            .iter_mut()
+            .find(|f| f.name == "borrow")
+            .unwrap();
+        let mut instructions = Vec::new();
+        let projection = "x".repeat(1024);
+        for index in 0..128 {
+            let loan = format!("alias{index}");
+            let parent = if index == 0 {
+                "origin".to_string()
+            } else {
+                format!("alias{}", index - 1)
+            };
+            instructions.push(match encoding {
+                "reborrow" if index > 0 => Instruction::Reborrow {
+                    loan,
+                    parent,
+                    projection: projection.clone(),
+                    mutable: false,
+                },
+                "returned" => Instruction::BeginReturnedLoan {
+                    loan,
+                    origin: parent,
+                    projections: vec![projection.clone()],
+                    mutable: false,
+                },
+                _ => Instruction::BeginLoan {
+                    loan,
+                    source: format!("{parent}.{projection}"),
+                    mutable: false,
+                },
+            });
+        }
+        instructions.push(Instruction::ReturnLoan {
+            loan: "alias127".to_string(),
+            origin: "origin".to_string(),
+        });
+        function.blocks[0].instructions = instructions;
+        // Every individual descriptor is small. The cumulative memo would
+        // exceed 8 MiB before the later flow/type checks can reject the input.
+        let error = function_returned_view_contract(function)
+            .expect_err("contract analysis must bound its own cumulative expansion");
+        assert!(
+            error.contains("loan-path byte limit"),
+            "{encoding}: {error}"
+        );
+        assert_public_boundaries_reject(&module, "loan-path byte limit");
+    }
+}
+
+#[test]
 fn adr0038_view_lowering_uses_explicit_loan_operations() {
     let module = crate::lower_source_to_mir(
         r#"
@@ -332,6 +392,371 @@ def main():
     });
 
     assert_public_boundaries_reject(&forged, "does not match declaration");
+}
+
+#[test]
+fn adr0038_public_mir_rejects_forged_call_argument_contracts() {
+    let baseline = crate::lower_source_to_mir(
+        r#"
+def choose(origin: int64, fallback: int64 = 0) -> view int64 from origin:
+    return view origin
+
+def main():
+    value = 1
+    view selected = choose(value)
+    print(selected)
+"#,
+    )
+    .expect("returned-view call fixture should lower");
+    validate_loan_flow(&baseline).expect("source-produced argument binding should validate");
+
+    let mutate_args = |module: &mut MirModule, update: &mut dyn FnMut(&mut Vec<MirArg>)| {
+        let args = module
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "main")
+            .into_iter()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.instructions)
+            .find_map(|instruction| match instruction {
+                Instruction::Assign {
+                    value:
+                        Rvalue::Call {
+                            callee: CallTarget::Name(name),
+                            args,
+                        },
+                    ..
+                } if name == "choose" => Some(args),
+                _ => None,
+            })
+            .expect("choose call should lower");
+        update(args);
+    };
+
+    let mut unknown_named = baseline.clone();
+    mutate_args(&mut unknown_named, &mut |args| {
+        args[0].name = Some("missing".to_string())
+    });
+    assert_public_boundaries_reject(&unknown_named, "unknown argument `missing`");
+
+    let mut duplicate_named = baseline.clone();
+    mutate_args(&mut duplicate_named, &mut |args| {
+        args[0].name = Some("origin".to_string());
+        args.push(args[0].clone());
+    });
+    let error = validate_loan_flow(&duplicate_named)
+        .expect_err("caller-supplied MIR cannot bind a parameter twice");
+    assert!(
+        error.contains("binds argument `origin` more than once"),
+        "{error}"
+    );
+
+    let mut too_many = baseline.clone();
+    mutate_args(&mut too_many, &mut |args| {
+        let extra = args[0].clone();
+        args.push(extra.clone());
+        args.push(extra);
+    });
+    let error =
+        validate_loan_flow(&too_many).expect_err("caller-supplied MIR cannot exceed call arity");
+    assert!(error.contains("has too many arguments"), "{error}");
+
+    let mut non_place_origin = baseline.clone();
+    mutate_args(&mut non_place_origin, &mut |args| {
+        args[0].value = Operand::Int(1)
+    });
+    assert_public_boundaries_reject(
+        &non_place_origin,
+        "binds its returned-view origin to a non-place operand",
+    );
+
+    let mut defaulted_origin = baseline;
+    defaulted_origin
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "choose")
+        .and_then(|function| function.params.first_mut())
+        .expect("choose origin should exist")
+        .default_function = Some("forged_default".to_string());
+    mutate_args(&mut defaulted_origin, &mut |args| args.clear());
+    let error = validate_loan_flow(&defaulted_origin)
+        .expect_err("a default marker cannot erase a returned-view origin binding");
+    assert!(
+        error.contains("omits returned-view origin parameter `origin`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn adr0038_public_mir_rejects_forged_function_and_method_declarations() {
+    let baseline = crate::lower_source_to_mir(
+        r#"
+class Holder:
+    value: int64
+
+    def borrow(self) -> view int64 from self:
+        return view self.value
+
+def identity(origin: int64) -> view int64 from origin:
+    return view origin
+
+def main():
+    value = 1
+    view selected = identity(value)
+    print(selected)
+"#,
+    )
+    .expect("function and method declaration fixture should lower");
+
+    let with_function_operand = |module: &mut MirModule, name: &str, signature: Type| {
+        let callee = module
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "main")
+            .into_iter()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.instructions)
+            .find_map(|instruction| match instruction {
+                Instruction::Assign {
+                    value: Rvalue::Call { callee, .. },
+                    ..
+                } if matches!(&*callee, CallTarget::Name(current) if current == "identity") => {
+                    Some(callee)
+                }
+                _ => None,
+            })
+            .expect("identity call should lower");
+        *callee = CallTarget::Value(Operand::Function {
+            name: name.to_string(),
+            signature: Box::new(signature),
+        });
+    };
+    let identity = baseline
+        .functions
+        .iter()
+        .find(|function| function.name == "identity")
+        .expect("identity declaration should lower");
+    let exact_signature = Type::Function {
+        params: identity
+            .params
+            .iter()
+            .map(|param| crate::sema::FunctionParamContract {
+                name: param.name.clone(),
+                ty: param.ty.clone(),
+                passing: match param.passing {
+                    MirReceiverKind::Value => crate::ast::ReceiverKind::Value,
+                    MirReceiverKind::Borrow => crate::ast::ReceiverKind::Borrow,
+                    MirReceiverKind::BorrowMut => crate::ast::ReceiverKind::BorrowMut,
+                },
+                has_default: param.default_function.is_some(),
+                default_erased: false,
+            })
+            .collect(),
+        return_type: Box::new(identity.return_type.clone()),
+    };
+
+    let mut unknown = baseline.clone();
+    with_function_operand(&mut unknown, "missing", exact_signature.clone());
+    assert_public_boundaries_reject(&unknown, "references an unknown declaration");
+
+    let mut unbound_method = baseline.clone();
+    let method_name = unbound_method
+        .classes
+        .iter()
+        .find(|class| class.name == "Holder")
+        .and_then(|class| class.methods.iter().find(|method| method.name == "borrow"))
+        .expect("Holder.borrow metadata should lower")
+        .function_name
+        .clone();
+    with_function_operand(
+        &mut unbound_method,
+        &method_name,
+        Type::Function {
+            params: Vec::new(),
+            return_type: Box::new(Type::named("int64")),
+        },
+    );
+    let error = validate_loan_flow(&unbound_method)
+        .expect_err("method declarations cannot be forged into free function values");
+    assert!(
+        error.contains("names an unbound receiver method"),
+        "{error}"
+    );
+
+    let mut non_function = baseline.clone();
+    with_function_operand(&mut non_function, "identity", Type::named("int64"));
+    let error = validate_loan_flow(&non_function)
+        .expect_err("function operands require an actual function signature");
+    assert!(error.contains("has a non-function signature"), "{error}");
+
+    let mut wrong_parameter = baseline.clone();
+    let mut signature = exact_signature.clone();
+    let Type::Function { params, .. } = &mut signature else {
+        unreachable!()
+    };
+    params[0].name = "forged_origin".to_string();
+    with_function_operand(&mut wrong_parameter, "identity", signature);
+    let error = validate_loan_flow(&wrong_parameter)
+        .expect_err("named function parameter contracts must match their declarations");
+    assert!(
+        error.contains("parameter 1 that does not match declaration"),
+        "{error}"
+    );
+
+    let mut wrong_return = baseline.clone();
+    let mut signature = exact_signature;
+    let Type::Function { return_type, .. } = &mut signature else {
+        unreachable!()
+    };
+    **return_type = Type::named("str");
+    with_function_operand(&mut wrong_return, "identity", signature);
+    let error = validate_loan_flow(&wrong_return)
+        .expect_err("function operand return contracts must match declarations");
+    assert!(
+        error.contains("return type that does not match declaration"),
+        "{error}"
+    );
+
+    let mut missing_method_body = baseline;
+    missing_method_body
+        .classes
+        .iter_mut()
+        .find(|class| class.name == "Holder")
+        .and_then(|class| {
+            class
+                .methods
+                .iter_mut()
+                .find(|method| method.name == "borrow")
+        })
+        .expect("Holder.borrow metadata should lower")
+        .function_name = "missing_method_body".to_string();
+    let main = missing_method_body
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .expect("main should lower");
+    main.local_types.push(MirLocalType {
+        name: "holder".to_string(),
+        ty: Type::named("Holder"),
+    });
+    main.blocks[0].instructions.insert(
+        0,
+        Instruction::Assign {
+            target: "unused".to_string(),
+            value: Rvalue::Call {
+                callee: CallTarget::Member {
+                    object: Operand::Place("holder".to_string()),
+                    field: "borrow".to_string(),
+                    receiver_place: None,
+                },
+                args: Vec::new(),
+            },
+        },
+    );
+    assert_public_boundaries_reject(&missing_method_body, "references missing function");
+}
+
+#[test]
+fn adr0038_public_mir_rejects_mutable_member_receiver_contract_forgery() {
+    let baseline = crate::lower_source_to_mir(
+        r#"
+class Counter:
+    value: int64
+
+    def increment(mut self):
+        self.value += 1
+
+def main():
+    mut counter = Counter(value=1)
+    counter.increment()
+"#,
+    )
+    .expect("mutable member fixture should lower");
+    validate_loan_flow(&baseline).expect("source-produced receiver contract should validate");
+
+    let mutate_callee = |module: &mut MirModule, update: &mut dyn FnMut(&mut CallTarget)| {
+        let callee = module
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "main")
+            .into_iter()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.instructions)
+            .find_map(|instruction| match instruction {
+                Instruction::Assign {
+                    value: Rvalue::Call { callee, .. },
+                    ..
+                } if matches!(&*callee, CallTarget::Member { field, .. } if field == "increment") => {
+                    Some(callee)
+                }
+                _ => None,
+            })
+            .expect("increment call should lower");
+        update(callee);
+    };
+
+    let mut non_place = baseline.clone();
+    mutate_callee(&mut non_place, &mut |callee| {
+        let CallTarget::Member { object, .. } = callee else {
+            unreachable!()
+        };
+        *object = Operand::MovePlace("counter".to_string());
+    });
+    assert_public_boundaries_reject(
+        &non_place,
+        "binds a mutable receiver to a non-place operand",
+    );
+
+    let mut missing_writeback = baseline.clone();
+    mutate_callee(&mut missing_writeback, &mut |callee| {
+        let CallTarget::Member { receiver_place, .. } = callee else {
+            unreachable!()
+        };
+        *receiver_place = None;
+    });
+    assert_public_boundaries_reject(
+        &missing_writeback,
+        "requires a mutable receiver writeback place",
+    );
+
+    let mut receiverless = baseline.clone();
+    let increment_function = receiverless
+        .classes
+        .iter()
+        .find(|class| class.name == "Counter")
+        .and_then(|class| {
+            class
+                .methods
+                .iter()
+                .find(|method| method.name == "increment")
+        })
+        .expect("increment metadata should lower")
+        .function_name
+        .clone();
+    receiverless
+        .functions
+        .iter_mut()
+        .find(|function| function.name == increment_function)
+        .expect("increment body should lower")
+        .receiver = None;
+    let error = validate_loan_flow(&receiverless)
+        .expect_err("member metadata cannot target a receiverless function");
+    assert!(
+        error.contains("targets a method without a receiver"),
+        "{error}"
+    );
+
+    let mut duplicate_class = baseline.clone();
+    duplicate_class
+        .classes
+        .push(duplicate_class.classes[0].clone());
+    assert_public_boundaries_reject(&duplicate_class, "duplicate class `Counter`");
+
+    let mut duplicate_function = baseline;
+    duplicate_function
+        .functions
+        .push(duplicate_function.functions[0].clone());
+    assert_public_boundaries_reject(&duplicate_function, "duplicate function");
 }
 
 #[test]
@@ -1021,8 +1446,9 @@ def main():
         &mut |callee| *callee = CallTarget::Name("left".to_string()),
         &mut |_, projections, _| *projections = vec!["left\0right".to_string()],
     );
-    let error = validate_loan_flow(&nul_projection)
-        .expect_err("NUL cannot alias projection whitelist entries in the direct backend");
+    let error = validate_loan_flow(&nul_projection).expect_err(
+        "NUL cannot make projection whitelist entries equivalent in the direct backend",
+    );
     assert!(error.contains("non-canonical MIR identifier"), "{error}");
     assert_public_boundaries_reject(&nul_projection, "non-canonical MIR identifier");
 }
@@ -1851,6 +2277,575 @@ fn adr0038_return_loan_is_linear_and_returned_paths_are_bounded() {
 }
 
 #[test]
+fn adr0038_returned_contract_analysis_rejects_inconsistent_and_invalid_descriptors() {
+    let make_function = |receiver: Option<MirReceiverKind>,
+                         params: Vec<MirParam>,
+                         instructions: Vec<Instruction>| MirFunction {
+        name: "contract_probe".to_string(),
+        module_name: "<test>".to_string(),
+        source_path: None,
+        span: Span::new(1, 1),
+        receiver,
+        params,
+        local_types: Vec::new(),
+        return_type: Type::named("int64"),
+        entry: "entry".to_string(),
+        blocks: vec![BasicBlock {
+            label: "entry".to_string(),
+            instructions,
+            terminator: Terminator::Return(Operand::Unit),
+        }],
+    };
+    let param = |name: &str, passing| MirParam {
+        name: name.to_string(),
+        passing,
+        ty: Type::named("int64"),
+        default_function: None,
+    };
+
+    let owned_origin = make_function(
+        None,
+        vec![param("origin", MirReceiverKind::Value)],
+        vec![Instruction::ReturnLoan {
+            loan: "origin".to_string(),
+            origin: "origin".to_string(),
+        }],
+    );
+    let error = function_returned_view_contract(&owned_origin)
+        .expect_err("owned parameters cannot authorize returned views");
+    assert!(
+        error.contains("uses owned parameter origin `origin`"),
+        "{error}"
+    );
+
+    let value_receiver = make_function(
+        Some(MirReceiverKind::Value),
+        Vec::new(),
+        vec![Instruction::ReturnLoan {
+            loan: "self".to_string(),
+            origin: "self".to_string(),
+        }],
+    );
+    let error = function_returned_view_contract(&value_receiver)
+        .expect_err("value receivers cannot authorize returned views");
+    assert!(
+        error.contains("non-borrowed receiver origin `self`"),
+        "{error}"
+    );
+
+    let inconsistent_origins = make_function(
+        None,
+        vec![
+            param("left", MirReceiverKind::Borrow),
+            param("right", MirReceiverKind::Borrow),
+        ],
+        vec![
+            Instruction::ReturnLoan {
+                loan: "left".to_string(),
+                origin: "left".to_string(),
+            },
+            Instruction::ReturnLoan {
+                loan: "right".to_string(),
+                origin: "right".to_string(),
+            },
+        ],
+    );
+    let error = function_returned_view_contract(&inconsistent_origins)
+        .expect_err("all returned paths must agree on their origin slot");
+    assert!(
+        error.contains("inconsistent returned-view origins"),
+        "{error}"
+    );
+
+    let inconsistent_capabilities = make_function(
+        None,
+        vec![param("origin", MirReceiverKind::Borrow)],
+        vec![
+            Instruction::BeginLoan {
+                loan: "selected".to_string(),
+                source: "origin".to_string(),
+                mutable: false,
+            },
+            Instruction::BeginLoan {
+                loan: "selected".to_string(),
+                source: "origin".to_string(),
+                mutable: true,
+            },
+            Instruction::ReturnLoan {
+                loan: "selected".to_string(),
+                origin: "origin".to_string(),
+            },
+        ],
+    );
+    let error = function_returned_view_contract(&inconsistent_capabilities)
+        .expect_err("one symbolic descriptor cannot mix shared and mutable definitions");
+    assert!(
+        error.contains("inconsistent returned-view capabilities"),
+        "{error}"
+    );
+
+    let inconsistent_return_capabilities = make_function(
+        None,
+        vec![param("origin", MirReceiverKind::Borrow)],
+        vec![
+            Instruction::BeginLoan {
+                loan: "shared".to_string(),
+                source: "origin.left".to_string(),
+                mutable: false,
+            },
+            Instruction::BeginLoan {
+                loan: "mutable".to_string(),
+                source: "origin.right".to_string(),
+                mutable: true,
+            },
+            Instruction::ReturnLoan {
+                loan: "shared".to_string(),
+                origin: "origin".to_string(),
+            },
+            Instruction::ReturnLoan {
+                loan: "mutable".to_string(),
+                origin: "origin".to_string(),
+            },
+        ],
+    );
+    let error = function_returned_view_contract(&inconsistent_return_capabilities)
+        .expect_err("all return paths must agree on shared versus mutable capability");
+    assert!(
+        error.contains("function `contract_probe` has inconsistent returned-view capabilities"),
+        "{error}"
+    );
+
+    let empty_projection_contract = make_function(
+        None,
+        vec![param("origin", MirReceiverKind::Borrow)],
+        vec![
+            Instruction::BeginReturnedLoan {
+                loan: "selected".to_string(),
+                origin: "origin".to_string(),
+                projections: Vec::new(),
+                mutable: false,
+            },
+            Instruction::ReturnLoan {
+                loan: "selected".to_string(),
+                origin: "origin".to_string(),
+            },
+        ],
+    );
+    let error = function_returned_view_contract(&empty_projection_contract)
+        .expect_err("a returned descriptor must authorize at least one projection");
+    assert!(
+        error.contains("empty returned-view projection contract"),
+        "{error}"
+    );
+
+    let mut alternative_product = Vec::new();
+    for index in 0..65 {
+        alternative_product.push(Instruction::BeginLoan {
+            loan: "parent".to_string(),
+            source: format!("origin.{index}"),
+            mutable: false,
+        });
+    }
+    alternative_product.push(Instruction::BeginReturnedLoan {
+        loan: "selected".to_string(),
+        origin: "parent".to_string(),
+        projections: (0..65).map(|index| index.to_string()).collect(),
+        mutable: false,
+    });
+    alternative_product.push(Instruction::ReturnLoan {
+        loan: "selected".to_string(),
+        origin: "origin".to_string(),
+    });
+    let alternative_product = make_function(
+        None,
+        vec![param("origin", MirReceiverKind::Borrow)],
+        alternative_product,
+    );
+    let error = function_returned_view_contract(&alternative_product)
+        .expect_err("symbolic origin and projection products must be bounded before expansion");
+    assert!(error.contains("exceeds the alternative limit"), "{error}");
+
+    let too_many_returned_paths = make_function(
+        None,
+        vec![param("origin", MirReceiverKind::Borrow)],
+        (0..=MAX_VALIDATED_LOAN_ALTERNATIVES)
+            .map(|index| Instruction::ReturnLoan {
+                loan: format!("origin.p{index}"),
+                origin: "origin".to_string(),
+            })
+            .collect(),
+    );
+    let error = function_returned_view_contract(&too_many_returned_paths)
+        .expect_err("distinct returned paths must have a bounded projection contract");
+    assert!(
+        error.contains("returned-view projection alternative limit"),
+        "{error}"
+    );
+
+    let large_projections = (0..1_025)
+        .map(|index| {
+            let prefix = format!("p{index}_");
+            format!(
+                "{prefix}{}",
+                "x".repeat(MAX_VALIDATED_MIR_IDENTIFIER_BYTES - prefix.len())
+            )
+        })
+        .map(|projection| Instruction::ReturnLoan {
+            loan: format!("origin.{projection}"),
+            origin: "origin".to_string(),
+        })
+        .collect();
+    let oversized_projection_contract = make_function(
+        None,
+        vec![param("origin", MirReceiverKind::Borrow)],
+        large_projections,
+    );
+    let error = function_returned_view_contract(&oversized_projection_contract)
+        .expect_err("returned projection bytes must be bounded across distinct paths");
+    assert!(
+        error.contains("returned-view projection byte limit"),
+        "{error}"
+    );
+
+    let mut missing_entry = owned_origin.clone();
+    missing_entry.entry = "missing".to_string();
+    let error = function_returned_view_contract(&missing_entry)
+        .expect_err("contract reachability requires a real entry block");
+    assert!(
+        error.contains("has missing entry block `missing`"),
+        "{error}"
+    );
+
+    let mut unknown_successor = owned_origin;
+    unknown_successor.blocks[0].terminator = Terminator::Goto("missing".to_string());
+    let error = function_returned_view_contract(&unknown_successor)
+        .expect_err("contract reachability must reject unknown successors");
+    assert!(
+        error.contains("branches to unknown block `missing` from block `entry`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn adr0038_public_mir_rejects_suspended_locked_and_overlapping_loan_accesses() {
+    let make_module = |instructions: Vec<Instruction>| MirModule {
+        constants: Vec::new(),
+        functions: vec![MirFunction {
+            name: "main".to_string(),
+            module_name: "<test>".to_string(),
+            source_path: None,
+            span: Span::new(1, 1),
+            receiver: None,
+            params: Vec::new(),
+            local_types: ["origin", "parent", "child", "other"]
+                .into_iter()
+                .map(|name| MirLocalType {
+                    name: name.to_string(),
+                    ty: Type::named("int64"),
+                })
+                .collect(),
+            return_type: Type::Unit,
+            entry: "entry".to_string(),
+            blocks: vec![BasicBlock {
+                label: "entry".to_string(),
+                instructions,
+                terminator: Terminator::Return(Operand::Unit),
+            }],
+        }],
+        classes: Vec::new(),
+        trait_impls: Vec::new(),
+        top_level: None,
+    };
+
+    let suspended_parent = make_module(vec![
+        Instruction::BeginLoan {
+            loan: "parent".to_string(),
+            source: "origin".to_string(),
+            mutable: true,
+        },
+        Instruction::Reborrow {
+            loan: "child".to_string(),
+            parent: "parent".to_string(),
+            projection: "field".to_string(),
+            mutable: false,
+        },
+        Instruction::Eval {
+            value: Operand::Place("parent".to_string()),
+        },
+    ]);
+    assert_public_boundaries_reject(&suspended_parent, "uses suspended parent loan `parent`");
+
+    let mutate_shared = make_module(vec![
+        Instruction::BeginLoan {
+            loan: "parent".to_string(),
+            source: "origin".to_string(),
+            mutable: false,
+        },
+        Instruction::Assign {
+            target: "parent".to_string(),
+            value: Rvalue::Use(Operand::Int(2)),
+        },
+    ]);
+    let error =
+        validate_loan_flow(&mutate_shared).expect_err("shared views cannot be assignment targets");
+    assert!(
+        error.contains("mutates through shared loan `parent`"),
+        "{error}"
+    );
+
+    let read_locked_source = make_module(vec![
+        Instruction::BeginLoan {
+            loan: "parent".to_string(),
+            source: "origin".to_string(),
+            mutable: true,
+        },
+        Instruction::Eval {
+            value: Operand::Place("origin".to_string()),
+        },
+    ]);
+    let error = validate_loan_flow(&read_locked_source)
+        .expect_err("mutable loans must lock direct reads of their source");
+    assert!(
+        error.contains("reads place `origin` locked by a mutable loan"),
+        "{error}"
+    );
+
+    let overlapping_mutable = make_module(vec![
+        Instruction::BeginLoan {
+            loan: "parent".to_string(),
+            source: "origin".to_string(),
+            mutable: true,
+        },
+        Instruction::BeginLoan {
+            loan: "child".to_string(),
+            source: "origin".to_string(),
+            mutable: false,
+        },
+    ]);
+    let error = validate_loan_flow(&overlapping_mutable)
+        .expect_err("overlapping access cannot bypass a live mutable loan");
+    assert!(
+        error.contains("overlaps active mutable loan `parent`"),
+        "{error}"
+    );
+
+    let dotted_descriptor = make_module(vec![Instruction::BeginLoan {
+        loan: "parent.child".to_string(),
+        source: "origin".to_string(),
+        mutable: false,
+    }]);
+    let error = validate_loan_flow(&dotted_descriptor)
+        .expect_err("loan descriptors must be local identifiers, not place paths");
+    assert!(
+        error.contains("must be one undotted local identifier"),
+        "{error}"
+    );
+}
+
+#[test]
+fn adr0038_malformed_mir_loan_instruction_diagnostics_are_specific() {
+    let reject = |instructions: Vec<Instruction>, expected: &str| {
+        let module = MirModule {
+            constants: Vec::new(),
+            functions: vec![MirFunction {
+                name: "probe".to_string(),
+                module_name: "<test>".to_string(),
+                source_path: None,
+                span: Span::new(1, 1),
+                receiver: None,
+                params: vec![MirParam {
+                    name: "origin".to_string(),
+                    passing: MirReceiverKind::Borrow,
+                    ty: Type::named("int64"),
+                    default_function: None,
+                }],
+                local_types: ["parent", "child", "other", "target"]
+                    .into_iter()
+                    .map(|name| MirLocalType {
+                        name: name.to_string(),
+                        ty: Type::named("int64"),
+                    })
+                    .collect(),
+                return_type: Type::Unit,
+                entry: "entry".to_string(),
+                blocks: vec![BasicBlock {
+                    label: "entry".to_string(),
+                    instructions,
+                    terminator: Terminator::Return(Operand::Unit),
+                }],
+            }],
+            classes: Vec::new(),
+            trait_impls: Vec::new(),
+            top_level: None,
+        };
+        let error = validate_loan_flow(&module).expect_err(expected);
+        assert!(
+            error.contains(expected),
+            "expected {expected:?}, got {error}"
+        );
+    };
+    let begin_parent = || Instruction::BeginLoan {
+        loan: "parent".to_string(),
+        source: "origin".to_string(),
+        mutable: false,
+    };
+    let reborrow_child = || Instruction::Reborrow {
+        loan: "child".to_string(),
+        parent: "parent".to_string(),
+        projection: String::new(),
+        mutable: false,
+    };
+
+    reject(
+        vec![
+            begin_parent(),
+            Instruction::Eval {
+                value: Operand::MovePlace("parent".to_string()),
+            },
+        ],
+        "moves through active loan `parent`",
+    );
+    reject(
+        vec![begin_parent(), begin_parent()],
+        "begins already-active loan `parent`",
+    );
+    reject(
+        vec![
+            begin_parent(),
+            Instruction::BeginLoan {
+                loan: "child".to_string(),
+                source: "parent".to_string(),
+                mutable: false,
+            },
+        ],
+        "must use Reborrow for parent `parent`",
+    );
+    reject(
+        vec![Instruction::BeginLoan {
+            loan: "parent".to_string(),
+            source: "missing".to_string(),
+            mutable: false,
+        }],
+        "has unknown source `missing`",
+    );
+    reject(
+        vec![Instruction::BeginLoan {
+            loan: "parent".to_string(),
+            source: "origin".to_string(),
+            mutable: true,
+        }],
+        "escalates shared input `origin`",
+    );
+    reject(
+        vec![Instruction::Reborrow {
+            loan: "child".to_string(),
+            parent: "parent".to_string(),
+            projection: String::new(),
+            mutable: false,
+        }],
+        "has inactive parent `parent`",
+    );
+    reject(
+        vec![begin_parent(), reborrow_child(), reborrow_child()],
+        "begins already-active reborrow `child`",
+    );
+    reject(
+        vec![Instruction::ReadLoan {
+            target: "target".to_string(),
+            loan: "parent".to_string(),
+        }],
+        "reads inactive loan `parent`",
+    );
+    reject(
+        vec![
+            Instruction::BeginLoan {
+                loan: "parent".to_string(),
+                source: "other".to_string(),
+                mutable: true,
+            },
+            reborrow_child(),
+            Instruction::ReadLoan {
+                target: "target".to_string(),
+                loan: "parent".to_string(),
+            },
+        ],
+        "reads suspended parent loan `parent`",
+    );
+    reject(
+        vec![Instruction::WriteLoan {
+            loan: "parent".to_string(),
+            value: Rvalue::Use(Operand::Int(1)),
+        }],
+        "writes inactive loan `parent`",
+    );
+    reject(
+        vec![
+            begin_parent(),
+            Instruction::WriteLoan {
+                loan: "parent".to_string(),
+                value: Rvalue::Use(Operand::Int(1)),
+            },
+        ],
+        "writes through shared loan `parent`",
+    );
+    reject(
+        vec![
+            Instruction::BeginLoan {
+                loan: "parent".to_string(),
+                source: "other".to_string(),
+                mutable: true,
+            },
+            reborrow_child(),
+            Instruction::WriteLoan {
+                loan: "parent".to_string(),
+                value: Rvalue::Use(Operand::Int(1)),
+            },
+        ],
+        "writes suspended parent loan `parent`",
+    );
+    reject(
+        vec![
+            begin_parent(),
+            reborrow_child(),
+            Instruction::EndLoan {
+                loan: "parent".to_string(),
+            },
+        ],
+        "ends parent loan `parent` before its child",
+    );
+    reject(
+        vec![Instruction::EndLoan {
+            loan: "parent".to_string(),
+        }],
+        "ends inactive loan `parent`",
+    );
+    reject(
+        vec![
+            begin_parent(),
+            reborrow_child(),
+            Instruction::ReturnLoan {
+                loan: "parent".to_string(),
+                origin: "origin".to_string(),
+            },
+        ],
+        "still has an active child",
+    );
+    reject(
+        vec![
+            begin_parent(),
+            Instruction::ReturnLoan {
+                loan: "parent".to_string(),
+                origin: "origin".to_string(),
+            },
+            Instruction::Eval {
+                value: Operand::Unit,
+            },
+        ],
+        "executes a non-cleanup instruction after returning a loan",
+    );
+}
+
+#[test]
 fn adr0038_mir_structure_is_validated_before_reachability() {
     let baseline =
         crate::lower_source_to_mir("def main():\n    pass\n").expect("baseline MIR should lower");
@@ -1989,6 +2984,93 @@ fn adr0038_mir_reborrow_and_returned_projections_are_canonical_and_type_valid() 
         }
     }
 
+    let non_projectable = make_module(
+        Type::Unit,
+        Type::named("int64"),
+        Type::named("int64"),
+        Vec::new(),
+        vec![
+            Instruction::BeginLoan {
+                loan: "parent".to_string(),
+                source: "origin.value".to_string(),
+                mutable: false,
+            },
+            Instruction::EndLoan {
+                loan: "parent".to_string(),
+            },
+        ],
+    );
+    let error = validate_loan_flow(&non_projectable)
+        .expect_err("loan projections cannot traverse scalar values");
+    assert!(
+        error.contains("traverses a non-projectable type"),
+        "{error}"
+    );
+
+    let generic_box = MirClass {
+        name: "Box".to_string(),
+        type_params: vec!["T".to_string()],
+        fields: vec![MirClassField {
+            name: "value".to_string(),
+            ty: Type::TypeParam("T".to_string()),
+        }],
+        methods: Vec::new(),
+    };
+    let malformed_generic = make_module(
+        Type::Named("Box".to_string(), Vec::new()),
+        Type::named("int64"),
+        Type::named("int64"),
+        vec![generic_box],
+        vec![
+            Instruction::BeginLoan {
+                loan: "parent".to_string(),
+                source: "origin.value".to_string(),
+                mutable: false,
+            },
+            Instruction::EndLoan {
+                loan: "parent".to_string(),
+            },
+        ],
+    );
+    let error = validate_loan_flow(&malformed_generic)
+        .expect_err("class projection types must carry the declared generic arity");
+    assert!(
+        error.contains("class type `Box`") && error.contains("has 0 arguments, expected 1"),
+        "{error}"
+    );
+
+    let pair_for_mismatch = MirClass {
+        name: "TypedPair".to_string(),
+        type_params: Vec::new(),
+        fields: vec![MirClassField {
+            name: "left".to_string(),
+            ty: Type::named("int64"),
+        }],
+        methods: Vec::new(),
+    };
+    let mismatched_descriptor = make_module(
+        Type::named("TypedPair"),
+        Type::named("str"),
+        Type::named("int64"),
+        vec![pair_for_mismatch],
+        vec![
+            Instruction::BeginLoan {
+                loan: "parent".to_string(),
+                source: "origin.left".to_string(),
+                mutable: false,
+            },
+            Instruction::EndLoan {
+                loan: "parent".to_string(),
+            },
+        ],
+    );
+    let error = validate_loan_flow(&mismatched_descriptor)
+        .expect_err("loan descriptor storage must match its projected source type");
+    assert!(
+        error.contains("projects `origin.left` with type") && error.contains("expected"),
+        "{error}"
+    );
+
     let pair = MirClass {
         name: "Pair".to_string(),
         type_params: Vec::new(),
@@ -2053,6 +3135,33 @@ fn adr0038_mir_reborrow_and_returned_projections_are_canonical_and_type_valid() 
     let error = validate_loan_flow(&self_shadow)
         .expect_err("a returned loan descriptor cannot shadow its origin root");
     assert!(error.contains("shadows its origin root"), "{error}");
+}
+
+#[test]
+fn adr0038_symbolic_contract_budget_rejects_direct_resource_overflow() {
+    let alternatives = SymbolicLoanContract {
+        sources: (0..=MAX_VALIDATED_LOAN_ALTERNATIVES)
+            .map(|index| std::sync::Arc::<str>::from(format!("origin.field{index}")))
+            .collect(),
+        mutable: false,
+    };
+    let error = validate_symbolic_loan_contract_budget("selected", &alternatives)
+        .expect_err("symbolic contracts must reject too many distinct origins");
+    assert!(error.contains("exceeds the alternative limit"), "{error}");
+
+    let expanded_path = SymbolicLoanContract {
+        sources: std::iter::once(std::sync::Arc::<str>::from(
+            "x".repeat(MAX_VALIDATED_EXPANDED_LOAN_PATH_BYTES + 1),
+        ))
+        .collect(),
+        mutable: true,
+    };
+    let error = validate_symbolic_loan_contract_budget("selected", &expanded_path)
+        .expect_err("symbolic contracts must reject oversized expanded paths");
+    assert!(
+        error.contains("exceeds the expanded loan-path byte limit"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -2400,6 +3509,144 @@ def plain():
         })
         .expect("plain function should be present");
     assert!(return_view_projections(plain).is_empty());
+}
+
+#[test]
+fn mir_projection_and_unknown_type_helpers_preserve_fallback_contracts() {
+    let expr = |kind| Expr {
+        kind,
+        span: Span::new(1, 1),
+    };
+    let origin = expr(ExprKind::Name("origin".to_string()));
+    let grouped = expr(ExprKind::Group(Box::new(expr(ExprKind::Group(Box::new(
+        origin.clone(),
+    ))))));
+    assert!(matches!(
+        &grouped_mir_expr(&grouped).kind,
+        ExprKind::Name(name) if name == "origin"
+    ));
+
+    let aliases = BTreeMap::from([
+        ("roots".to_string(), vec![String::new(), "base".to_string()]),
+        ("empty".to_string(), Vec::new()),
+    ]);
+    let member = expr(ExprKind::Member {
+        object: Box::new(expr(ExprKind::Name("roots".to_string()))),
+        field: "field".to_string(),
+    });
+    assert_eq!(
+        return_view_projection_set(&member, "origin", &aliases),
+        vec!["field".to_string(), "base.field".to_string()]
+    );
+    let index = expr(ExprKind::Index {
+        object: Box::new(expr(ExprKind::Name("roots".to_string()))),
+        index: Box::new(expr(ExprKind::Int(2))),
+    });
+    assert_eq!(
+        return_view_projection_set(&index, "origin", &aliases),
+        vec!["2".to_string(), "base.2".to_string()]
+    );
+    for invalid_index in [
+        ExprKind::Name("dynamic".to_string()),
+        ExprKind::Int(u128::MAX),
+    ] {
+        let invalid = expr(ExprKind::Index {
+            object: Box::new(origin.clone()),
+            index: Box::new(expr(invalid_index)),
+        });
+        assert!(return_view_projection_set(&invalid, "origin", &aliases).is_empty());
+    }
+    assert!(return_view_projection_set(
+        &expr(ExprKind::Name("empty".to_string())),
+        "origin",
+        &aliases
+    )
+    .is_empty());
+    assert!(return_view_projection_set(&expr(ExprKind::Int(1)), "origin", &aliases).is_empty());
+
+    let contract = |ty| crate::sema::FunctionParamContract {
+        name: "value".to_string(),
+        ty,
+        passing: ReceiverKind::Value,
+        has_default: false,
+        default_erased: false,
+    };
+    let closure = |params, captures, return_type| Type::Closure {
+        params: Box::new(params),
+        return_type: Box::new(return_type),
+        captures: Box::new(captures),
+        call_kind: crate::sema::ClosureCallKind::Repeatable,
+    };
+    assert!(type_contains_unknown(&closure(
+        vec![contract(Type::named("Unknown"))],
+        Vec::new(),
+        Type::Unit,
+    )));
+    assert!(type_contains_unknown(&closure(
+        Vec::new(),
+        vec![crate::sema::ClosureCapture {
+            name: "captured".to_string(),
+            ty: Type::named("Unknown"),
+            mode: crate::sema::ClosureCaptureMode::Copy,
+            span: Span::new(1, 1),
+        }],
+        Type::Unit,
+    )));
+    assert!(type_contains_unknown(&closure(
+        Vec::new(),
+        Vec::new(),
+        Type::named("Unknown"),
+    )));
+    assert!(!type_contains_unknown(&closure(
+        Vec::new(),
+        Vec::new(),
+        Type::Module("resolved".to_string()),
+    )));
+}
+
+#[test]
+fn adr0038_contextual_returned_call_projections_cross_control_flow_shapes() {
+    let module = crate::lower_source_to_mir(
+        r#"
+class Pair:
+    left: int64
+    right: int64
+
+def select_left(origin: Pair) -> view int64 from origin:
+    return view origin.left
+
+def forward(origin: Pair, condition: bool) -> view int64 from origin:
+    if condition:
+        view selected = select_left(origin)
+        return view selected
+    match condition:
+        case true:
+            return view select_left(origin)
+        case _:
+            pass
+    for ignored in [1]:
+        return view select_left(origin)
+    while condition:
+        return view select_left(origin)
+    return view select_left(origin)
+
+def main():
+    pair = Pair(left=1, right=2)
+    view selected = forward(pair, false)
+    print(selected)
+"#,
+    )
+    .expect("returned-call projections should be discovered through control-flow bodies");
+    let forward = module
+        .functions
+        .iter()
+        .find(|function| function.name == "forward")
+        .expect("forward should lower");
+    let contract = function_returned_view_contract(forward)
+        .expect("lowered contextual contract should validate")
+        .expect("forward should expose a returned-view contract");
+    assert_eq!(contract.projections.as_ref(), &["left".to_string()]);
+    validate_loan_flow(&module).expect("contextual returned-call MIR should validate");
 }
 
 #[test]

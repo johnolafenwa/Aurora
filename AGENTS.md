@@ -15,6 +15,27 @@ Before implementing a new feature or fixing a bug:
 
 Do not treat examples and tutorials as passive documentation. They are part of the maintained surface of the project.
 
+## Security-Sensitive Agent Delegation
+
+For authorized defensive work that is likely to encounter cybersecurity
+safeguards, delegate the security-sensitive subtask to a Daybreak Blue
+sub-agent (`gpt-daybreak-blue-latest`) when that approved model is available.
+This is the user's standing preference for this repository across sessions.
+
+- Apply this to vulnerability investigation, security patch validation,
+  adversarial or malformed-input regression tests, resource-exhaustion
+  analysis, and related security-sensitive compiler/runtime review.
+- Give the sub-agent a concrete, bounded task, the authorized repository scope,
+  relevant findings, and explicit file ownership. Keep ordinary implementation,
+  documentation, release preparation, and coordination with the primary agent.
+- Preserve the test-first workflow, existing coverage gates, user changes, and
+  applicable security-skill requirements. Review the sub-agent's evidence and
+  changes before integrating them.
+- Use only approved access. Delegation does not broaden authorization, bypass
+  safeguards, or guarantee that a request will be accepted. If Daybreak Blue
+  is unavailable or the task is restricted, report the limitation rather than
+  silently substituting another model or attempting to evade the restriction.
+
 ## Persistence And Stop Conditions
 
 Treat explicit completion conditions literally. Agents may work for as long as

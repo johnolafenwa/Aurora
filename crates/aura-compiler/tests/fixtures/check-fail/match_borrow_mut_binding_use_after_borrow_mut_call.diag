@@ -1,4 +1,4 @@
-error[AU2999]: cannot use pattern binding `v` after reassigning match scrutinee `x`
+error[AU3002]: cannot use pattern binding `v` after reassigning match scrutinee `x`
  --> crates/aura-compiler/tests/fixtures/check-fail/match_borrow_mut_binding_use_after_borrow_mut_call.au:13:13
    |
 13 |             v = v + 1

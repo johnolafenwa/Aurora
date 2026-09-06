@@ -1,6 +1,6 @@
 # Downloads
 
-Aura 0.3.2 is a technical preview. The compiler, command-line tools, editor
+Aura 0.3.3 is a technical preview. The compiler, command-line tools, editor
 extension, reference manual, and source are distributed from the
 [Aura GitHub repository](https://github.com/johnolafenwa/Aura).
 
@@ -25,7 +25,7 @@ Choose a detailed platform guide:
 - [Windows 11 through Ubuntu on WSL 2](/install/windows-wsl)
 
 Download the archive for your platform from the
-[v0.3.2-preview release](https://github.com/johnolafenwa/Aura/releases/tag/v0.3.2-preview).
+[v0.3.3-preview release](https://github.com/johnolafenwa/Aura/releases/tag/v0.3.3-preview).
 Each release includes Linux x64, macOS x64, and macOS arm64 archives together
 with a `SHA256SUMS` manifest.
 
@@ -44,7 +44,7 @@ Install **Aura Programming Language** from either public extension registry:
 - [Open VSX](https://open-vsx.org/extension/JohnOlafenwa/vscode-aura-lang)
 
 The registry packages are identical and carry the plain extension version
-`0.3.3`. The extension needs the `aura` executable on `PATH` because semantic
+`0.3.4`. The extension needs the `aura` executable on `PATH` because semantic
 editor features run through the compiler-owned `aura lsp` server.
 
 Install from a terminal with:
@@ -54,7 +54,7 @@ code --install-extension JohnOlafenwa.vscode-aura-lang
 ```
 
 For a manual installation, download
-[`aura-language.vsix`](https://github.com/johnolafenwa/Aura/releases/download/v0.3.2-preview/aura-language.vsix)
+[`aura-language.vsix`](https://github.com/johnolafenwa/Aura/releases/download/v0.3.3-preview/aura-language.vsix)
 from the GitHub Release, then choose **Extensions: Install from VSIX...** in
 VS Code.
 

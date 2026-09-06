@@ -1,4 +1,4 @@
-error[AU2999]: cannot use pattern binding `v` after reassigning match scrutinee `holder.state`
+error[AU3002]: cannot use pattern binding `v` after reassigning match scrutinee `holder.state`
  --> crates/aura-compiler/tests/fixtures/check-fail/match_borrow_mut_field_binding_use_after_scrutinee_reassign.au:13:13
    |
 13 |             v = v + 1

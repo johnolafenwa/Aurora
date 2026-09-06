@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-release_tag=v0.3.2-preview
+release_tag=v0.3.3-preview
 prefix=${AURA_INSTALL_PREFIX:-"$HOME/.local"}
 base_url=${AURA_INSTALL_BASE_URL:-"https://github.com/johnolafenwa/Aura/releases/download/$release_tag"}
 

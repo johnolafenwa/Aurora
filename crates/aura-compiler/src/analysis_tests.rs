@@ -7,13 +7,14 @@ use super::{
     extract_receiver_ending_before, find_identifier_in_line, find_receiver_start,
     first_dangling_member_line, format_class_hover, format_enum_hover_named,
     format_function_detail, format_function_hover, format_method_hover, format_value_hover,
-    format_variant_hover, infer_builtin_variant_call, lower_type_ref,
-    placeholder_stmt_for_return_type, range_from_span, range_from_span_with_path,
+    format_variant_hover, infer_builtin_variant_call, lambda_capture_opener_before_position,
+    lower_type_ref, placeholder_stmt_for_return_type, range_from_span, range_from_span_with_path,
     recover_checked_program_after_member_errors, recover_checked_program_after_member_errors_with,
     recover_checked_program_after_parse_error_with, recover_checked_program_after_position,
     render_view_source, replace_dangling_member_stmt_with_recovery_stmt,
-    sanitize_member_completion_source, stmt_end_line, stmt_start_line, symbols_from_module,
-    view_source_root, AnalysisBuilder, TypeExt,
+    replace_lambda_capture_statement_with_recovery_stmt, sanitize_member_completion_source,
+    stmt_end_line, stmt_start_line, symbols_from_module, view_source_root, AnalysisBuilder,
+    TypeExt,
 };
 use crate::ast::{
     Argument, AssignStmt, AssignTarget, BinaryOp, ClassDecl, Expr, ExprKind, FunctionDecl, Item,
@@ -6916,6 +6917,63 @@ def main():
 }
 
 #[test]
+fn adr0038_capture_recovery_ignores_quoted_delimiters_and_stale_capture_names() {
+    let recovery_source = [
+        "def main():",
+        "    value = 1",
+        "    callback = lambda [",
+        r#"        "ignored \" ] delimiter","#,
+        "        val",
+        "    ]: val",
+        "    print(value)",
+    ]
+    .join("\n");
+    let cursor_line = 4;
+    let opener = lambda_capture_opener_before_position(
+        &recovery_source,
+        cursor_line,
+        recovery_source.lines().nth(cursor_line).unwrap().len(),
+    )
+    .expect("the quote-aware scanner should retain the real capture opener");
+    let recovered = replace_lambda_capture_statement_with_recovery_stmt(&recovery_source, opener);
+    assert_eq!(recovered.lines().nth(5), Some("    pass"));
+    assert_eq!(recovered.lines().nth(6), Some("    print(value)"));
+    crate::check_source(&recovered).expect("the replacement should remain valid function syntax");
+
+    let checked_source = [
+        "def main():",
+        "    values = [1]",
+        "    callback: def() -> int64 = lambda [values]: values.len()",
+    ]
+    .join("\n");
+    let program = checked_program(&checked_source);
+    let Item::Function(main) = &program.module.items[0] else {
+        panic!("expected main function");
+    };
+    let crate::ast::Stmt::Assign(assign) = &main.body[1] else {
+        panic!("expected callback assignment");
+    };
+    let mut stale_lambda = assign.value.clone();
+    let ExprKind::Lambda { captures, .. } = &mut stale_lambda.kind else {
+        panic!("expected checked lambda");
+    };
+    let stale_capture = captures
+        .as_mut()
+        .and_then(|captures| captures.first_mut())
+        .expect("expected explicit capture");
+    stale_capture.name = "removed".to_string();
+    let stale_span = stale_capture.span;
+    let mut builder = AnalysisBuilder::new(&checked_source, &program, Vec::new());
+    builder.visit_expr(&stale_lambda, &BTreeMap::new());
+    let stale_range = range_from_span(stale_span, "removed".len());
+    assert!(builder.output.occurrences.iter().all(|occurrence| {
+        occurrence.line != stale_range.line
+            || occurrence.start_character != stale_range.start_character
+            || occurrence.end_character != stale_range.end_character
+    }));
+}
+
+#[test]
 fn adr0038_analysis_view_source_helpers_cover_place_shapes_and_recovery() {
     let name = expr(ExprKind::Name("pair".to_string()));
     let member = expr(ExprKind::Member {
@@ -6941,6 +6999,413 @@ fn adr0038_analysis_view_source_helpers_cover_place_shapes_and_recovery() {
     let literal = expr(ExprKind::Int(7));
     assert_eq!(view_source_root(&literal), None);
     assert_eq!(render_view_source(&literal), None);
+
+    let program = checked_program("def main():\n    pass\n");
+    let mut builder = AnalysisBuilder::new("", &program, Vec::new());
+    let mut scope = BTreeMap::new();
+    let fallback = ViewStmt {
+        name: "selected".to_string(),
+        mutable: false,
+        source: literal,
+        span: Span::new(2, 5),
+    };
+    builder.bind_view_value(&fallback, Type::named("int64"), &mut scope);
+    let selected = scope
+        .get("selected")
+        .expect("recovery should retain an unresolved view binding");
+    assert_eq!(
+        selected.definition,
+        range_from_span(fallback.span, fallback.name.len())
+    );
+    assert_eq!(
+        selected.hover,
+        "```aura\nview selected: int64 from <place>\n```"
+    );
+}
+
+#[test]
+fn adr0038_analysis_resolves_imported_returned_views_and_nested_type_arguments() {
+    let temp = TempDir::new("analysis-imported-returned-view");
+    let helper_path = temp.path().join("helpers.au");
+    let main_path = temp.path().join("main.au");
+    fs::write(
+        &helper_path,
+        [
+            "public class Box:",
+            "    public value: int64",
+            "",
+            "public def borrow(box: Box) -> view int64 from box:",
+            "    return view box.value",
+            "",
+            "def internal_borrow(box: Box) -> view int64 from box:",
+            "    return view box.value",
+        ]
+        .join("\n"),
+    )
+    .expect("should write returned-view helper module");
+    let source = [
+        "import helpers",
+        "",
+        "def main():",
+        "    box = helpers.Box(value=7)",
+        "    view selected = helpers.borrow(box)",
+        "    print(selected)",
+    ]
+    .join("\n");
+    fs::write(&main_path, &source).expect("should write importing module");
+    let analysis = analyze_path_source(&main_path, &source);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
+    let selected = analysis
+        .occurrences
+        .iter()
+        .find(|occurrence| occurrence.hover.contains("view selected:"))
+        .expect("imported returned view should produce a binding occurrence");
+    assert_eq!(
+        selected.hover,
+        "```aura\nview selected: int64 from box\n```"
+    );
+    assert_eq!(
+        selected.definition.as_ref().map(|range| range.line),
+        Some(3)
+    );
+
+    let imported_program = crate::check_path(&main_path).expect("importing program should check");
+    let namespace = imported_program
+        .imported_modules
+        .get("helpers")
+        .expect("helpers namespace should be imported");
+    assert!(!namespace.functions.contains_key("internal_borrow"));
+    assert!(namespace.all_functions.contains_key("internal_borrow"));
+    let imported_builder = AnalysisBuilder::new(&source, &imported_program, Vec::new());
+    let internal_callee = expr(ExprKind::Member {
+        object: Box::new(expr(ExprKind::Name("helpers".to_string()))),
+        field: "internal_borrow".to_string(),
+    });
+    assert_eq!(
+        imported_builder
+            .analysis_function_info_for_callee(&internal_callee, &BTreeMap::new())
+            .map(|function| function.decl.name.as_str()),
+        Some("internal_borrow"),
+        "whole-module analysis metadata should remain available without exporting the symbol"
+    );
+    assert_eq!(
+        imported_builder
+            .returned_view_callee_decl(&internal_callee, &BTreeMap::new())
+            .map(|(decl, receiver)| (decl.name, receiver.is_none())),
+        Some(("internal_borrow".to_string(), true))
+    );
+
+    let program = checked_program("def main():\n    pass\n");
+    let builder = AnalysisBuilder::new("", &program, Vec::new());
+    let type_name = |name: &str| expr(ExprKind::Name(name.to_string()));
+    let list_of_int = expr(ExprKind::Index {
+        object: Box::new(type_name("list")),
+        index: Box::new(expr(ExprKind::Group(Box::new(type_name("int"))))),
+    });
+    let nested = expr(ExprKind::Group(Box::new(expr(ExprKind::Index {
+        object: Box::new(type_name("dict")),
+        index: Box::new(expr(ExprKind::Tuple(vec![
+            type_name("str"),
+            list_of_int.clone(),
+        ]))),
+    }))));
+    assert_eq!(
+        builder.analysis_type_arg_expr(&nested),
+        Some(Type::Named(
+            "dict".to_string(),
+            vec![
+                Type::named("str"),
+                Type::Named("list".to_string(), vec![Type::named("int64")]),
+            ],
+        ))
+    );
+    assert_eq!(
+        builder.analysis_type_arg_expr(&list_of_int),
+        Some(Type::Named("list".to_string(), vec![Type::named("int64")]))
+    );
+    assert!(builder
+        .analysis_type_arg_expr(&expr(ExprKind::Index {
+            object: Box::new(expr(ExprKind::Int(1))),
+            index: Box::new(type_name("str")),
+        }))
+        .is_none());
+    assert!(builder
+        .analysis_type_arg_expr(&expr(ExprKind::Int(1)))
+        .is_none());
+}
+
+#[test]
+fn adr0038_analysis_callee_resolution_handles_grouping_shadowing_and_arity() {
+    let source = [
+        "trait Project:",
+        "    def borrow[Item](self, value: Item) -> view Item from value",
+        "",
+        "trait Alternate:",
+        "    def borrow[Item](self, value: Item) -> view Item from value",
+        "",
+        "class Box:",
+        "    value: int64",
+        "",
+        "    def borrow[Item](self, value: Item) -> view Item from value:",
+        "        return view value",
+        "",
+        "class Holder[Item]:",
+        "    value: Item",
+        "",
+        "    def get(self) -> view Item from self:",
+        "        return view self.value",
+        "",
+        "class TraitBorrower:",
+        "    value: int64",
+        "",
+        "impl Project for TraitBorrower:",
+        "    def borrow[Item](self, value: Item) -> view Item from value:",
+        "        return view value",
+        "",
+        "def identity[Item](value: Item) -> view Item from value:",
+        "    return view value",
+        "",
+        "def nested(origin: int64):",
+        "    view result = identity(identity(origin))",
+        "    print(result)",
+        "",
+        "def choose[Left, Right](left: Left, right: own Right) -> Right:",
+        "    return right",
+        "",
+        "def keep[Item](value: own Item, enabled: bool = true) -> Item:",
+        "    return value",
+        "",
+        "def inspect[Item: Project](value: Item):",
+        "    pass",
+    ]
+    .join("\n");
+    let program = checked_program(&source);
+    let analysis = analyze_source(&source);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "nested returned-view analysis should succeed: {:?}",
+        analysis.diagnostics
+    );
+    assert!(analysis
+        .occurrences
+        .iter()
+        .any(|occurrence| occurrence.hover == "```aura\nview result: int64 from origin\n```"));
+    let mut builder = AnalysisBuilder::new(&source, &program, Vec::new());
+    let name = |value: &str| expr(ExprKind::Name(value.to_string()));
+    let grouped = expr(ExprKind::Group(Box::new(name("identity"))));
+    let specialized = expr(ExprKind::Specialize {
+        expr: Box::new(grouped.clone()),
+        type_args: vec![type_ref("int64")],
+    });
+    assert_eq!(
+        builder
+            .analysis_function_info_for_callee(&specialized, &BTreeMap::new())
+            .map(|info| info.decl.name.as_str()),
+        Some("identity")
+    );
+    assert_eq!(
+        builder
+            .returned_view_callee_decl(&specialized, &BTreeMap::new())
+            .map(|(decl, receiver)| (decl.name, receiver.is_none())),
+        Some(("identity".to_string(), true))
+    );
+
+    let mut scope = BTreeMap::new();
+    builder.bind_named_value("identity", Type::named("int64"), 1, "binding", &mut scope);
+    assert!(builder
+        .analysis_function_info_for_callee(&name("identity"), &scope)
+        .is_none());
+    assert!(builder
+        .analysis_function_info_for_callee(&expr(ExprKind::Int(1)), &scope)
+        .is_none());
+
+    let grouped_choose = expr(ExprKind::Group(Box::new(expr(ExprKind::Index {
+        object: Box::new(name("choose")),
+        index: Box::new(expr(ExprKind::Tuple(vec![name("int"), name("str")]))),
+    }))));
+    assert!(builder
+        .returned_view_callee_decl(&grouped_choose, &BTreeMap::new())
+        .is_none());
+    let grouped_value_index = expr(ExprKind::Group(Box::new(expr(ExprKind::Index {
+        object: Box::new(expr(ExprKind::Int(1))),
+        index: Box::new(expr(ExprKind::Int(0))),
+    }))));
+    assert!(builder
+        .returned_view_callee_decl(&grouped_value_index, &BTreeMap::new())
+        .is_none());
+    assert_eq!(
+        builder.infer_call_type(
+            &grouped_choose,
+            &[
+                arg(expr(ExprKind::Int(1))),
+                arg(expr(ExprKind::String("kept".to_string()))),
+            ],
+            &BTreeMap::new(),
+        ),
+        Some(Type::named("str"))
+    );
+    let wrong_arity_choose = expr(ExprKind::Group(Box::new(expr(ExprKind::Index {
+        object: Box::new(name("choose")),
+        index: Box::new(name("int")),
+    }))));
+    assert!(builder
+        .infer_call_type(
+            &wrong_arity_choose,
+            &[
+                arg(expr(ExprKind::Int(1))),
+                arg(expr(ExprKind::String("kept".to_string()))),
+            ],
+            &BTreeMap::new(),
+        )
+        .is_none());
+
+    let box_expr = name("box");
+    let member = expr(ExprKind::Member {
+        object: Box::new(box_expr.clone()),
+        field: "borrow".to_string(),
+    });
+    let receiver_type = Type::named("Box");
+    assert!(builder
+        .infer_member_call_return_type(
+            &box_expr,
+            &receiver_type,
+            "borrow",
+            &[],
+            Some(&[]),
+            &BTreeMap::new(),
+        )
+        .is_none());
+    assert_eq!(
+        builder.infer_member_call_return_type(
+            &name("holder"),
+            &Type::named("Holder"),
+            "get",
+            &[],
+            None,
+            &BTreeMap::new(),
+        ),
+        Some(Type::TypeParam("Item".to_string())),
+        "an incomplete generic receiver should preserve its unresolved method result"
+    );
+
+    let inspect_line = source
+        .lines()
+        .position(|line| line.trim() == "pass")
+        .expect("inspect body");
+    let trait_scope = builder.scope_for_line(inspect_line);
+    let trait_receiver = trait_scope
+        .get("value")
+        .expect("generic parameter should be in scope")
+        .ty
+        .clone();
+    let trait_member = expr(ExprKind::Member {
+        object: Box::new(name("value")),
+        field: "borrow".to_string(),
+    });
+    assert_eq!(
+        builder
+            .returned_view_callee_decl(&trait_member, &trait_scope)
+            .map(|(decl, receiver)| (decl.name, receiver.is_some())),
+        Some(("borrow".to_string(), true))
+    );
+    assert!(builder
+        .infer_member_call_return_type(
+            &name("value"),
+            &trait_receiver,
+            "borrow",
+            &[],
+            Some(&[]),
+            &trait_scope,
+        )
+        .is_none());
+
+    assert!(builder
+        .infer_member_call_return_type(
+            &name("projected"),
+            &Type::named("TraitBorrower"),
+            "borrow",
+            &[],
+            Some(&[]),
+            &BTreeMap::new(),
+        )
+        .is_none());
+
+    let mut ambiguous_scope = trait_scope.clone();
+    ambiguous_scope
+        .get_mut("value")
+        .expect("generic parameter should remain mutable in the editor scope")
+        .trait_bounds = vec![
+        TraitBound {
+            trait_name: "Missing".to_string(),
+            trait_args: Vec::new(),
+        },
+        TraitBound {
+            trait_name: "Project".to_string(),
+            trait_args: Vec::new(),
+        },
+        TraitBound {
+            trait_name: "Project".to_string(),
+            trait_args: Vec::new(),
+        },
+        TraitBound {
+            trait_name: "Alternate".to_string(),
+            trait_args: Vec::new(),
+        },
+    ];
+    assert!(builder
+        .unambiguous_trait_bound_method(&trait_receiver, "borrow", &ambiguous_scope)
+        .is_none());
+    assert!(builder
+        .returned_view_callee_decl(&trait_member, &ambiguous_scope)
+        .is_none());
+
+    assert!(builder
+        .infer_specialized_callable_return_type(
+            &expr(ExprKind::Group(Box::new(member))),
+            &[],
+            &[],
+            &BTreeMap::new(),
+        )
+        .is_none());
+    assert!(
+        builder
+            .infer_specialized_callable_return_type(
+                &expr(ExprKind::Int(1)),
+                &[],
+                &[],
+                &BTreeMap::new(),
+            )
+            .is_none()
+    );
+
+    assert_eq!(
+        builder.infer_call_type(
+            &name("keep"),
+            &[arg(expr(ExprKind::Int(1)))],
+            &BTreeMap::new(),
+        ),
+        Some(Type::named("int64"))
+    );
+    assert_eq!(
+        builder.infer_call_type(&name("keep"), &[arg(name("unresolved"))], &BTreeMap::new(),),
+        Some(Type::TypeParam("Item".to_string()))
+    );
+    assert_eq!(
+        builder.infer_call_type(
+            &name("keep"),
+            &[
+                arg(expr(ExprKind::Int(1))),
+                arg(expr(ExprKind::Bool(true))),
+                arg(expr(ExprKind::Bool(false))),
+            ],
+            &BTreeMap::new(),
+        ),
+        Some(Type::TypeParam("Item".to_string()))
+    );
 }
 
 #[test]

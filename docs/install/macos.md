@@ -26,7 +26,7 @@ verified installer:
 curl -fsSL https://johnolafenwa.github.io/Aura/install.sh | sh
 ```
 
-The script downloads the matching `v0.3.2-preview` archive and checks it
+The script downloads the matching `v0.3.3-preview` archive and checks it
 against the release's `SHA256SUMS` file before copying anything into the
 installation prefix.
 
@@ -55,7 +55,7 @@ The command path should end in `.local/bin/aura`, and the version should begin
 with:
 
 ```text
-aura 0.3.2-preview
+aura 0.3.3-preview
 ```
 
 ## 5. Run A Program

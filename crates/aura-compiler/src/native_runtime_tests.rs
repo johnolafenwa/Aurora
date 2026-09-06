@@ -110,6 +110,12 @@ fn adr0038_direct_returned_view_handoffs_are_call_frame_scoped() {
 fn adr0038_direct_returned_view_projection_handoff_reports_invalid_state() {
     assert_eq!(
         capture_direct_boundary_error_message(|| {
+            super::aura_direct_set_returned_view_projection(b"field".as_ptr(), b"field".len());
+        }),
+        "direct returned-view handoff has no active call frame"
+    );
+    assert_eq!(
+        capture_direct_boundary_error_message(|| {
             unsafe {
                 super::aura_direct_enter_call(1, 1, b"caller".as_ptr(), b"caller".len());
             }
@@ -276,6 +282,243 @@ fn adr0038_direct_mutable_sink_updates_projected_cleanup_snapshot_before_return(
             assert!(state.mutable_sinks.is_empty());
             assert!(state.pending_mutable_sinks.is_none());
         });
+    });
+}
+
+#[test]
+fn adr0038_indirect_mutable_sink_handoff_keeps_capture_and_argument_slots_distinct() {
+    super::with_direct_task_runtime_scope(|| {
+        let public = [41, 42];
+        let capture_indices = [1, 0];
+        let captures = [52, 51];
+        super::aura_direct_set_next_indirect_mutable_sinks(
+            public.as_ptr(),
+            2,
+            capture_indices.as_ptr(),
+            captures.as_ptr(),
+            2,
+        );
+        super::prepare_indirect_direct_mutable_sinks(3);
+        unsafe {
+            super::aura_direct_enter_call(1, 1, b"closure".as_ptr(), 7);
+        }
+        for (index, expected) in [51, 52, 0, 41, 42, 0].into_iter().enumerate() {
+            assert_eq!(
+                super::aura_direct_current_mutable_sink(index as i64),
+                expected
+            );
+        }
+        unsafe {
+            super::aura_direct_exit_call();
+        }
+        assert_eq!(super::aura_direct_current_mutable_sink(0), 0);
+        super::aura_direct_set_next_indirect_mutable_sinks(
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        super::prepare_indirect_direct_mutable_sinks(0);
+        unsafe {
+            super::aura_direct_enter_call(1, 1, b"empty".as_ptr(), 5);
+            super::aura_direct_exit_call();
+        }
+        // A call with no pending handoff must not inherit the previous one.
+        super::prepare_indirect_direct_mutable_sinks(0);
+        super::with_direct_task_runtime_state(|state| {
+            assert!(state.pending_mutable_sinks.is_none())
+        });
+    });
+}
+
+#[test]
+fn adr0038_mutable_sink_abi_rejects_invalid_counts_buffers_and_handoffs() {
+    let cases: &[(&str, fn())] = &[
+        ("invalid direct mutable sink count", || {
+            super::aura_direct_set_next_mutable_sinks(std::ptr::null(), -1)
+        }),
+        ("direct mutable sink buffer is null", || {
+            super::aura_direct_set_next_mutable_sinks(std::ptr::null(), 1)
+        }),
+        ("invalid direct public mutable sink count", || {
+            super::aura_direct_set_next_indirect_mutable_sinks(
+                std::ptr::null(),
+                -1,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            )
+        }),
+        ("invalid direct capture mutable sink count", || {
+            super::aura_direct_set_next_indirect_mutable_sinks(
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                -1,
+            )
+        }),
+        ("direct public mutable sink buffer is null", || {
+            super::aura_direct_set_next_indirect_mutable_sinks(
+                std::ptr::null(),
+                1,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            )
+        }),
+        ("direct capture mutable sink buffer is null", || {
+            super::aura_direct_set_next_indirect_mutable_sinks(
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+            )
+        }),
+        ("invalid direct capture mutable sink index", || {
+            super::aura_direct_set_next_indirect_mutable_sinks(std::ptr::null(), 0, &-1, &1, 1)
+        }),
+        ("invalid direct mutable sink index", || {
+            super::aura_direct_current_mutable_sink(-1);
+        }),
+        (
+            "direct mutable write-through sink handoff was overwritten before use",
+            || {
+                super::aura_direct_set_next_mutable_sinks(std::ptr::null(), 0);
+                super::aura_direct_set_next_mutable_sinks(std::ptr::null(), 0);
+            },
+        ),
+        (
+            "direct function-value call received a concrete mutable sink handoff",
+            || {
+                super::aura_direct_set_next_mutable_sinks(std::ptr::null(), 0);
+                super::prepare_indirect_direct_mutable_sinks(0);
+            },
+        ),
+        (
+            "direct mutable write-through sinks were not prepared for a concrete call",
+            || {
+                super::aura_direct_set_next_indirect_mutable_sinks(
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                );
+                unsafe {
+                    super::aura_direct_enter_call(1, 1, b"concrete".as_ptr(), 8);
+                }
+            },
+        ),
+        (
+            "direct closure mutable sink index 2 is out of bounds for 1 captures",
+            || {
+                super::aura_direct_set_next_indirect_mutable_sinks(std::ptr::null(), 0, &2, &1, 1);
+                super::prepare_indirect_direct_mutable_sinks(1);
+            },
+        ),
+        (
+            "direct closure mutable sink index 1 is out of bounds for 1 captures",
+            || {
+                super::aura_direct_set_next_indirect_mutable_sinks(&7, 1, &1, &1, 1);
+                super::prepare_indirect_direct_mutable_sinks(1);
+            },
+        ),
+        ("unknown direct mutable write-through sink", || {
+            super::aura_direct_mutable_sink_project(99, b"value".as_ptr(), 5);
+        }),
+        ("unknown direct mutable write-through sink", || {
+            super::aura_direct_mutable_sink_store_owned(99, int_value(7))
+        }),
+        (
+            "invalid direct mutable write-through projection `a..b`",
+            || {
+                super::aura_direct_mutable_sink_project(99, b"a..b".as_ptr(), 4);
+            },
+        ),
+    ];
+    for &(expected, work) in cases {
+        assert_eq!(capture_direct_boundary_error_message(work), expected);
+    }
+}
+
+#[test]
+fn adr0038_mutable_sink_zero_and_expired_cleanup_are_safe_noops() {
+    super::with_direct_task_runtime_scope(|| {
+        super::replace_direct_cleanup_registration_value(0, &Value::Unit);
+        assert_eq!(
+            super::aura_direct_mutable_sink_new(0, int_value(1), std::ptr::null(), 0),
+            0
+        );
+        assert_eq!(
+            super::aura_direct_mutable_sink_project(0, std::ptr::null(), 0),
+            0
+        );
+        super::aura_direct_mutable_sink_store_owned(0, int_value(2));
+        super::aura_direct_mutable_sink_release(0);
+        let sink = super::aura_direct_mutable_sink_new(99, int_value(3), b"".as_ptr(), 0);
+        let child = super::aura_direct_mutable_sink_project(sink, b"".as_ptr(), 0);
+        super::aura_direct_mutable_sink_store_owned(child, int_value(4));
+        super::with_direct_task_runtime_state(|state| {
+            assert_eq!(
+                state.mutable_sinks[&sink]
+                    .slot
+                    .lock()
+                    .unwrap()
+                    .root
+                    .render(),
+                "4"
+            );
+        });
+        super::aura_direct_mutable_sink_release(child);
+        let projected = super::aura_direct_mutable_sink_project(sink, b"field".as_ptr(), 5);
+        let same_projection = super::aura_direct_mutable_sink_project(projected, b"".as_ptr(), 0);
+        super::with_direct_task_runtime_state(|state| {
+            assert_eq!(state.mutable_sinks[&same_projection].projection, "field");
+        });
+        super::aura_direct_mutable_sink_release(same_projection);
+        super::aura_direct_mutable_sink_release(projected);
+        super::aura_direct_mutable_sink_release(sink);
+    });
+}
+
+#[test]
+fn adr0038_mutable_sink_rejects_invalid_cleanup_registration_shape() {
+    assert_eq!(
+        capture_direct_boundary_error_message(|| {
+            let cleanup_id = super::push_direct_cleanup_registration(0, std::ptr::null_mut(), 0);
+            let sink =
+                super::aura_direct_mutable_sink_new(cleanup_id, int_value(1), b"".as_ptr(), 0);
+            super::aura_direct_mutable_sink_store_owned(sink, int_value(2));
+        }),
+        "direct mutable write-through sink `1` targets an invalid cleanup registration"
+    );
+}
+
+#[test]
+fn adr0038_cleanup_and_mutable_sink_ids_roll_over_without_using_zero() {
+    super::with_direct_task_runtime_scope(|| {
+        super::with_direct_task_runtime_state(|state| {
+            state.next_cleanup_id = i64::MAX;
+            state.next_mutable_sink_id = i64::MAX;
+        });
+
+        let cleanup_max = super::push_direct_cleanup_registration(0, std::ptr::null_mut(), 0);
+        let cleanup_one = super::push_direct_cleanup_registration(0, std::ptr::null_mut(), 0);
+        assert_eq!((cleanup_max, cleanup_one), (i64::MAX, 1));
+
+        let sink_max =
+            super::aura_direct_mutable_sink_new(cleanup_max, int_value(1), b"".as_ptr(), 0);
+        let sink_one =
+            super::aura_direct_mutable_sink_new(cleanup_one, int_value(2), b"".as_ptr(), 0);
+        assert_eq!((sink_max, sink_one), (i64::MAX, 1));
+
+        super::aura_direct_mutable_sink_release(sink_max);
+        super::aura_direct_mutable_sink_release(sink_one);
+        drop(super::take_direct_cleanup_registration(cleanup_max));
+        drop(super::take_direct_cleanup_registration(cleanup_one));
     });
 }
 
@@ -20273,4 +20516,514 @@ fn direct_capacity_format_and_detailed_assertion_abis_pin_observable_contracts()
     ] {
         unsafe { release_value(value) };
     }
+}
+
+#[test]
+fn coverage_native_runtime_decodes_closure_patterns_and_uses_type_fallbacks() {
+    let encoded_closure = super::canonical_runtime_type_name(&Type::Closure {
+        params: Box::new(vec![FunctionParamContract {
+            name: "value".to_string(),
+            ty: Type::named("?Item"),
+            passing: ReceiverKind::Borrow,
+            has_default: false,
+            default_erased: false,
+        }]),
+        return_type: Box::new(Type::named("?Item")),
+        captures: Box::new(vec![ClosureCapture {
+            name: "captured".to_string(),
+            ty: Type::named("?Captured"),
+            mode: ClosureCaptureMode::Copy,
+            span: Span::new(3, 7),
+        }]),
+        call_kind: ClosureCallKind::Repeatable,
+    });
+    let decoded_closure = runtime_type_pattern_from_name(&encoded_closure);
+    let Type::Closure {
+        params,
+        return_type,
+        captures,
+        call_kind,
+    } = decoded_closure
+    else {
+        panic!("canonical closure metadata must remain a closure")
+    };
+    assert_eq!(params[0].ty, Type::TypeParam("Item".to_string()));
+    assert_eq!(*return_type, Type::TypeParam("Item".to_string()));
+    assert_eq!(captures[0].ty, Type::TypeParam("Captured".to_string()));
+    assert_eq!(call_kind, ClosureCallKind::Repeatable);
+
+    let bool_value_ptr = boxed_value(Value::Bool(true));
+    let canonical_bool = super::canonical_runtime_type_name(&Type::named("bool"));
+    assert_eq!(
+        super::aura_direct_value_type_matches(
+            bool_value_ptr,
+            canonical_bool.as_ptr(),
+            canonical_bool.len(),
+        ),
+        1,
+        "canonical matching must infer a type when the wrapper has no explicit tag"
+    );
+
+    let untyped_integer = boxed_value(Value::Int(IntegerValue::from_signed(7)));
+    assert_eq!(
+        super::aura_direct_value_type_matches(untyped_integer, b"int128".as_ptr(), b"int128".len(),),
+        1,
+        "an untyped integer literal remains compatible with integer runtime types"
+    );
+
+    let embedded_type = "Marker[int64]";
+    let tagged_instance = boxed_value(Value::Instance(InstanceValue {
+        class_name: "Marker".to_string(),
+        fields: BTreeMap::from([(
+            super::DIRECT_RUNTIME_TYPE_FIELD.to_string(),
+            Value::String(embedded_type.to_string()),
+        )]),
+    }));
+    assert_eq!(
+        super::aura_direct_value_has_runtime_type(tagged_instance),
+        1
+    );
+    assert_eq!(
+        super::aura_direct_value_type_matches(
+            tagged_instance,
+            embedded_type.as_ptr(),
+            embedded_type.len(),
+        ),
+        1
+    );
+
+    let malformed_tag = boxed_value(Value::Instance(InstanceValue {
+        class_name: "Marker".to_string(),
+        fields: BTreeMap::from([(
+            super::DIRECT_RUNTIME_TYPE_FIELD.to_string(),
+            Value::Bool(true),
+        )]),
+    }));
+    assert_eq!(super::aura_direct_value_has_runtime_type(malformed_tag), 0);
+
+    let tuple = boxed_value(Value::Tuple(TupleValue {
+        element_types: vec![Type::named("int64"), Type::named("int64")],
+        elements: vec![
+            Value::Int(IntegerValue::from_i64(1)),
+            Value::Int(IntegerValue::from_i64(2)),
+        ],
+    }));
+    assert_eq!(
+        super::aura_direct_value_type_matches(
+            tuple,
+            b"(?Item, ?Item)".as_ptr(),
+            b"(?Item, ?Item)".len(),
+        ),
+        1,
+        "untagged tuple patterns must use their structural element metadata"
+    );
+
+    assert_eq!(runtime_type_from_name("None"), Type::Unit);
+    assert_eq!(
+        runtime_type_from_name("module pkg.tools"),
+        Type::Module("pkg.tools".to_string())
+    );
+    assert!(runtime_type_pattern_matches(
+        &Type::Module("pkg.tools".to_string()),
+        &Type::Module("pkg.tools".to_string()),
+        &mut BTreeMap::new(),
+    ));
+    assert!(runtime_type_pattern_matches(
+        &Type::Unit,
+        &Type::Unit,
+        &mut BTreeMap::new(),
+    ));
+
+    for value in [
+        bool_value_ptr,
+        untyped_integer,
+        tagged_instance,
+        malformed_tag,
+        tuple,
+    ] {
+        unsafe { release_value(value) };
+    }
+}
+
+#[test]
+fn coverage_native_runtime_classifies_power_bitwise_unary_and_divmod_paths() {
+    let typed = |value, kind| {
+        Value::Int(
+            IntegerValue::from_typed_signed(value, kind)
+                .expect("the diagnostic fixture must fit its declared integer kind"),
+        )
+    };
+
+    let mismatched_power = eval_binary_value(
+        typed(2, IntegerKind::Int8),
+        typed(3, IntegerKind::Int16),
+        BinaryOp::Pow,
+    )
+    .expect_err("integer power must reject mismatched widths");
+    assert_eq!(mismatched_power.code, "AU2002");
+    assert_eq!(
+        mismatched_power.message,
+        "integer power operand types must match"
+    );
+
+    let negative_power = eval_binary_value(
+        typed(2, IntegerKind::Int8),
+        typed(-1, IntegerKind::Int8),
+        BinaryOp::Pow,
+    )
+    .expect_err("integer power must reject negative integer exponents");
+    assert_eq!(negative_power.code, "AU4001");
+    assert!(negative_power.message.contains("negative integer exponent"));
+
+    let overflowing_power = eval_binary_value(
+        typed(16, IntegerKind::Int8),
+        typed(2, IntegerKind::Int8),
+        BinaryOp::Pow,
+    )
+    .expect_err("integer power must preserve the declared width");
+    assert_eq!(overflowing_power.code, "AU4002");
+    assert_eq!(overflowing_power.message, "integer power overflow");
+
+    let mismatched_bitwise = eval_binary_value(
+        typed(1, IntegerKind::Int8),
+        typed(1, IntegerKind::Int16),
+        BinaryOp::BitAnd,
+    )
+    .expect_err("bitwise operators must reject mismatched widths");
+    assert_eq!(mismatched_bitwise.code, "AU2002");
+    assert_eq!(
+        mismatched_bitwise.message,
+        "bitwise integer operand types must match"
+    );
+
+    let untyped_bit_not =
+        eval_unary_value(Value::Int(IntegerValue::from_signed(1)), UnaryOp::BitNot)
+            .expect_err("bitwise not needs a concrete integer width");
+    assert_eq!(untyped_bit_not.code, "AU4001");
+    assert_eq!(
+        untyped_bit_not.message,
+        "invalid typed integer for unary `~`"
+    );
+
+    let wrong_type_bit_not = eval_unary_value(Value::Bool(true), UnaryOp::BitNot)
+        .expect_err("bitwise not must reject non-integers");
+    assert_eq!(wrong_type_bit_not.code, "AU2003");
+    assert_eq!(
+        wrong_type_bit_not.message,
+        "unary `~` expects an integer value, found `bool`"
+    );
+
+    for (op, operator) in [
+        (BinaryOp::FloorDiv, "//"),
+        (BinaryOp::Pow, "**"),
+        (BinaryOp::BitOr, "bitwise"),
+        (BinaryOp::Shl, "shift"),
+    ] {
+        let error = eval_binary_value(Value::Bool(true), Value::Bool(false), op)
+            .expect_err("non-numeric operands must be rejected");
+        assert!(
+            error.message.contains(operator),
+            "{op:?} diagnostic should identify `{operator}`: {}",
+            error.message
+        );
+    }
+
+    let left = boxed_value(Value::Int(IntegerValue::from_signed(7)));
+    let right = boxed_value(Value::Int(IntegerValue::from_signed(3)));
+    let pair = super::aura_direct_divmod(left, right);
+    assert_eq!(
+        unsafe { value_ref(pair) },
+        Value::Tuple(TupleValue {
+            element_types: vec![Type::named("Unknown"), Type::named("Unknown")],
+            elements: vec![
+                Value::Int(IntegerValue::from_signed(2)),
+                Value::Int(IntegerValue::from_signed(1)),
+            ],
+        }),
+        "divmod must infer tuple metadata for untagged integer operands"
+    );
+    for value in [left, right, pair] {
+        unsafe { release_value(value) };
+    }
+}
+
+#[test]
+fn coverage_native_runtime_rejects_invalid_enum_payload_metadata_and_indices() {
+    let invalid_count = capture_direct_boundary_diagnostic(|| {
+        super::aura_direct_enum_variant(
+            b"Status".as_ptr(),
+            b"Status".len(),
+            b"Ready".as_ptr(),
+            b"Ready".len(),
+            std::ptr::null_mut(),
+            -1,
+        );
+    });
+    assert_eq!(invalid_count.code, "AU4001");
+    assert_eq!(invalid_count.message, "invalid enum payload count");
+
+    let negative_index_value = boxed_value(Value::EnumVariant(EnumVariantValue {
+        enum_name: "Status".to_string(),
+        variant_name: "Ready".to_string(),
+        payloads: Vec::new(),
+    }));
+    let negative_index_address = negative_index_value as usize;
+    let negative_index = capture_direct_boundary_diagnostic(move || {
+        super::aura_direct_variant_take_payload(negative_index_address as *mut OpaqueValue, -1);
+    });
+    assert_eq!(negative_index.code, "AU4001");
+    assert_eq!(negative_index.message, "invalid enum payload index");
+    unsafe { release_value(negative_index_value) };
+
+    let missing_payload_value = boxed_value(Value::EnumVariant(EnumVariantValue {
+        enum_name: "Status".to_string(),
+        variant_name: "Ready".to_string(),
+        payloads: Vec::new(),
+    }));
+    let missing_payload_address = missing_payload_value as usize;
+    let missing_payload = capture_direct_boundary_diagnostic(move || {
+        super::aura_direct_variant_take_payload(missing_payload_address as *mut OpaqueValue, 2);
+    });
+    assert_eq!(missing_payload.code, "AU4001");
+    assert_eq!(
+        missing_payload.message,
+        "enum variant `Status.Ready` does not carry a payload at index 2"
+    );
+    unsafe { release_value(missing_payload_value) };
+
+    let wrong_type = int_value(3);
+    let wrong_type_address = wrong_type as usize;
+    let wrong_type_error = capture_direct_boundary_diagnostic(move || {
+        super::aura_direct_variant_take_payload(wrong_type_address as *mut OpaqueValue, 0);
+    });
+    assert_eq!(wrong_type_error.code, "AU4001");
+    assert_eq!(
+        wrong_type_error.message,
+        "expected enum value, found `integer`"
+    );
+    unsafe { release_value(wrong_type) };
+}
+
+fn coverage_native_runtime_invalid_process_stdio(run: bool, invalid_index: usize) -> Diagnostic {
+    capture_direct_boundary_diagnostic(move || {
+        let stdio = |index| {
+            if index == invalid_index {
+                bool_value(true)
+            } else {
+                super::aura_direct_process_null()
+            }
+        };
+        if run {
+            super::aura_direct_process_run(
+                string_vec(&["never-spawned"]),
+                boxed_value(Value::Unit),
+                super::aura_direct_map_empty(),
+                stdio(0),
+                stdio(1),
+                stdio(2),
+                duration_value(0),
+                bool_value(false),
+            );
+        } else {
+            super::aura_direct_process_start(
+                string_vec(&["never-spawned"]),
+                boxed_value(Value::Unit),
+                super::aura_direct_map_empty(),
+                stdio(0),
+                stdio(1),
+                stdio(2),
+                bool_value(false),
+            );
+        }
+    })
+}
+
+#[test]
+fn coverage_native_runtime_dynamic_json_and_process_stdio_errors_stay_structured() {
+    let json_source = string_value("null");
+    let json_args = super::DirectHostArgBuffer {
+        handles: vec![json_source as i64],
+    };
+    let unknown = super::evaluate_direct_json_host_builtin("json::is_valid", &json_args)
+        .expect_err("an unclassified JSON name must not fall through to another host API");
+    assert_eq!(unknown.code, "AU4001");
+    assert_eq!(
+        unknown.message,
+        "unknown dynamic JSON host builtin `json::is_valid`"
+    );
+    drop(json_args);
+
+    for run in [false, true] {
+        for invalid_index in 0..3 {
+            let diagnostic = coverage_native_runtime_invalid_process_stdio(run, invalid_index);
+            let operation = if run {
+                "process.run(...)"
+            } else {
+                "process.start(...)"
+            };
+            assert_eq!(diagnostic.code, "AU4001");
+            assert_eq!(
+                diagnostic.message,
+                format!("`{operation}` expects `process.Stdio`, found `true`"),
+                "stdio argument {invalid_index} must be decoded before any process is spawned"
+            );
+        }
+    }
+}
+
+#[test]
+fn coverage_native_runtime_queue_group_iteration_reports_value_closed_and_cancelled() {
+    fn assert_variant_and_release(
+        value: *mut OpaqueValue,
+        enum_name: &str,
+        variant_name: &str,
+    ) -> Vec<Value> {
+        let cloned = unsafe { value_ref(value) };
+        unsafe { release_value(value) };
+        expect_variant_value(cloned, enum_name, variant_name)
+    }
+
+    let value_channel = super::aura_direct_channel_new(std::ptr::null_mut());
+    let value_group = super::aura_direct_task_group_new();
+    assert_variant_and_release(
+        super::aura_direct_channel_try_send(value_channel, int_value(41)),
+        "Result",
+        "Ok",
+    );
+    let value_payloads = assert_variant_and_release(
+        super::aura_direct_channel_recv_in_task_group(value_channel, value_group),
+        "QueueReceive",
+        "Item",
+    );
+    assert_eq!(
+        value_payloads,
+        vec![Value::Int(IntegerValue::from_signed(41))]
+    );
+
+    let closed_channel = super::aura_direct_channel_new(std::ptr::null_mut());
+    let closed_group = super::aura_direct_task_group_new();
+    assert!(assert_variant_and_release(
+        super::aura_direct_channel_recv_in_task_group(closed_channel, closed_group),
+        "QueueReceive",
+        "Closed",
+    )
+    .is_empty());
+
+    let cancelled_channel = super::aura_direct_channel_new(std::ptr::null_mut());
+    let cancelled_group = super::aura_direct_task_group_new();
+    let cancelled_unit = super::aura_direct_task_group_cancel(cancelled_group);
+    unsafe { release_value(cancelled_unit) };
+    assert!(assert_variant_and_release(
+        super::aura_direct_channel_recv_in_task_group(cancelled_channel, cancelled_group),
+        "QueueReceive",
+        "Cancelled",
+    )
+    .is_empty());
+
+    for value in [
+        value_channel,
+        value_group,
+        closed_channel,
+        closed_group,
+        cancelled_channel,
+        cancelled_group,
+    ] {
+        unsafe { release_value(value) };
+    }
+}
+
+#[test]
+fn coverage_native_runtime_closure_capture_and_timer_errors_preserve_diagnostics() {
+    let closure = boxed_value(Value::Function(Box::new(FunctionValue {
+        name: "empty_capture".to_string(),
+        signature: Type::Closure {
+            params: Box::new(Vec::new()),
+            return_type: Box::new(Type::Unit),
+            captures: Box::new(Vec::new()),
+            call_kind: ClosureCallKind::Repeatable,
+        },
+        source_path: None,
+        entry_span: Span::new(1, 1),
+        direct_thunk: Some(test_native_thunk as *const () as usize as i64),
+        direct_default_binder: Some(1),
+        closure_environment: Some(Arc::new(ClosureEnvironment::new(Vec::new(), false))),
+    })));
+    let closure_address = closure as usize;
+    let missing_capture = capture_direct_boundary_diagnostic(move || {
+        super::aura_direct_closure_capture(closure_address as *mut OpaqueValue, 0);
+    });
+    assert_eq!(missing_capture.code, "AU4001");
+    assert_eq!(
+        missing_capture.message,
+        "closure has no live capture at index 0"
+    );
+    unsafe { release_value(closure) };
+
+    let timer_error = capture_direct_boundary_diagnostic(|| {
+        super::direct_timer_result_or_trap::<()>(Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "timer probe rejected",
+        )));
+    });
+    assert_eq!(timer_error.code, "AU4001");
+    assert_eq!(timer_error.message, "timer probe rejected");
+}
+
+unsafe extern "C-unwind" fn coverage_native_runtime_root_trap(
+    args: *const i64,
+    arg_count: usize,
+) -> *mut OpaqueValue {
+    assert!(args.is_null());
+    assert_eq!(arg_count, 0);
+    super::aura_direct_fail_division_by_zero(0, 0)
+}
+
+#[test]
+fn coverage_native_runtime_root_wrapper_runs_normal_and_forced_cleanup_paths() {
+    assert_eq!(
+        super::run_direct_root_task(direct_root_returns_unit)
+            .expect("the direct root wrapper must preserve a normal unit return"),
+        Value::Unit
+    );
+    let diagnostic = super::run_direct_root_task(coverage_native_runtime_root_trap)
+        .expect_err("a trapped direct root must return its structured diagnostic");
+    assert_eq!(diagnostic.code, "AU4004");
+    assert_eq!(diagnostic.message, "division by zero");
+}
+
+#[test]
+fn coverage_native_runtime_refcount_and_pending_buffer_fallbacks_release_real_values() {
+    let pending_value = string_value("pending task argument");
+    unsafe { super::retain_untracked_value(pending_value) };
+    assert_eq!(
+        unsafe { &*pending_value }.ref_count.load(Ordering::Acquire),
+        2
+    );
+    drop(super::PendingDirectTaskArgs {
+        handles: vec![0, pending_value as i64],
+    });
+    assert_eq!(
+        unsafe { &*pending_value }.ref_count.load(Ordering::Acquire),
+        1,
+        "dropping pending task arguments must ignore empty slots and release live handles"
+    );
+    unsafe { release_value(pending_value) };
+
+    let corrupt_refcount = string_value("invalid refcount state");
+    unsafe { &*corrupt_refcount }
+        .ref_count
+        .store(0, Ordering::Release);
+    let corrupt_address = corrupt_refcount as usize;
+    let diagnostic = capture_direct_boundary_diagnostic(move || unsafe {
+        super::release_untracked_value(corrupt_address as *mut OpaqueValue);
+    });
+    assert_eq!(diagnostic.code, "AU4001");
+    assert_eq!(
+        diagnostic.message,
+        "attempted to release an already-released direct runtime value"
+    );
+    unsafe { &*corrupt_refcount }
+        .ref_count
+        .store(1, Ordering::Release);
+    unsafe { release_value(corrupt_refcount) };
 }

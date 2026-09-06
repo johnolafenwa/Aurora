@@ -623,7 +623,7 @@ def main() -> int32:
         .expect_err("monotonic clock calls with arguments should fail direct codegen");
     assert_eq!(
         error,
-        "direct backend expected `sys::monotonic_time_ms` to receive no arguments, found 1"
+        "invalid MIR call to `sys::monotonic_time_ms` has too many arguments"
     );
 }
 

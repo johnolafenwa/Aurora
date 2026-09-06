@@ -157,6 +157,10 @@ fn uncoded_constructors_assign_stable_phase_banded_codes() {
         "AU1101"
     );
     assert_eq!(Diagnostic::new("unknown name `value`").code, "AU2001");
+    assert_eq!(
+        Diagnostic::new("python-style implicit imports are not supported").code,
+        "AU2005"
+    );
     assert_eq!(Diagnostic::new("use of moved value `value`").code, "AU3001");
     assert_eq!(
         Diagnostic::new("integer overflow in addition").code,

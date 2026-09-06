@@ -844,7 +844,20 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    run_corpus_case_with_timeout_duration(operation, path, StdDuration::from_secs(10), action)
+    let timeout = corpus_case_timeout_for_environment(
+        cfg!(coverage),
+        std::env::var_os("GITHUB_ACTIONS").is_some(),
+    );
+    run_corpus_case_with_timeout_duration(operation, path, timeout, action)
+}
+
+fn corpus_case_timeout_for_environment(coverage: bool, hosted_ci: bool) -> StdDuration {
+    let local = StdDuration::from_secs(10);
+    if coverage || hosted_ci {
+        local.saturating_mul(4)
+    } else {
+        local
+    }
 }
 
 fn run_corpus_case_with_timeout_duration<T, F>(
@@ -913,6 +926,26 @@ fn corpus_case_timeout_reports_the_operation_and_path() {
     .expect_err("slow corpus operation should time out");
     assert!(error.contains("runtime probe timed out"));
     assert!(error.contains("slow.au"));
+}
+
+#[test]
+fn corpus_case_timeout_scales_for_coverage_and_hosted_ci() {
+    assert_eq!(
+        corpus_case_timeout_for_environment(false, false),
+        StdDuration::from_secs(10)
+    );
+    assert_eq!(
+        corpus_case_timeout_for_environment(true, false),
+        StdDuration::from_secs(40)
+    );
+    assert_eq!(
+        corpus_case_timeout_for_environment(false, true),
+        StdDuration::from_secs(40)
+    );
+    assert_eq!(
+        corpus_case_timeout_for_environment(true, true),
+        StdDuration::from_secs(40)
+    );
 }
 
 fn escape_aura_string(text: &str) -> String {
@@ -1041,6 +1074,11 @@ fn path_wrapper_functions_cover_success_and_loader_error_paths() {
     assert!(duplicate_source_builtin
         .message
         .contains("duplicate import binding `exists`"));
+    let duplicate_source_module_alias = check_source("import fs as files\nimport fs as files\n")
+        .expect_err("duplicate source-level builtin module aliases should fail");
+    assert!(duplicate_source_module_alias
+        .message
+        .contains("duplicate import binding `files`"));
     let missing_source_builtin =
         check_source("from fs import definitely_missing\n").expect_err("unknown builtin export");
     assert!(missing_source_builtin
@@ -1177,6 +1215,28 @@ fn module_constant_plan_is_dependency_first_import_ordered_and_diamond_safe() {
             .map(|constant| constant.key.as_str())
             .collect::<Vec<_>>(),
         plan
+    );
+}
+
+#[test]
+fn module_constant_plan_reports_an_entry_missing_from_the_loader_cache() {
+    let temp = TempDir::new("aura-module-constant-plan-missing-cache");
+    let main_path = temp.path().join("main.au");
+    fs::write(&main_path, "root = 1\n").expect("write entry module");
+    let loader = ModuleLoader::new(&main_path).expect("package loader should initialize");
+
+    let error = loader
+        .build_constant_init_plan(&main_path)
+        .expect_err("an unloaded entry must not produce a partial constant plan");
+    assert!(
+        error
+            .message
+            .contains("constant initialization plan is missing loaded module"),
+        "unexpected invariant diagnostic: {error:?}"
+    );
+    assert!(
+        error.message.contains(&main_path.display().to_string()),
+        "the invariant diagnostic should identify the missing module: {error:?}"
     );
 }
 
@@ -1494,6 +1554,8 @@ fn module_loader_helper_functions_cover_namespace_and_export_paths() {
         [
             "from pkg.named import Named",
             "",
+            "public answer = 42",
+            "",
             "public class Box[T]:",
             "    value: T",
             "    public def read(own self) -> T:",
@@ -1589,6 +1651,7 @@ fn module_loader_helper_functions_cover_namespace_and_export_paths() {
 
     let mut program = check_path(&user_path).expect("user module should check");
     assert!(local_item_exists(&program, "Box"));
+    assert!(local_item_exists(&program, "answer"));
     assert!(!local_item_exists(&program, "missing"));
 
     let imported_named = check_path(&named_path).expect("named module should check");

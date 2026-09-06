@@ -41,7 +41,7 @@ relevant reference page, conformance tests, examples, tutorials, and work
 record in the same pass.
 
 The repository commit identifies the precise revision of the specification.
-The rendered Manual is stamped with source version 0.3.2 (technical preview)
+The rendered Manual is stamped with source version 0.3.3 (technical preview)
 and its implementation baseline commit. Release builds supply that commit
 without writing a self-referential hash into this source page; see the
 [Manual overview](/manual/) for the exact precedence and local fallback.

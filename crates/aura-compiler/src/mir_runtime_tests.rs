@@ -52,6 +52,155 @@ fn test_function_operand(name: &str, params: Vec<Type>, return_type: Type) -> Op
 }
 
 #[test]
+fn adr0038_runtime_loan_ledger_enforces_capability_and_parent_lifecycle() {
+    let mut env = Env::default();
+    env.define_typed(
+        "owner",
+        Type::named("int64"),
+        Value::Int(IntegerValue::from_signed(1)),
+    );
+    env.begin_loan("parent", "owner", true).unwrap();
+    assert!(env
+        .begin_loan("parent", "owner", true)
+        .unwrap_err()
+        .message
+        .contains("already-active"));
+    assert!(env
+        .read_place("owner")
+        .unwrap_err()
+        .message
+        .contains("mutable loan remains active"));
+    assert!(env
+        .write_place("owner", Value::Unit)
+        .unwrap_err()
+        .message
+        .contains("locked MIR place"));
+    assert!(env
+        .take_place("owner")
+        .unwrap_err()
+        .message
+        .contains("move locked"));
+    assert!(env
+        .take_place("parent")
+        .unwrap_err()
+        .message
+        .contains("move through active"));
+    env.begin_loan("child", "parent", false).unwrap();
+    assert!(env
+        .read_place("parent")
+        .unwrap_err()
+        .message
+        .contains("suspended"));
+    assert!(env
+        .write_place("parent", Value::Unit)
+        .unwrap_err()
+        .message
+        .contains("suspended"));
+    assert!(env
+        .end_loan("parent")
+        .unwrap_err()
+        .message
+        .contains("child reborrow remains active"));
+    assert!(env
+        .write_place("child", Value::Unit)
+        .unwrap_err()
+        .message
+        .contains("shared MIR loan"));
+    assert!(env
+        .begin_loan("escalated", "child", true)
+        .unwrap_err()
+        .message
+        .contains("from shared loan"));
+    assert_eq!(env.read_place("child").unwrap().render(), "1");
+    env.end_loan("child").unwrap();
+    env.write_place("parent", Value::Int(IntegerValue::from_signed(2)))
+        .unwrap();
+    env.end_loan("parent").unwrap();
+    assert_eq!(env.take_place("owner").unwrap().render(), "2");
+    assert!(env
+        .end_loan("parent")
+        .unwrap_err()
+        .message
+        .contains("unknown MIR loan"));
+}
+
+#[test]
+fn adr0038_runtime_loan_ledger_rejects_invalid_identity_and_shared_constant_moves() {
+    let mut env = Env::default();
+    env.define_typed(
+        "owner",
+        Type::named("int64"),
+        Value::Int(IntegerValue::from_signed(1)),
+    );
+    for name in ["", "alias.child"] {
+        assert!(env
+            .begin_loan(name, "owner", false)
+            .unwrap_err()
+            .message
+            .contains("undotted local identifier"));
+    }
+    assert!(env
+        .begin_loan("owner", "owner", false)
+        .unwrap_err()
+        .message
+        .contains("shadow its source root"));
+    assert!(env
+        .begin_loan("missing", "absent", false)
+        .unwrap_err()
+        .message
+        .contains("unknown place"));
+    assert!(env.begin_loan("bad", "owner..field", false).is_err());
+    env.begin_loan("shared", "owner", false).unwrap();
+    assert!(env
+        .begin_loan("exclusive", "owner", true)
+        .unwrap_err()
+        .message
+        .contains("overlaps active shared loan"));
+    env.begin_loan("second", "owner", false).unwrap();
+    assert_eq!(env.returned_view_projection("shared", "owner").unwrap(), "");
+    assert!(env
+        .returned_view_projection("shared", "other")
+        .unwrap_err()
+        .message
+        .contains("outside declared origin"));
+    env.end_loan("shared").unwrap();
+    env.end_loan("second").unwrap();
+    env.write_shared_place("constant", Arc::new(Value::String("immutable".into())))
+        .unwrap();
+    assert!(env
+        .take_place("constant")
+        .unwrap_err()
+        .message
+        .contains("consuming context"));
+    assert!(env
+        .take_place("constant.field")
+        .unwrap_err()
+        .message
+        .contains("cannot be mutated"));
+    assert!(env
+        .write_shared_place("constant.field", Arc::new(Value::Unit))
+        .unwrap_err()
+        .message
+        .contains("nested MIR place"));
+    assert!(env
+        .place_mut("constant")
+        .unwrap_err()
+        .message
+        .contains("shared MIR place"));
+    assert!(env
+        .place_mut("absent")
+        .unwrap_err()
+        .message
+        .contains("unknown MIR place"));
+    env.begin_loan("read_constant", "constant", false).unwrap();
+    assert_eq!(
+        env.read_place("read_constant").unwrap().render(),
+        "immutable"
+    );
+    env.end_loan("read_constant").unwrap();
+}
+
+#[test]
 fn adr0038_mutable_views_write_through_and_reborrows_share_one_place() {
     let output = crate::run_source(
         r#"
@@ -1011,6 +1160,11 @@ fn adr0038_mir_loan_environment_covers_alias_resolution_and_nested_place_errors(
         .expect_err("tuple projections must be in bounds")
         .message
         .contains("has no element at index 4"));
+    assert!(env
+        .place_ref("pair.nested.00")
+        .expect_err("tuple projections must use their canonical decimal spelling")
+        .message
+        .contains("non-canonical tuple projection"));
 
     let mut nested = pair_value();
     super::write_nested_place(
@@ -1131,6 +1285,47 @@ fn adr0038_mir_loan_environment_covers_alias_resolution_and_nested_place_errors(
             .message
             .contains("on a non-instance value")
     );
+
+    let mut cyclic_parents = Env::default();
+    cyclic_parents.define_typed(
+        "owner",
+        Type::named("int64"),
+        Value::Int(IntegerValue::from_signed(1)),
+    );
+    cyclic_parents.loans.insert(
+        "left".to_string(),
+        super::RuntimeLoan {
+            source: "owner".to_string(),
+            mutable: false,
+            parent: Some("right".to_string()),
+        },
+    );
+    cyclic_parents.loans.insert(
+        "right".to_string(),
+        super::RuntimeLoan {
+            source: "owner".to_string(),
+            mutable: false,
+            parent: Some("left".to_string()),
+        },
+    );
+    assert!(!cyclic_parents.loan_has_active_child("unrelated"));
+    cyclic_parents
+        .begin_loan("child", "left", false)
+        .expect("a corrupted parent cycle must terminate defensively");
+}
+
+#[test]
+fn adr0038_runtime_place_types_fall_back_to_values_and_reject_dynamic_projection() {
+    let runtime = test_runtime();
+    let mut env = Env::default();
+    env.values
+        .insert("dynamic".to_string(), Value::String("text".to_string()));
+    assert_eq!(
+        runtime.resolve_place_type("dynamic", &env),
+        Some(Type::named("str"))
+    );
+    assert_eq!(runtime.resolve_place_type("dynamic.field", &env), None);
+    assert_eq!(runtime.resolve_place_type("missing", &env), None);
 }
 
 #[test]
@@ -5558,6 +5753,93 @@ fn mir_owned_process_and_http_decoders_transfer_string_allocations() {
 }
 
 #[test]
+fn mir_owned_runtime_decoders_reject_malformed_values_without_partial_conversion() {
+    assert!(super::expect_owned_string_value(Value::Bool(true), "name")
+        .expect_err("owned strings must reject non-string values")
+        .message
+        .contains("expects `str`"));
+    assert!(super::expect_owned_command_vec(Value::Unit, "command")
+        .expect_err("owned commands must reject non-vector values")
+        .message
+        .contains("expects `list[str]`"));
+
+    let uint128_max = || {
+        Value::Int(
+            IntegerValue::from_typed_unsigned(u128::MAX, IntegerKind::Uint128)
+                .expect("u128::MAX is a valid uint128"),
+        )
+    };
+    let non_signed_byte = Value::Vec(VecValue {
+        element_type: Type::named("uint8"),
+        elements: vec![uint128_max()],
+    });
+    assert!(super::expect_owned_bytes_value(non_signed_byte, "payload")
+        .expect_err("byte conversion must reject integers outside the signed runtime view")
+        .message
+        .contains("expects `list[uint8]`"));
+    let oversized_byte = Value::Vec(VecValue {
+        element_type: Type::named("uint8"),
+        elements: vec![Value::Int(IntegerValue::from_signed(256))],
+    });
+    assert!(super::expect_owned_bytes_value(oversized_byte, "payload")
+        .expect_err("byte conversion must reject values above uint8::MAX")
+        .message
+        .contains("expects `list[uint8]`"));
+
+    assert_eq!(
+        super::expect_owned_optional_string_value(Value::Unit, "cwd")
+            .expect("unit is an absent optional string"),
+        None
+    );
+    assert!(super::expect_owned_optional_string_value(
+        Value::EnumVariant(EnumVariantValue {
+            enum_name: "Option".to_string(),
+            variant_name: "Some".to_string(),
+            payloads: Vec::new(),
+        }),
+        "cwd",
+    )
+    .expect_err("malformed owned Option.Some payloads must fail")
+    .message
+    .contains("malformed option payload"));
+    assert!(
+        super::expect_owned_optional_string_value(Value::Bool(false), "cwd")
+            .expect_err("owned optional strings must reject booleans")
+            .message
+            .contains("expects `Option[str]`")
+    );
+
+    assert!(super::expect_i64_value(&uint128_max(), "count")
+        .expect_err("uint128 values outside i128 must not convert to int64")
+        .message
+        .contains("expects `int64`"));
+    assert!(super::expect_i64_value(
+        &Value::Int(IntegerValue::from_signed(i128::from(i64::MAX) + 1)),
+        "count",
+    )
+    .expect_err("signed integers above i64::MAX must fail")
+    .message
+    .contains("expects `int64`"));
+
+    assert_eq!(
+        super::expect_io_optional_timeout(None, "timeout")
+            .expect("an omitted I/O timeout must stay absent"),
+        None
+    );
+    let timeout_error =
+        super::expect_io_optional_timeout(Some(&Value::String("later".to_string())), "timeout")
+            .expect_err("I/O timeouts must reject strings");
+    assert_eq!(timeout_error.render(), "io.Error.InvalidInput");
+
+    assert!(
+        super::expect_owned_headers_map(Value::Bool(true), "headers")
+            .expect_err("owned HTTP headers must reject non-map values")
+            .message
+            .contains("expects `dict[str, str]`")
+    );
+}
+
+#[test]
 fn mir_owned_queue_and_task_fallback_adapters_preserve_allocations() {
     fn expect_string_ptr(value: Value, expected: *const u8, label: &str) {
         match value {
@@ -8783,6 +9065,73 @@ fn mir_runtime_argument_binding_helpers_cover_named_and_positional_cases() {
 }
 
 #[test]
+fn mir_runtime_function_binding_reports_missing_and_invalid_writeback_arguments() {
+    let params = vec![MirParam {
+        name: "value".to_string(),
+        passing: MirReceiverKind::BorrowMut,
+        ty: Type::named("int64"),
+        default_function: None,
+    }];
+    assert!(bind_args(&params, Vec::new())
+        .err()
+        .expect("required function arguments must be present")
+        .message
+        .contains("missing MIR argument `value`"));
+
+    let argument = |name: Option<&str>, writeback_place: Option<&str>| EvaluatedMirArg {
+        name: name.map(str::to_string),
+        value: Value::Int(IntegerValue::from_signed(1)),
+        ty: Some(Type::named("int64")),
+        writeback_place: writeback_place.map(str::to_string),
+    };
+    assert!(super::bind_function_writeback_places(
+        &params,
+        &[argument(Some("unknown"), Some("owner"))],
+    )
+    .expect_err("unknown named writeback arguments must fail")
+    .message
+    .contains("unknown MIR argument `unknown`"));
+    assert!(super::bind_function_writeback_places(
+        &params,
+        &[
+            argument(Some("value"), Some("owner")),
+            argument(None, Some("other")),
+        ],
+    )
+    .expect_err("positional writeback arguments cannot follow named ones")
+    .message
+    .contains("positional MIR argument cannot follow"));
+    assert!(super::bind_function_writeback_places(
+        &params,
+        &[
+            argument(Some("value"), Some("owner")),
+            argument(Some("value"), Some("other")),
+        ],
+    )
+    .expect_err("duplicate named writeback arguments must fail")
+    .message
+    .contains("duplicate MIR argument `value`"));
+    assert!(super::bind_function_writeback_places(
+        &params,
+        &[argument(None, Some("owner")), argument(None, Some("other")),],
+    )
+    .expect_err("extra positional writeback arguments must fail")
+    .message
+    .contains("too many MIR arguments"));
+}
+
+#[test]
+fn mir_runtime_missing_constant_initializer_is_a_bounded_diagnostic() {
+    let mut runtime = test_runtime();
+    let error = runtime
+        .read_module_constant("module::missing", "module::__init_missing")
+        .expect_err("a missing serialized constant initializer must not panic");
+    assert!(error
+        .message
+        .contains("missing MIR initializer `module::__init_missing`"));
+}
+
+#[test]
 fn mir_runtime_deadline_helper_rejects_overflowing_instants() {
     let error = super::runtime_deadline_after_timeout(Some(StdDuration::MAX))
         .expect_err("overflowing instant deadlines should be rejected");
@@ -8920,6 +9269,105 @@ fn mir_runtime_complexity_guard_rejects_excessive_instruction_counts() {
     super::validate_runtime_module_complexity(&match_module)
         .expect("small match terminator modules should be accepted");
 
+    let projection_limit = module_with_blocks(vec![BasicBlock {
+        label: "entry".to_string(),
+        instructions: vec![Instruction::BeginReturnedLoan {
+            loan: "returned".to_string(),
+            origin: "owner".to_string(),
+            projections: vec![String::new(); super::MAX_RUNTIME_LOAN_PROJECTIONS + 1],
+            mutable: false,
+        }],
+        terminator: Terminator::Return(Operand::Int(0)),
+    }]);
+    let projection_limit_error = super::validate_runtime_module_complexity(&projection_limit)
+        .expect_err("serialized returned-view descriptors must have a bounded projection count");
+    assert!(projection_limit_error
+        .message
+        .contains("returned-loan projection limit"));
+
+    let path_limit = module_with_blocks(vec![BasicBlock {
+        label: "entry".to_string(),
+        instructions: vec![Instruction::BeginLoan {
+            loan: "borrowed".to_string(),
+            source: "x".repeat(super::MAX_RUNTIME_LOAN_PATH_BYTES + 1),
+            mutable: false,
+        }],
+        terminator: Terminator::Return(Operand::Int(0)),
+    }]);
+    let path_limit_error = super::validate_runtime_module_complexity(&path_limit)
+        .expect_err("serialized loan descriptors must have a bounded path byte count");
+    assert!(path_limit_error.message.contains("loan-path byte limit"));
+
+    let alternative_limit = module_with_blocks(vec![BasicBlock {
+        label: "entry".to_string(),
+        instructions: vec![
+            Instruction::BeginReturnedLoan {
+                loan: "parent".to_string(),
+                origin: "owner".to_string(),
+                projections: (0..65).map(|index| format!("a{index}")).collect(),
+                mutable: false,
+            },
+            Instruction::BeginReturnedLoan {
+                loan: "child".to_string(),
+                origin: "parent".to_string(),
+                projections: (0..65).map(|index| format!("b{index}")).collect(),
+                mutable: false,
+            },
+        ],
+        terminator: Terminator::Return(Operand::Int(0)),
+    }]);
+    let alternative_limit_error = super::validate_runtime_module_complexity(&alternative_limit)
+        .expect_err("nested returned views must not multiply beyond the alternative limit");
+    assert!(alternative_limit_error
+        .message
+        .contains("expanded loan alternative limit"));
+
+    let cyclic_expansion = module_with_blocks(vec![BasicBlock {
+        label: "entry".to_string(),
+        instructions: vec![
+            Instruction::Reborrow {
+                loan: "left".to_string(),
+                parent: "right".to_string(),
+                projection: String::new(),
+                mutable: false,
+            },
+            Instruction::Reborrow {
+                loan: "right".to_string(),
+                parent: "left".to_string(),
+                projection: String::new(),
+                mutable: false,
+            },
+        ],
+        terminator: Terminator::Return(Operand::Int(0)),
+    }]);
+    let cyclic_expansion_error = super::validate_runtime_module_complexity(&cyclic_expansion)
+        .expect_err("cyclic serialized loan descriptors must be rejected without recursion");
+    assert!(cyclic_expansion_error
+        .message
+        .contains("expanded loan alternative limit"));
+
+    let deep_reborrows = module_with_blocks(vec![BasicBlock {
+        label: "entry".to_string(),
+        instructions: (0..258)
+            .map(|index| Instruction::Reborrow {
+                loan: format!("loan{index}"),
+                parent: if index == 257 {
+                    "owner".to_string()
+                } else {
+                    format!("loan{}", index + 1)
+                },
+                projection: String::new(),
+                mutable: false,
+            })
+            .collect(),
+        terminator: Terminator::Return(Operand::Int(0)),
+    }]);
+    let deep_reborrow_error = super::validate_runtime_module_complexity(&deep_reborrows)
+        .expect_err("serialized reborrow chains must have bounded expansion depth");
+    assert!(deep_reborrow_error
+        .message
+        .contains("expanded loan alternative limit"));
+
     let amplified_origin = "o".repeat(300_000);
     let amplified = module_with_blocks(vec![BasicBlock {
         label: "entry".to_string(),
@@ -8940,6 +9388,31 @@ fn mir_runtime_complexity_guard_rejects_excessive_instruction_counts() {
         "unexpected diagnostic: {}",
         expansion_error.message
     );
+
+    let mut combined_expansion = module_with_blocks(vec![BasicBlock {
+        label: "entry".to_string(),
+        instructions: vec![Instruction::BeginReturnedLoan {
+            loan: "first".to_string(),
+            origin: "a".repeat(140_000),
+            projections: (0..16).map(|index| index.to_string()).collect(),
+            mutable: false,
+        }],
+        terminator: Terminator::Return(Operand::Int(0)),
+    }]);
+    let mut second = combined_expansion.functions[0].clone();
+    second.name = "second".to_string();
+    if let Instruction::BeginReturnedLoan { loan, origin, .. } =
+        &mut second.blocks[0].instructions[0]
+    {
+        *loan = "second".to_string();
+        *origin = "b".repeat(140_000);
+    }
+    combined_expansion.functions.push(second);
+    let combined_expansion_error = super::validate_runtime_module_complexity(&combined_expansion)
+        .expect_err("expanded loan-path bytes must be bounded across the whole module");
+    assert!(combined_expansion_error
+        .message
+        .contains("expanded loan-path byte limit"));
 
     let reborrow_amplification = module_with_blocks(vec![BasicBlock {
         label: "entry".to_string(),

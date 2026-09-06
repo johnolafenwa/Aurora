@@ -25,6 +25,35 @@ Last updated: 2026-09-06
   checks pass. Detailed feature design and implementation remain future work.
 - Work note: `work/2026-09-06-approved-roadmap-adrs.md`.
 
+## Aura v0.3.3-preview loans/views release (in progress)
+
+- Current authorized target: fully review ADR-0038 and make the candidate ready
+  before pushing for release tests. Preserve the original compiler coverage
+  gates and add tests, per the user's 2026-09-06 direction. Publication remains
+  pending; no release tag has been created.
+- Release metadata, manifests, locks, installer, Manual stamps, platform guides,
+  generated agent documentation, packaging tests, and changelog are being
+  advanced together.
+- Required publication gate: focused release checks, one complete local CI run,
+  one complete green hosted CI run for the exact candidate commit, then an
+  annotated tag-triggered prerelease and public artifact/checksum verification.
+- The complete local `npm run ci` gate is green. Compiler coverage is
+  96.307730% lines, 97.210239% functions, and 94.810026% regions, passing the
+  unchanged 96.30%/97.21%/94.71% floors after meaningful diagnostic, cleanup,
+  and symbolic-contract tests were added.
+- The current review found and fixed cumulative symbolic returned-view path
+  expansion before common MIR validation, with test-first regressions through
+  in-memory, serialized, and direct-native public boundaries. An independent
+  post-fix static review found no remaining scoped bypass or regression.
+- Daybreak review traced a timing-only queue-default CLI failure under the full
+  parallel gate to scheduler-thread contention. Its test now requests one Aura
+  worker while retaining the product watchdog and passes in both ordinary and
+  coverage suites. The exact-candidate hosted Linux/macOS run remains pending.
+- Current review: `work/2026-09-06-adr0038-release-readiness.md`.
+- Protected user files remain untouched: `personal/file_ops.au`, the untracked
+  ADR-0022 draft, and the untracked `.swp` file.
+- Work note: `work/2026-08-25-v0.3.3-preview-release.md`.
+
 ## ADR-0038 loans and views (complete)
 
 - Implemented place identity for local/parameter/receiver roots, fixed class

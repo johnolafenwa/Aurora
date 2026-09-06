@@ -81,7 +81,7 @@ test("extension manifest and listing are ready for both public marketplaces", ()
   assert.equal(manifest.name, "vscode-aura-lang");
   assert.equal(manifest.publisher, "JohnOlafenwa");
   assert.equal(manifest.displayName, "Aura Programming Language");
-  assert.equal(manifest.version, "0.3.3");
+  assert.equal(manifest.version, "0.3.4");
   assert.equal(manifest.preview, true);
   assert.equal(manifest.private, undefined);
   assert.equal(manifest.icon, "images/aura.png");

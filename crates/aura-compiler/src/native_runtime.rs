@@ -7942,12 +7942,18 @@ pub extern "C-unwind" fn aura_direct_set_returned_view_projection(
 ) {
     task_runtime_boundary(|| {
         let projection = decode_bytes(projection_ptr, projection_len);
-        with_direct_task_runtime_state(|state| {
-            let frame = state.returned_view_frames.last_mut().unwrap_or_else(|| {
-                runtime_error("direct returned-view handoff has no active call frame")
-            });
+        let installed = with_direct_task_runtime_state(|state| {
+            let Some(frame) = state.returned_view_frames.last_mut() else {
+                return false;
+            };
             frame.returned = Some(projection);
+            true
         });
+        if !installed {
+            // Raise after releasing the task-state RefCell borrow. The runtime
+            // error path consults that state to capture the diagnostic.
+            runtime_error("direct returned-view handoff has no active call frame");
+        }
     })
 }
 

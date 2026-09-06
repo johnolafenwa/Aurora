@@ -354,6 +354,36 @@ fn format_width_and_precision_enforce_the_ratified_boundaries() {
 }
 
 #[test]
+fn format_components_reject_host_overflow_and_round_decimal_ties_to_even() {
+    let oversized_component = "9".repeat(128);
+    let width = parse_format_spec(&format!("{oversized_component}d"))
+        .expect_err("a width outside usize must be rejected before the maintained limit check");
+    assert_eq!(width.kind, FormatSpecErrorKind::Syntax);
+    assert_eq!(width.message, "format width is not a valid decimal integer");
+
+    let precision = parse_format_spec(&format!(".{oversized_component}e"))
+        .expect_err("a precision outside usize must be rejected before formatting");
+    assert_eq!(precision.kind, FormatSpecErrorKind::Syntax);
+    assert_eq!(
+        precision.message,
+        "format precision is not a valid decimal integer"
+    );
+
+    for (value, expected) in [(1_251, "1.3e+03"), (1_350, "1.4e+03"), (1_250, "1.2e+03")] {
+        assert_eq!(
+            format_runtime_value(
+                &Value::Int(IntegerValue::from_i64(value)),
+                &Type::named("int64"),
+                ".1e",
+            )
+            .expect("integer scientific formatting should round without binary64 conversion"),
+            expected,
+            "formatting {value} should use decimal ties-to-even"
+        );
+    }
+}
+
+#[test]
 fn integer_float_style_formats_do_not_round_through_binary64() {
     let exact = Value::Int(
         crate::integer::IntegerValue::from_typed_unsigned(
@@ -1328,6 +1358,194 @@ fn array_containing_language_copy_reports_outer_shape_and_storage_allocation_fai
         source_storage.as_ptr(),
         slice_storage.as_ptr(),
         "a successful Vec slice must own its nested Array storage"
+    );
+}
+
+#[test]
+fn adr0038_partial_capture_copies_release_every_projected_value_after_failure() {
+    fn channel_value(channel: &ChannelValue) -> Value {
+        Value::Channel(channel.clone())
+    }
+
+    fn cleanup_tree(channel: &ChannelValue) -> Value {
+        Value::Tuple(TupleValue {
+            element_types: vec![
+                Type::Named("list".to_string(), vec![Type::named("CleanupNode")]),
+                Type::Named(
+                    "dict".to_string(),
+                    vec![Type::named("str"), Type::named("Queue")],
+                ),
+            ],
+            elements: vec![
+                Value::Vec(VecValue {
+                    element_type: Type::named("CleanupNode"),
+                    elements: vec![Value::Set(SetValue {
+                        element_type: Type::named("CleanupNode"),
+                        elements: vec![Value::Instance(InstanceValue {
+                            class_name: "CleanupNode".to_string(),
+                            fields: BTreeMap::from([(
+                                "payload".to_string(),
+                                Value::EnumVariant(EnumVariantValue {
+                                    enum_name: "CleanupPayload".to_string(),
+                                    variant_name: "Queue".to_string(),
+                                    payloads: vec![channel_value(channel)],
+                                }),
+                            )]),
+                        })],
+                    })],
+                }),
+                Value::Map(MapValue {
+                    key_type: Type::named("str"),
+                    value_type: Type::named("Queue"),
+                    entries: vec![(Value::String("queue".to_string()), channel_value(channel))],
+                }),
+            ],
+        })
+    }
+
+    fn failing_array() -> Value {
+        Value::Array(
+            ArrayValue::new(
+                vec![1].into_boxed_slice(),
+                ArrayStorage::Int32(vec![7].into_boxed_slice()),
+            )
+            .expect("the source Array should be valid before clone-failure injection"),
+        )
+    }
+
+    fn assert_failure_releases_partial_copies(
+        source: Value,
+        channel: &ChannelValue,
+        successful_allocations: usize,
+        expected_message: &str,
+    ) {
+        let environment = ClosureEnvironment::new(
+            vec![ClosureCaptureValue {
+                name: "state".to_string(),
+                ty: Type::named("CaptureState"),
+                value: source,
+                source_place: Some("state".to_string()),
+                mutable: true,
+            }],
+            false,
+        );
+        let baseline = Arc::strong_count(&channel.inner);
+        assert!(
+            baseline > 1,
+            "the source fixture must retain at least one observable Queue value"
+        );
+
+        let error = super::with_array_allocation_budget(successful_allocations + 1, || {
+            environment.arguments("main::__lambda_projected_capture")
+        })
+        .expect_err("the selected nested allocation must fail recoverably");
+        assert_eq!(error.code, "AU4005");
+        assert_eq!(error.message, expected_message);
+        assert_eq!(
+            Arc::strong_count(&channel.inner),
+            baseline,
+            "all Queue aliases created before the failure must be released exactly once"
+        );
+
+        let recovered = environment
+            .arguments("main::__lambda_projected_capture")
+            .expect("a failed repeatable capture copy must leave its source environment live");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].source_place.as_deref(), Some("state"));
+        assert!(recovered[0].mutable);
+        drop(recovered);
+        assert_eq!(
+            Arc::strong_count(&channel.inner),
+            baseline,
+            "dropping a successful retry must release each projected Queue alias once"
+        );
+    }
+
+    let tuple_channel = ChannelValue::new();
+    assert_failure_releases_partial_copies(
+        Value::Tuple(TupleValue {
+            element_types: vec![
+                Type::named("CaptureState"),
+                Type::Named("Array".to_string(), vec![Type::named("int32")]),
+            ],
+            elements: vec![cleanup_tree(&tuple_channel), failing_array()],
+        }),
+        &tuple_channel,
+        8,
+        "Array shape could not allocate storage for 1 array elements",
+    );
+
+    let set_channel = ChannelValue::new();
+    let tuple_capture = || {
+        Value::Tuple(TupleValue {
+            element_types: vec![Type::named("Queue")],
+            elements: vec![channel_value(&set_channel)],
+        })
+    };
+    assert_failure_releases_partial_copies(
+        Value::Set(SetValue {
+            element_type: Type::Tuple(vec![Type::named("Queue")]),
+            elements: vec![tuple_capture(), tuple_capture()],
+        }),
+        &set_channel,
+        3,
+        "Array-containing tuple type copy could not allocate storage for 1 array elements",
+    );
+
+    let map_key_channel = ChannelValue::new();
+    let integer_key = |value| {
+        Value::Tuple(TupleValue {
+            element_types: vec![Type::named("int32")],
+            elements: vec![Value::Int(IntegerValue::from_i32(value))],
+        })
+    };
+    assert_failure_releases_partial_copies(
+        Value::Map(MapValue {
+            key_type: Type::Tuple(vec![Type::named("int32")]),
+            value_type: Type::named("Queue"),
+            entries: vec![
+                (integer_key(1), channel_value(&map_key_channel)),
+                (integer_key(2), channel_value(&map_key_channel)),
+            ],
+        }),
+        &map_key_channel,
+        3,
+        "Array-containing tuple type copy could not allocate storage for 1 array elements",
+    );
+
+    let map_value_channel = ChannelValue::new();
+    let queue_tuple = || {
+        Value::Tuple(TupleValue {
+            element_types: vec![Type::named("Queue")],
+            elements: vec![channel_value(&map_value_channel)],
+        })
+    };
+    assert_failure_releases_partial_copies(
+        Value::Map(MapValue {
+            key_type: Type::named("str"),
+            value_type: Type::Tuple(vec![Type::named("Queue")]),
+            entries: vec![
+                (Value::String("first".to_string()), queue_tuple()),
+                (Value::String("second".to_string()), queue_tuple()),
+            ],
+        }),
+        &map_value_channel,
+        3,
+        "Array-containing tuple type copy could not allocate storage for 1 array elements",
+    );
+
+    let instance_channel = ChannelValue::new();
+    assert_failure_releases_partial_copies(
+        Value::Instance(InstanceValue {
+            class_name: "CaptureState".to_string(),
+            fields: BTreeMap::from([
+                ("a_state".to_string(), cleanup_tree(&instance_channel)),
+                ("z_values".to_string(), failing_array()),
+            ]),
+        }),
+        &instance_channel,
+        6,
+        "Array shape could not allocate storage for 1 array elements",
     );
 }
 
@@ -2679,6 +2897,85 @@ fn adr0038_closure_environment_mutable_capture_helpers_cover_success_and_errors(
             .expect_err("a missing environment has no live captures")
             .message,
         "closure has no live capture at index 0"
+    );
+}
+
+#[test]
+fn adr0038_closure_capture_access_recovers_poisoned_loan_bookkeeping() {
+    fn mutable_capture(value: i64) -> ClosureCaptureValue {
+        ClosureCaptureValue {
+            name: "counter".to_string(),
+            ty: Type::named("int64"),
+            value: Value::Int(IntegerValue::from_i64(value)),
+            source_place: Some("state.counter".to_string()),
+            mutable: true,
+        }
+    }
+
+    let repeatable = Arc::new(ClosureEnvironment::new(vec![mutable_capture(3)], false));
+    let poison_target = Arc::clone(&repeatable);
+    let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = poison_target
+            .captures
+            .lock()
+            .expect("fresh capture bookkeeping should be healthy");
+        panic!("poison capture bookkeeping");
+    }));
+    assert!(poison.is_err());
+
+    repeatable
+        .write_back_mutable(0, Value::Int(IntegerValue::from_i64(4)))
+        .expect("a poisoned mutex must not discard mutable-capture writeback");
+    assert_eq!(
+        repeatable
+            .capture_value(0)
+            .expect("a poisoned mutex must not hide a live borrowed capture"),
+        Value::Int(IntegerValue::from_i64(4))
+    );
+    let borrowed = repeatable
+        .arguments("main::__lambda_borrowed")
+        .expect("repeatable capture reads must recover the same live environment");
+    assert_eq!(borrowed[0].source_place.as_deref(), Some("state.counter"));
+    assert!(borrowed[0].mutable);
+    assert_eq!(borrowed[0].value, Value::Int(IntegerValue::from_i64(4)));
+
+    let consuming = Arc::new(ClosureEnvironment::new(vec![mutable_capture(7)], true));
+    let poison_target = Arc::clone(&consuming);
+    let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = poison_target
+            .consumed
+            .lock()
+            .expect("fresh consumption bookkeeping should be healthy");
+        panic!("poison consumption bookkeeping");
+    }));
+    assert!(poison.is_err());
+
+    let owned = consuming
+        .arguments("main::__lambda_once")
+        .expect("poison recovery must preserve the first consuming capture read");
+    assert_eq!(owned[0].value, Value::Int(IntegerValue::from_i64(7)));
+    assert_eq!(
+        consuming
+            .capture_value(0)
+            .expect("the consumed slot stays addressable for native mutable writeback"),
+        Value::Unit,
+        "moving a consuming capture must clear the environment before its writeback"
+    );
+    consuming
+        .write_back_mutable(0, Value::Int(IntegerValue::from_i64(8)))
+        .expect("the closure body may publish its final mutable capture value");
+    assert_eq!(
+        consuming
+            .capture_value(0)
+            .expect("the final mutable capture value remains observable for runtime cleanup"),
+        Value::Int(IntegerValue::from_i64(8))
+    );
+    assert_eq!(
+        consuming
+            .arguments("main::__lambda_once")
+            .expect_err("poison recovery must not permit a second consuming read")
+            .message,
+        "closure `main::__lambda_once` has already consumed its captured environment"
     );
 }
 
@@ -5316,6 +5613,34 @@ fn numeric_divmod_returns_matching_typed_pairs_and_classifies_failures() {
     )
     .expect_err("minimum divided by negative one must not panic");
     assert_eq!(min_overflow.code, "AU4002");
+    assert_eq!(
+        min_overflow.message,
+        "`divmod(...)` integer quotient overflow"
+    );
+
+    let mathematical_quotient_overflow = divmod_numeric_values(
+        &Value::Int(IntegerValue::from_literal(u128::MAX)),
+        &Value::Int(IntegerValue::from_signed(-1)),
+        &Type::named("int128"),
+    )
+    .expect_err("an unrepresentable negative uint128 quotient must be diagnosed");
+    assert_eq!(mathematical_quotient_overflow.code, "AU4002");
+    assert_eq!(
+        mathematical_quotient_overflow.message,
+        "`divmod(...)` integer quotient overflow"
+    );
+
+    let narrowed_remainder_overflow = divmod_numeric_values(
+        &Value::Int(IntegerValue::from_signed(1_000)),
+        &Value::Int(IntegerValue::from_signed(700)),
+        &Type::named("int8"),
+    )
+    .expect_err("a remainder outside the statically supplied integer width must be diagnosed");
+    assert_eq!(narrowed_remainder_overflow.code, "AU4002");
+    assert_eq!(
+        narrowed_remainder_overflow.message,
+        "`divmod(...)` integer remainder overflow"
+    );
 
     let mismatch = divmod_numeric_values(
         &Value::Int(IntegerValue::from_i64(1)),
@@ -6806,6 +7131,29 @@ fn dynamic_json_runtime_conversion_rejects_noncanonical_payload_metadata() {
 }
 
 #[test]
+fn dynamic_json_rejects_deserialized_int64_metadata_with_an_out_of_range_payload() {
+    let malformed_integer: IntegerValue = serde_json::from_value(serde_json::json!({
+        "representation": { "Unsigned": 9_223_372_036_854_775_808_u64 },
+        "runtime_kind": "Int64"
+    }))
+    .expect("the wire shape should deserialize so the runtime validator can reject its payload");
+    assert_eq!(malformed_integer.runtime_kind(), Some(IntegerKind::Int64));
+
+    let malformed = Value::EnumVariant(EnumVariantValue {
+        enum_name: "json.Value".to_string(),
+        variant_name: "Int".to_string(),
+        payloads: vec![Value::Int(malformed_integer)],
+    });
+    let error = super::runtime_value_to_json(&malformed)
+        .expect_err("exact int64 metadata must not mask an out-of-range serialized payload");
+    assert_eq!(error.code, "AU4001");
+    assert_eq!(
+        error.message,
+        "malformed runtime `json.Value`: Value.Int payload is outside `int64`"
+    );
+}
+
+#[test]
 fn dynamic_json_accessors_reject_noncanonical_payload_metadata() {
     fn json_variant(variant_name: &str, payload: Value) -> Value {
         Value::EnumVariant(EnumVariantValue {
@@ -8130,6 +8478,20 @@ fn task_group_wake_flags_cover_already_completed_and_duplicate_registrations() {
     failure_flag.store(false, Ordering::SeqCst);
     failed.register_group_failure_wake_flag(failure_flag.clone());
     assert!(failure_flag.load(Ordering::SeqCst));
+
+    let idle_group = TaskGroupValue::new(&CancellationContext::default());
+    idle_group
+        .inner
+        .failure_wake_flag
+        .store(true, Ordering::SeqCst);
+    idle_group.clear_failure_wake_if_no_unobserved_error();
+    assert!(!idle_group.inner.failure_wake_flag.load(Ordering::SeqCst));
+
+    let failed_group = TaskGroupValue::new(&CancellationContext::default());
+    failed_group.register_task(failed);
+    assert!(failed_group.inner.failure_wake_flag.load(Ordering::SeqCst));
+    failed_group.clear_failure_wake_if_no_unobserved_error();
+    assert!(failed_group.inner.failure_wake_flag.load(Ordering::SeqCst));
 
     let running_group = TaskGroupValue::new(&CancellationContext::default());
     let blocker = ChannelValue::new();
@@ -11685,6 +12047,66 @@ fn supervisor_delays_restarts_and_reports_restart_counts() {
     assert!(supervisor.is_empty());
 }
 
+#[cfg(unix)]
+#[test]
+fn supervisor_reports_restart_spawn_failure_after_executable_disappears() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new("aura-supervisor-restart-missing");
+    let program = temp.path().join("short-lived-worker.sh");
+    fs::write(&program, "#!/bin/sh\nsleep 0.05\nexit 1\n")
+        .expect("temporary supervisor worker should be written");
+    let mut permissions = fs::metadata(&program)
+        .expect("temporary supervisor worker should have metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&program, permissions)
+        .expect("temporary supervisor worker should be executable");
+
+    let supervisor = ProcessSupervisorValue::new();
+    supervisor
+        .start(
+            "vanishing".to_string(),
+            vec![program.to_string_lossy().into_owned()],
+            None,
+            Vec::new(),
+            ProcessStdioConfig::Null,
+            ProcessStdioConfig::Null,
+            ProcessStdioConfig::Null,
+            ProcessRestartPolicy::Always,
+            StdDuration::from_millis(10),
+            Some(1),
+            false,
+        )
+        .expect("the initial supervised worker should start");
+    assert!(matches!(
+        supervisor.wait(Some(StdDuration::ZERO), None),
+        ProcessSupervisorWaitStatus::TimedOut
+    ));
+
+    fs::remove_file(&program)
+        .expect("the running executable should be unlinkable before its scheduled restart");
+    let failed = match supervisor.wait(Some(StdDuration::from_secs(2)), None) {
+        ProcessSupervisorWaitStatus::Event(event) => event,
+        ProcessSupervisorWaitStatus::TimedOut => panic!("supervisor restart failure timed out"),
+        ProcessSupervisorWaitStatus::Cancelled => {
+            panic!("supervisor restart failure was unexpectedly cancelled")
+        }
+    };
+    let Value::EnumVariant(failed) = failed else {
+        panic!("supervisor restart failure should return an event variant");
+    };
+    assert_eq!(failed.enum_name, "SupervisorEvent");
+    assert_eq!(failed.variant_name, "Failed");
+    assert_eq!(failed.payloads[0], Value::String("vanishing".to_string()));
+    assert_eq!(
+        failed.payloads[1].render().split('(').next(),
+        Some("Error.Spawn")
+    );
+    assert_eq!(failed.payloads[2], Value::Int(IntegerValue::from_signed(1)));
+    assert!(supervisor.is_empty());
+}
+
 #[test]
 fn tcp_udp_http_and_websocket_helpers_cover_timeout_and_protocol_surface() {
     let short_timeout = StdDuration::from_secs(5);
@@ -13076,6 +13498,21 @@ fn blocking_io_pool_startup_failure_crosses_runtime_boundaries_as_fatal_au4006()
     assert_eq!(
         unrelated.downcast_ref::<&str>(),
         Some(&"unrelated runtime panic")
+    );
+}
+
+#[test]
+fn blocking_io_startup_fallback_wraps_plain_host_errors_as_fatal_au4006() {
+    let diagnostic = super::catch_lightweight_task_failure(|| -> Result<(), Diagnostic> {
+        super::raise_blocking_io_pool_startup_failure(io::Error::other(
+            "plain host startup failure",
+        ))
+    })
+    .expect_err("a plain host startup failure must terminate the runtime invocation");
+    assert_eq!(diagnostic.code, "AU4006");
+    assert_eq!(
+        diagnostic.message,
+        "failed to initialize the blocking-I/O pool: plain host startup failure"
     );
 }
 
@@ -15048,6 +15485,68 @@ fn http_request_rejects_invalid_header_names_and_non_ascii_values() {
     )
     .expect_err("request headers with non-ASCII values should be rejected");
     assert_eq!(bad_value.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn http_content_length_validation_rejects_non_identity_transfer_coding() {
+    let error = super::parse_http_content_length(&[(
+        "Transfer-Encoding".to_string(),
+        "chunked".to_string(),
+    )])
+    .expect_err("content-length validation must reject unsupported transfer coding");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error.to_string(),
+        "Aura HTTP currently does not support transfer-encoding other than identity"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn tls_and_websocket_validation_fail_before_remote_protocol_io() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("the local TLS validation listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("the local TLS validation listener should have an address");
+    let accepted = thread::spawn(move || {
+        let (_stream, _) = listener
+            .accept()
+            .expect("the validation connection should reach the local listener");
+    });
+    let tls_error = TlsStreamValue::connect(
+        &address.to_string(),
+        "not a valid TLS server name",
+        None,
+        Some(StdDuration::from_secs(2)),
+        None,
+    )
+    .expect_err("an invalid TLS server name must fail before a handshake is attempted");
+    accepted
+        .join()
+        .expect("the local TLS validation listener should finish");
+    assert_eq!(tls_error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(tls_error.to_string(), "invalid TLS server name");
+
+    let websocket_error = super::WebSocketValue::connect(
+        "custom://example.com/socket",
+        Some(StdDuration::from_secs(1)),
+    )
+    .expect_err("a websocket URL without a known scheme port must fail before resolution");
+    assert_eq!(websocket_error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        websocket_error.to_string(),
+        "websocket URL is missing a known port"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pending_tls_listener_progress_uses_a_bounded_default_poll() {
+    let (reader, _writer) = std::os::unix::net::UnixStream::pair()
+        .expect("the local readiness probe should create a socket pair");
+    super::wait_for_tls_listener_progress(reader.as_raw_fd(), false, None, None)
+        .expect("a pending handshake without a caller deadline should yield after a bounded poll");
 }
 
 #[test]

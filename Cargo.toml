@@ -6,7 +6,7 @@ resolver = "2"
 edition = "2021"
 license = "MIT"
 rust-version = "1.95"
-version = "0.3.2"
+version = "0.3.3"
 
 # Native cache hits hash large linked artifacts on every use. Keep the SHA-256
 # implementation optimized in development builds so integrity verification

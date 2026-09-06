@@ -1,6 +1,6 @@
 # Why Aura
 
-Aura 0.3.2 is a technical preview of a compiled, statically typed programming
+Aura 0.3.3 is a technical preview of a compiled, statically typed programming
 language for reliable software. It combines Python-inspired syntax,
 deterministic ownership, structured concurrency, typed failure, and native
 executables.

@@ -34,6 +34,737 @@ use crate::sema::Type;
 use crate::{lower_path_to_mir, lower_source_to_mir};
 
 #[test]
+fn adr0038_direct_view_fixed_point_comparison_ignores_order_not_authority() {
+    use super::{direct_view_maps_equivalent, DirectViewAlternative};
+    use cranelift_frontend::Variable;
+    let a = DirectViewAlternative {
+        place: "owner.left".into(),
+        conditions: vec![(Variable::from_u32(1), 0), (Variable::from_u32(2), 1)],
+    };
+    let b = DirectViewAlternative {
+        place: "owner.right".into(),
+        conditions: vec![(Variable::from_u32(1), 1)],
+    };
+    let left = HashMap::from([(
+        "view".into(),
+        DirectViewPlace {
+            alternatives: vec![a.clone(), b.clone()],
+        },
+    )]);
+    let mut reordered = a.clone();
+    reordered.conditions.reverse();
+    let right = HashMap::from([(
+        "view".into(),
+        DirectViewPlace {
+            alternatives: vec![b.clone(), reordered],
+        },
+    )]);
+    assert!(direct_view_maps_equivalent(&left, &right));
+    assert!(!direct_view_maps_equivalent(&left, &HashMap::new()));
+    assert!(!direct_view_maps_equivalent(
+        &left,
+        &HashMap::from([("different".into(), left["view"].clone())])
+    ));
+    for alternatives in [
+        vec![a.clone()],
+        vec![a.clone(), a.clone()],
+        vec![
+            a.clone(),
+            DirectViewAlternative {
+                place: b.place.clone(),
+                conditions: vec![],
+            },
+        ],
+        vec![
+            a,
+            DirectViewAlternative {
+                place: b.place,
+                conditions: vec![(Variable::from_u32(1), 0)],
+            },
+        ],
+    ] {
+        assert!(!direct_view_maps_equivalent(
+            &left,
+            &HashMap::from([("view".into(), DirectViewPlace { alternatives })])
+        ));
+    }
+}
+
+#[test]
+fn adr0038_direct_cfg_helpers_validate_reachability_order_and_selector_tags() {
+    use std::collections::HashSet;
+
+    use super::{
+        direct_reverse_postorder, direct_view_selector_tags, reachable_direct_block_labels,
+    };
+
+    let block = |label: &str, instructions: Vec<Instruction>, terminator: Terminator| BasicBlock {
+        label: label.to_string(),
+        instructions,
+        terminator,
+    };
+    let function = MirFunction {
+        name: "cfg_helpers".to_string(),
+        module_name: "<test>".to_string(),
+        source_path: None,
+        span: Span::new(1, 1),
+        receiver: None,
+        params: Vec::new(),
+        local_types: Vec::new(),
+        return_type: Type::Unit,
+        entry: "entry".to_string(),
+        blocks: vec![
+            block(
+                "entry",
+                vec![Instruction::BeginReturnedLoan {
+                    loan: "chosen".to_string(),
+                    origin: "owner".to_string(),
+                    projections: vec!["right".to_string(), "left".to_string()],
+                    mutable: false,
+                }],
+                Terminator::Branch {
+                    condition: Operand::Bool(true),
+                    then_label: "left".to_string(),
+                    else_label: "right".to_string(),
+                },
+            ),
+            block("left", Vec::new(), Terminator::Goto("join".to_string())),
+            block("right", Vec::new(), Terminator::Goto("join".to_string())),
+            block("join", Vec::new(), Terminator::Return(Operand::Unit)),
+            block(
+                "dead",
+                vec![Instruction::BeginReturnedLoan {
+                    loan: "chosen".to_string(),
+                    origin: "owner".to_string(),
+                    projections: vec!["ignored".to_string()],
+                    mutable: false,
+                }],
+                Terminator::Return(Operand::Unit),
+            ),
+        ],
+    };
+
+    let reachable = reachable_direct_block_labels(&function).expect("valid CFG should resolve");
+    assert_eq!(
+        reachable,
+        HashSet::from_iter(["entry", "left", "right", "join"].map(str::to_string))
+    );
+    let order = direct_reverse_postorder(&function, &reachable).expect("valid CFG should order");
+    assert_eq!(order.first().map(String::as_str), Some("entry"));
+    assert_eq!(order.last().map(String::as_str), Some("join"));
+    assert_eq!(order.iter().collect::<HashSet<_>>().len(), reachable.len());
+
+    let tags = direct_view_selector_tags(&function, &reachable);
+    assert_eq!(tags["chosen"].get("left"), Some(&0));
+    assert_eq!(tags["chosen"].get("right"), Some(&1));
+    assert!(!tags["chosen"].contains_key("ignored"));
+
+    let mut malformed = function.clone();
+    malformed.blocks.push(malformed.blocks[0].clone());
+    assert!(reachable_direct_block_labels(&malformed)
+        .expect_err("duplicate labels must fail")
+        .contains("duplicate MIR block `entry`"));
+
+    malformed = function.clone();
+    malformed.entry = "missing".to_string();
+    assert!(reachable_direct_block_labels(&malformed)
+        .expect_err("missing entry must fail")
+        .contains("could not find entry block `missing`"));
+    assert!(
+        direct_reverse_postorder(&malformed, &HashSet::from(["missing".to_string()]))
+            .expect_err("an unresolved reachable entry must fail")
+            .contains("could not resolve reachable block `missing`")
+    );
+
+    malformed = function;
+    malformed.blocks[1].terminator = Terminator::Goto("missing".to_string());
+    assert!(reachable_direct_block_labels(&malformed)
+        .expect_err("unknown successors must fail")
+        .contains("targets unknown block `missing`"));
+}
+
+#[test]
+fn adr0038_direct_view_and_closure_metadata_helpers_preserve_dataflow_invariants() {
+    use std::collections::HashSet;
+
+    use cranelift_frontend::Variable;
+
+    use super::{
+        direct_closure_metadata_uses, direct_closure_writeback_live_ins,
+        merge_direct_closure_writebacks, DirectClosureCaptureWriteback, DirectViewAlternative,
+    };
+    use crate::sema::ClosureCallKind;
+
+    let selector = Variable::from_u32(7);
+    let projected = DirectViewPlace::static_place("owner".to_string())
+        .project("")
+        .project("field")
+        .conditioned(selector, 1)
+        .conditioned(selector, 1);
+    assert_eq!(
+        projected.alternatives,
+        vec![DirectViewAlternative {
+            place: "owner.field".to_string(),
+            conditions: vec![(selector, 1)],
+        }]
+    );
+
+    let writeback = |index, place: &str, ty| DirectClosureCaptureWriteback {
+        index,
+        place: DirectViewPlace::static_place(place.to_string()),
+        ty,
+    };
+    let left = HashMap::from([(
+        "worker".to_string(),
+        vec![writeback(0, "left", DirectType::Scalar(ScalarKind::Int64))],
+    )]);
+    let right = HashMap::from([
+        (
+            "worker".to_string(),
+            vec![
+                writeback(0, "right", DirectType::Scalar(ScalarKind::Int64)),
+                writeback(1, "other", DirectType::Scalar(ScalarKind::Bool)),
+                writeback(0, "typed", DirectType::Scalar(ScalarKind::Bool)),
+            ],
+        ),
+        (
+            "second".to_string(),
+            vec![writeback(
+                0,
+                "second",
+                DirectType::Scalar(ScalarKind::Int64),
+            )],
+        ),
+    ]);
+    let merged = merge_direct_closure_writebacks(&left, &right);
+    assert_eq!(merged["worker"].len(), 3);
+    assert_eq!(merged["worker"][0].place.alternatives.len(), 2);
+    assert_eq!(merged["second"].len(), 1);
+
+    let transferred = Rvalue::Use(Operand::MovePlace("worker.capture".to_string()));
+    assert_eq!(
+        direct_closure_metadata_uses(&transferred).collect::<Vec<_>>(),
+        ["worker"]
+    );
+    let called = Rvalue::Call {
+        callee: CallTarget::Value(Operand::Place("worker.callable".to_string())),
+        args: Vec::new(),
+    };
+    assert_eq!(
+        direct_closure_metadata_uses(&called).collect::<Vec<_>>(),
+        ["worker"]
+    );
+    assert!(direct_closure_metadata_uses(&Rvalue::Use(Operand::Int(0)))
+        .next()
+        .is_none());
+
+    let closure_ty = Type::Closure {
+        params: Box::new(Vec::new()),
+        return_type: Box::new(Type::Unit),
+        captures: Box::new(Vec::new()),
+        call_kind: ClosureCallKind::Repeatable,
+    };
+    let function = MirFunction {
+        name: "closure_liveness".to_string(),
+        module_name: "<test>".to_string(),
+        source_path: None,
+        span: Span::new(1, 1),
+        receiver: None,
+        params: Vec::new(),
+        local_types: vec![
+            MirLocalType {
+                name: "worker".to_string(),
+                ty: closure_ty.clone(),
+            },
+            MirLocalType {
+                name: "replacement".to_string(),
+                ty: closure_ty,
+            },
+        ],
+        return_type: Type::Unit,
+        entry: "entry".to_string(),
+        blocks: vec![
+            BasicBlock {
+                label: "entry".to_string(),
+                instructions: Vec::new(),
+                terminator: Terminator::Goto("use".to_string()),
+            },
+            BasicBlock {
+                label: "use".to_string(),
+                instructions: vec![
+                    Instruction::Assign {
+                        target: "replacement".to_string(),
+                        value: Rvalue::Use(Operand::Place("worker.capture".to_string())),
+                    },
+                    Instruction::Assign {
+                        target: "worker".to_string(),
+                        value: Rvalue::Use(Operand::Place("replacement".to_string())),
+                    },
+                ],
+                terminator: Terminator::Return(Operand::Unit),
+            },
+            BasicBlock {
+                label: "dead".to_string(),
+                instructions: vec![Instruction::Assign {
+                    target: "value".to_string(),
+                    value: Rvalue::Use(Operand::Place("worker".to_string())),
+                }],
+                terminator: Terminator::Return(Operand::Unit),
+            },
+        ],
+    };
+    let live = direct_closure_writeback_live_ins(
+        &function,
+        &HashSet::from(["entry".to_string(), "use".to_string()]),
+    );
+    assert_eq!(live["use"], HashSet::from(["worker".to_string()]));
+    assert_eq!(live["entry"], HashSet::from(["worker".to_string()]));
+    assert!(!live.contains_key("dead"));
+}
+
+#[test]
+fn adr0038_direct_cfg_join_rejects_branch_dependent_view_identity() {
+    let function = MirFunction {
+        name: "view_join".to_string(),
+        module_name: "<test>".to_string(),
+        source_path: None,
+        span: Span::new(1, 1),
+        receiver: None,
+        params: vec![
+            MirParam {
+                name: "left".to_string(),
+                passing: MirReceiverKind::Borrow,
+                ty: Type::named("int64"),
+                default_function: None,
+            },
+            MirParam {
+                name: "right".to_string(),
+                passing: MirReceiverKind::Borrow,
+                ty: Type::named("int64"),
+                default_function: None,
+            },
+        ],
+        local_types: Vec::new(),
+        return_type: Type::Unit,
+        entry: "entry".to_string(),
+        blocks: vec![
+            BasicBlock {
+                label: "entry".to_string(),
+                instructions: Vec::new(),
+                terminator: Terminator::Branch {
+                    condition: Operand::Bool(true),
+                    then_label: "take_left".to_string(),
+                    else_label: "take_right".to_string(),
+                },
+            },
+            BasicBlock {
+                label: "take_left".to_string(),
+                instructions: vec![Instruction::BeginLoan {
+                    loan: "selected".to_string(),
+                    source: "left".to_string(),
+                    mutable: false,
+                }],
+                terminator: Terminator::Goto("join".to_string()),
+            },
+            BasicBlock {
+                label: "take_right".to_string(),
+                instructions: vec![Instruction::BeginLoan {
+                    loan: "selected".to_string(),
+                    source: "right".to_string(),
+                    mutable: false,
+                }],
+                terminator: Terminator::Goto("join".to_string()),
+            },
+            BasicBlock {
+                label: "join".to_string(),
+                instructions: Vec::new(),
+                terminator: Terminator::Return(Operand::Unit),
+            },
+        ],
+    };
+    let mut setup_function = function.clone();
+    for block in &mut setup_function.blocks {
+        block.instructions.clear();
+    }
+    let module = crate::mir::MirModule {
+        constants: Vec::new(),
+        functions: vec![setup_function],
+        classes: Vec::new(),
+        trait_impls: Vec::new(),
+        top_level: None,
+    };
+    let mut codegen = NativeCodegen::new(&module, "/tmp/direct_view_join.au", "")
+        .expect("direct codegen should initialize for structurally complete MIR");
+    let error = codegen
+        .define_function(&function)
+        .expect_err("branch-dependent view identities must not cross a direct CFG join");
+    assert!(
+        error.contains("reaches MIR block `join`")
+            && error.contains("inconsistent view identities"),
+        "unexpected direct join diagnostic: {error}"
+    );
+}
+
+#[test]
+fn adr0038_direct_tuple_place_errors_reach_codegen_after_constructor_setup() {
+    let base = MirFunction {
+        name: "tuple_place".to_string(),
+        module_name: "<test>".to_string(),
+        source_path: None,
+        span: Span::new(1, 1),
+        receiver: None,
+        params: vec![MirParam {
+            name: "pair".to_string(),
+            passing: MirReceiverKind::Value,
+            ty: Type::Tuple(vec![Type::named("int64"), Type::named("bool")]),
+            default_function: None,
+        }],
+        local_types: vec![MirLocalType {
+            name: "result".to_string(),
+            ty: Type::named("int64"),
+        }],
+        return_type: Type::Unit,
+        entry: "entry".to_string(),
+        blocks: vec![BasicBlock {
+            label: "entry".to_string(),
+            instructions: Vec::new(),
+            terminator: Terminator::Return(Operand::Unit),
+        }],
+    };
+
+    for (projection, expected) in [
+        ("not_an_index", "is not a fixed position"),
+        ("9", "has no element at index 9"),
+    ] {
+        let mut function = base.clone();
+        function.blocks[0].instructions = vec![Instruction::Assign {
+            target: "result".to_string(),
+            value: Rvalue::Use(Operand::Place(format!("pair.{projection}"))),
+        }];
+        let module = crate::mir::MirModule {
+            constants: Vec::new(),
+            functions: vec![function.clone()],
+            classes: Vec::new(),
+            trait_impls: Vec::new(),
+            top_level: None,
+        };
+        let mut codegen = NativeCodegen::new(&module, "/tmp/direct_tuple_place.au", "")
+            .expect("constructor should accept the function before place compilation");
+        let error = codegen
+            .define_function(&function)
+            .expect_err("invalid tuple projections must fail in direct place loading");
+        assert!(
+            error.contains(expected),
+            "unexpected projection error: {error}"
+        );
+    }
+}
+
+#[test]
+fn adr0038_direct_method_resolution_covers_inherent_and_named_trait_fallbacks() {
+    let module = lower_source_to_mir(
+        r#"
+trait Readable:
+    def read(self) -> int64
+
+class Counter:
+    value: int64
+
+    def read(self) -> int64:
+        return self.value
+
+class Wrapped:
+    value: int64
+
+impl Readable for Wrapped:
+    def read(self) -> int64:
+        return self.value
+
+def through_bound[T: Readable](value: T) -> int64:
+    return value.read()
+
+def main() -> int32:
+    direct = Counter(value=3).read()
+    via_trait = through_bound(Wrapped(value=4))
+    print(direct + via_trait)
+    return 0
+"#,
+    )
+    .expect("inherent and trait-dispatched methods should lower");
+    emit_host_object(&module)
+        .expect("direct backend should resolve inherent and named trait method fallbacks");
+}
+
+#[test]
+fn adr0038_direct_metadata_diagnostics_cover_reachable_constructor_boundaries() {
+    let simple = lower_source_to_mir(
+        r#"
+def main() -> int32:
+    return 0
+"#,
+    )
+    .expect("simple direct function should lower");
+    let main = simple
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+        .cloned()
+        .expect("main should lower");
+    let mut missing_function_reachability =
+        NativeCodegen::new(&simple, "/tmp/direct_missing_reachability.au", "")
+            .expect("simple direct codegen should initialize");
+    missing_function_reachability
+        .reachable_blocks
+        .remove("main");
+    let error = missing_function_reachability
+        .define_function(&main)
+        .expect_err("function compilation requires reachable-block metadata");
+    assert!(
+        error.contains("missing reachable-block metadata for `main`"),
+        "unexpected function metadata diagnostic: {error}"
+    );
+
+    let cleanup_function = cleanup_test_function("value", Type::named("int32"), "value");
+    let cleanup_module = cleanup_test_module(vec![cleanup_function.clone()]);
+    let mut missing_cleanup_reachability =
+        NativeCodegen::new(&cleanup_module, "/tmp/direct_cleanup_reachability.au", "")
+            .expect("cleanup codegen should initialize");
+    missing_cleanup_reachability
+        .reachable_blocks
+        .remove(&cleanup_function.name);
+    let error = missing_cleanup_reachability
+        .define_cleanup_thunks(&cleanup_function)
+        .expect_err("cleanup-thunk enumeration requires reachable-block metadata");
+    assert!(
+        error.contains("missing reachable-block metadata"),
+        "{error}"
+    );
+
+    let mut missing_single_cleanup_reachability = NativeCodegen::new(
+        &cleanup_module,
+        "/tmp/direct_single_cleanup_reachability.au",
+        "",
+    )
+    .expect("cleanup codegen should initialize");
+    missing_single_cleanup_reachability
+        .reachable_blocks
+        .remove(&cleanup_function.name);
+    let error = missing_single_cleanup_reachability
+        .define_cleanup_thunk(&cleanup_function, "value")
+        .expect_err("one cleanup thunk still requires reachable-block metadata");
+    assert!(
+        error.contains("missing reachable-block metadata"),
+        "{error}"
+    );
+
+    let initializer = MirFunction {
+        name: "constant_init".to_string(),
+        module_name: "<test>".to_string(),
+        source_path: None,
+        span: Span::new(1, 1),
+        receiver: None,
+        params: Vec::new(),
+        local_types: Vec::new(),
+        return_type: Type::named("int64"),
+        entry: "entry".to_string(),
+        blocks: vec![BasicBlock {
+            label: "entry".to_string(),
+            instructions: Vec::new(),
+            terminator: Terminator::Return(Operand::Int(1)),
+        }],
+    };
+    let constant_module = crate::mir::MirModule {
+        constants: vec![crate::mir::MirConstant {
+            key: "<test>::answer".to_string(),
+            initializer: initializer.name.clone(),
+            ty: Type::named("int64"),
+        }],
+        functions: vec![main.clone(), initializer.clone()],
+        classes: Vec::new(),
+        trait_impls: Vec::new(),
+        top_level: None,
+    };
+    let mut missing_main_initializer =
+        NativeCodegen::new(&constant_module, "/tmp/direct_constant_thunk.au", "")
+            .expect("constant codegen should initialize");
+    missing_main_initializer
+        .function_thunks
+        .remove(&initializer.name);
+    let error = missing_main_initializer
+        .define_function_thunk(&main)
+        .expect_err("main thunk requires every module-constant initializer");
+    assert!(
+        error.contains("cannot find module constant initializer `constant_init`"),
+        "unexpected main-thunk diagnostic: {error}"
+    );
+
+    let mut constant_reader = main.clone();
+    constant_reader.local_types.push(MirLocalType {
+        name: "answer".to_string(),
+        ty: Type::named("int64"),
+    });
+    constant_reader.blocks[0]
+        .instructions
+        .push(Instruction::Assign {
+            target: "answer".to_string(),
+            value: Rvalue::ModuleConstant {
+                key: "<test>::answer".to_string(),
+                initializer: initializer.name.clone(),
+            },
+        });
+    let reader_module = crate::mir::MirModule {
+        constants: Vec::new(),
+        functions: vec![constant_reader.clone(), initializer.clone()],
+        classes: Vec::new(),
+        trait_impls: Vec::new(),
+        top_level: None,
+    };
+    let mut missing_rvalue_initializer =
+        NativeCodegen::new(&reader_module, "/tmp/direct_constant_rvalue.au", "")
+            .expect("constant reader codegen should initialize");
+    missing_rvalue_initializer
+        .function_thunks
+        .remove(&initializer.name);
+    let error = missing_rvalue_initializer
+        .define_function(&constant_reader)
+        .expect_err("module-constant rvalues require their initializer thunk");
+    assert!(
+        error.contains("cannot find module constant initializer `constant_init`"),
+        "unexpected constant-rvalue diagnostic: {error}"
+    );
+}
+
+#[test]
+fn adr0038_direct_mutable_closure_requires_source_place_metadata() {
+    let source = r#"
+def main():
+    mut values = [1]
+    mut update: def(int64) -> None = lambda [mut values] item: values.append(item)
+    update(2)
+"#;
+    let module = lower_source_to_mir(source).expect("mutable closure should lower");
+    let mut main = module
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+        .cloned()
+        .expect("main should lower");
+    let capture = main
+        .blocks
+        .iter_mut()
+        .flat_map(|block| block.instructions.iter_mut())
+        .find_map(|instruction| match instruction {
+            Instruction::Assign {
+                value: Rvalue::Closure { captures, .. },
+                ..
+            } => captures
+                .iter_mut()
+                .find(|capture| capture.passing == MirReceiverKind::BorrowMut),
+            _ => None,
+        })
+        .expect("lowered closure should have a mutable capture");
+    capture.source_place = None;
+
+    let mut codegen = NativeCodegen::new(&module, "/tmp/direct_mutable_capture.au", source)
+        .expect("valid mutable closure metadata should initialize codegen");
+    let error = codegen
+        .define_function(&main)
+        .expect_err("direct closure writeback needs an explicit capture source place");
+    assert!(
+        error.contains("mutable closure capture `values` has no source place"),
+        "unexpected mutable-capture diagnostic: {error}"
+    );
+}
+
+#[test]
+fn direct_runtime_type_substitutions_respect_callable_structure_and_capabilities() {
+    use super::collect_direct_runtime_type_substitutions;
+    use crate::ast::ReceiverKind;
+    use crate::sema::{ClosureCallKind, ClosureCapture, ClosureCaptureMode, FunctionParamContract};
+
+    let param = |name: &str, ty: Type, passing| FunctionParamContract {
+        name: name.to_string(),
+        ty,
+        passing,
+        has_default: false,
+        default_erased: false,
+    };
+    let pattern = Type::Closure {
+        params: Box::new(vec![param(
+            "value",
+            Type::TypeParam("T".to_string()),
+            ReceiverKind::Value,
+        )]),
+        return_type: Box::new(Type::Tuple(vec![
+            Type::TypeParam("T".to_string()),
+            Type::TypeParam("U".to_string()),
+        ])),
+        captures: Box::new(vec![ClosureCapture {
+            name: "state".to_string(),
+            ty: Type::TypeParam("U".to_string()),
+            mode: ClosureCaptureMode::MutableView,
+            span: Span::new(1, 1),
+        }]),
+        call_kind: ClosureCallKind::MutableRepeatable,
+    };
+    let actual = Type::Closure {
+        params: Box::new(vec![param(
+            "value",
+            Type::named("int64"),
+            ReceiverKind::Value,
+        )]),
+        return_type: Box::new(Type::Tuple(vec![Type::named("int64"), Type::named("str")])),
+        captures: Box::new(vec![ClosureCapture {
+            name: "state".to_string(),
+            ty: Type::named("str"),
+            mode: ClosureCaptureMode::MutableView,
+            span: Span::new(1, 1),
+        }]),
+        call_kind: ClosureCallKind::MutableRepeatable,
+    };
+    let mut substitutions = HashMap::new();
+    collect_direct_runtime_type_substitutions(&pattern, &actual, &mut substitutions);
+    assert_eq!(substitutions.get("T"), Some(&Type::named("int64")));
+    assert_eq!(substitutions.get("U"), Some(&Type::named("str")));
+
+    let function_pattern = Type::Function {
+        params: vec![param(
+            "value",
+            Type::TypeParam("V".to_string()),
+            ReceiverKind::Borrow,
+        )],
+        return_type: Box::new(Type::TypeParam("R".to_string())),
+    };
+    let wrong_capability = Type::Function {
+        params: vec![param("value", Type::named("bool"), ReceiverKind::BorrowMut)],
+        return_type: Box::new(Type::named("int32")),
+    };
+    collect_direct_runtime_type_substitutions(
+        &function_pattern,
+        &wrong_capability,
+        &mut substitutions,
+    );
+    assert!(!substitutions.contains_key("V"));
+    assert!(!substitutions.contains_key("R"));
+
+    for (pattern, actual) in [
+        (
+            Type::Named("list".to_string(), vec![Type::TypeParam("N".to_string())]),
+            Type::named("str"),
+        ),
+        (
+            Type::Tuple(vec![Type::TypeParam("Q".to_string())]),
+            Type::Tuple(Vec::new()),
+        ),
+        (function_pattern, Type::Unit),
+    ] {
+        collect_direct_runtime_type_substitutions(&pattern, &actual, &mut substitutions);
+    }
+    assert!(!substitutions.contains_key("N"));
+    assert!(!substitutions.contains_key("Q"));
+}
+
+#[test]
 fn adr0038_local_and_returned_views_compile_through_direct_backend() {
     let module = lower_source_to_mir(
         r#"

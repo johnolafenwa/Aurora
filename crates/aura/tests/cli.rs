@@ -13182,11 +13182,12 @@ fn queue_get_or_without_timeout_returns_default_immediately() {
     return 0
 "#;
 
-    assert_run_and_direct_source_stdout_with_timeout(
+    assert_run_and_direct_source_stdout_with_timeout_and_workers(
         "aura-queue-get-or-no-timeout",
         source,
         std::time::Duration::from_secs(15),
         "before\n7\nafter\n",
+        Some(1),
     );
 }
 

@@ -55,7 +55,7 @@ npx @vscode/vsce package --out aura-language.vsix --no-dependencies
 ```
 
 Inspect the resulting VSIX and confirm the identity is
-`JohnOlafenwa.vscode-aura-lang` and the Marketplace version is plain `0.3.3`.
+`JohnOlafenwa.vscode-aura-lang` and the Marketplace version is plain `0.3.4`.
 
 ## Publish An Extension-Only Patch
 
@@ -67,7 +67,7 @@ gh auth login
 gh auth status
 gh workflow run release.yml --ref main \
   -f source_ref=main \
-  -f release_tag=v0.3.3 \
+  -f release_tag=v0.3.4 \
   -f publish=false \
   -f publish_extension=true
 ```
@@ -88,7 +88,7 @@ without moving or recreating its tag:
 gh auth login
 gh auth status
 gh workflow run release.yml --ref main \
-  -f release_tag=v0.3.2-preview \
+  -f release_tag=v0.3.3-preview \
   -f publish=false \
   -f publish_extension=true
 ```

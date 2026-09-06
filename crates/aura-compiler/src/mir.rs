@@ -1035,7 +1035,9 @@ struct ValidatedReturnedViewContract {
 
 #[derive(Clone, Debug)]
 struct SymbolicLoanContract {
-    sources: BTreeSet<String>,
+    // Memo hits and empty reborrows share path storage rather than duplicating
+    // the cumulative expansion already charged to the analysis budget.
+    sources: BTreeSet<std::sync::Arc<str>>,
     mutable: bool,
 }
 
@@ -1052,7 +1054,7 @@ fn validate_symbolic_loan_contract_budget(
     let path_bytes = contract
         .sources
         .iter()
-        .map(String::len)
+        .map(|source| source.len())
         .fold(0usize, usize::saturating_add);
     if path_bytes > MAX_VALIDATED_EXPANDED_LOAN_PATH_BYTES {
         return Err(format!(
@@ -1063,16 +1065,46 @@ fn validate_symbolic_loan_contract_budget(
     Ok(())
 }
 
+fn project_symbolic_loan_sources(
+    sources: BTreeSet<std::sync::Arc<str>>,
+    projection: &str,
+    function: &MirFunction,
+    budget: &mut ValidatedLoanBudget,
+    name: &str,
+) -> std::result::Result<BTreeSet<std::sync::Arc<str>>, String> {
+    if projection.is_empty() {
+        return Ok(sources);
+    }
+    let bytes = sources.iter().fold(0usize, |bytes, source| {
+        bytes.saturating_add(
+            source
+                .len()
+                .saturating_add(1)
+                .saturating_add(projection.len()),
+        )
+    });
+    // Reserve before materializing any suffix/product expansion. Per-contract
+    // checks alone do not bound the total retained by the memo table.
+    budget.reserve(function, name, bytes)?;
+    Ok(sources
+        .into_iter()
+        .map(|source| std::sync::Arc::from(format!("{source}.{projection}")))
+        .collect())
+}
+
 fn symbolic_loan_place_sources<'a>(
     place: &str,
     definitions: &BTreeMap<&'a str, Vec<&'a Instruction>>,
     memo: &mut BTreeMap<&'a str, SymbolicLoanContract>,
     visiting: &mut BTreeSet<&'a str>,
     depth: usize,
-) -> std::result::Result<BTreeSet<String>, String> {
+    function: &MirFunction,
+    budget: &mut ValidatedLoanBudget,
+) -> std::result::Result<BTreeSet<std::sync::Arc<str>>, String> {
     let (root, suffix) = place.split_once('.').unwrap_or((place, ""));
     let Some((definition_root, _)) = definitions.get_key_value(root) else {
-        return Ok(BTreeSet::from([place.to_string()]));
+        budget.reserve(function, place, place.len())?;
+        return Ok(BTreeSet::from([std::sync::Arc::from(place)]));
     };
     let sources = symbolic_loan_contract(
         definition_root,
@@ -1080,18 +1112,11 @@ fn symbolic_loan_place_sources<'a>(
         memo,
         visiting,
         depth.saturating_add(1),
+        function,
+        budget,
     )?
-    .sources
-    .into_iter()
-    .map(|source| {
-        if suffix.is_empty() {
-            source
-        } else {
-            format!("{source}.{suffix}")
-        }
-    })
-    .collect();
-    Ok(sources)
+    .sources;
+    project_symbolic_loan_sources(sources, suffix, function, budget, place)
 }
 
 fn symbolic_loan_contract<'a>(
@@ -1100,6 +1125,8 @@ fn symbolic_loan_contract<'a>(
     memo: &mut BTreeMap<&'a str, SymbolicLoanContract>,
     visiting: &mut BTreeSet<&'a str>,
     depth: usize,
+    function: &MirFunction,
+    budget: &mut ValidatedLoanBudget,
 ) -> std::result::Result<SymbolicLoanContract, String> {
     if let Some(contract) = memo.get(name) {
         return Ok(contract.clone());
@@ -1120,7 +1147,15 @@ fn symbolic_loan_contract<'a>(
             Instruction::BeginLoan {
                 source, mutable, ..
             } => SymbolicLoanContract {
-                sources: symbolic_loan_place_sources(source, definitions, memo, visiting, depth)?,
+                sources: symbolic_loan_place_sources(
+                    source,
+                    definitions,
+                    memo,
+                    visiting,
+                    depth,
+                    function,
+                    budget,
+                )?,
                 mutable: *mutable,
             },
             Instruction::BeginReturnedLoan {
@@ -1129,8 +1164,15 @@ fn symbolic_loan_contract<'a>(
                 mutable,
                 ..
             } => {
-                let origins =
-                    symbolic_loan_place_sources(origin, definitions, memo, visiting, depth)?;
+                let origins = symbolic_loan_place_sources(
+                    origin,
+                    definitions,
+                    memo,
+                    visiting,
+                    depth,
+                    function,
+                    budget,
+                )?;
                 let unique_projections = projections.iter().collect::<BTreeSet<_>>();
                 if origins.len().saturating_mul(unique_projections.len())
                     > MAX_VALIDATED_LOAN_ALTERNATIVES
@@ -1141,14 +1183,14 @@ fn symbolic_loan_contract<'a>(
                     ));
                 }
                 let mut sources = BTreeSet::new();
-                for origin in origins {
-                    for projection in &unique_projections {
-                        sources.insert(if projection.is_empty() {
-                            origin.clone()
-                        } else {
-                            format!("{origin}.{projection}")
-                        });
-                    }
+                for projection in unique_projections {
+                    sources.extend(project_symbolic_loan_sources(
+                        origins.clone(),
+                        projection,
+                        function,
+                        budget,
+                        name,
+                    )?);
                 }
                 SymbolicLoanContract {
                     sources,
@@ -1167,17 +1209,12 @@ fn symbolic_loan_contract<'a>(
                     memo,
                     visiting,
                     depth.saturating_add(1),
+                    function,
+                    budget,
                 )?
-                .sources
-                .into_iter()
-                .map(|source| {
-                    if projection.is_empty() {
-                        source
-                    } else {
-                        format!("{source}.{projection}")
-                    }
-                })
-                .collect();
+                .sources;
+                let sources =
+                    project_symbolic_loan_sources(sources, projection, function, budget, name)?;
                 SymbolicLoanContract {
                     sources,
                     mutable: *mutable,
@@ -1269,6 +1306,7 @@ fn function_returned_view_contract(
     let mut projections = BTreeSet::new();
     let mut projection_bytes = 0usize;
     let mut memo = BTreeMap::new();
+    let mut budget = ValidatedLoanBudget::default();
     for instruction in instructions {
         let Instruction::ReturnLoan {
             loan,
@@ -1330,6 +1368,8 @@ fn function_returned_view_contract(
                 &mut memo,
                 &mut BTreeSet::new(),
                 0,
+                function,
+                &mut budget,
             )?
             .mutable;
             SymbolicLoanContract {
@@ -1339,6 +1379,8 @@ fn function_returned_view_contract(
                     &mut memo,
                     &mut BTreeSet::new(),
                     0,
+                    function,
+                    &mut budget,
                 )?,
                 mutable,
             }
@@ -1353,7 +1395,7 @@ fn function_returned_view_contract(
                     .is_some_and(|param| param.passing == MirReceiverKind::BorrowMut)
             };
             SymbolicLoanContract {
-                sources: BTreeSet::from([loan.clone()]),
+                sources: BTreeSet::from([std::sync::Arc::from(loan.as_str())]),
                 mutable: root_mutable,
             }
         };
@@ -1365,7 +1407,7 @@ fn function_returned_view_contract(
         }
         mutable = Some(contract.mutable);
         for source in contract.sources {
-            let projection = if source == *declared_origin {
+            let projection = if source.as_ref() == declared_origin {
                 String::new()
             } else {
                 source

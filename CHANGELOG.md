@@ -5,6 +5,45 @@ versioning for release artifacts while it remains a technical preview; a minor
 preview release may still contain source and API incompatibilities called out
 in this file.
 
+## VS Code extension 0.3.4 — Unreleased
+
+- Added syntax highlighting and snippets for shared and mutable views,
+  returned-view contracts, and explicit shared/mutable/owned closure captures.
+- Updated the bundled language server to semantic interface version 6 with
+  view-aware diagnostics, completion, hover, go-to-definition, and capture
+  provenance.
+
+## 0.3.3 — Unreleased (technical preview)
+
+Aura 0.3.3 is a technical preview feature release of the compiler,
+command-line tools, language server, VS Code extension, Manual, Learn track,
+tutorials, examples, and installation tooling.
+
+- Implemented ADR-0038 place-based loans and views. `view name = place` and
+  `view mut name = place` grant shared or exclusive non-owning access to fixed local,
+  parameter, receiver, class-field, and tuple places without copying or moving
+  the owner.
+- Added inferred last-use lifetimes, reborrowing with parent suspension and
+  resumption, immediate mutable write-through, and deterministic cleanup on
+  ordinary, early-return, branch, match, and managed-resource exits.
+- Added returned-view contracts with `view ... from source`, including methods,
+  generic trait dispatch, forwarded calls, and exact runtime handoff of the
+  selected fixed projection from one declared origin.
+- Added explicit closure loan captures (`[value]`, `[mut value]`, and
+  `[own value]`) with repeatability, escape, storage, ownership, and Transfer
+  checks that preserve the source place and release each loan exactly once.
+- Added stable `AU3010` provenance, overlap, escape, and lifetime diagnostics;
+  compiler analysis and editor tooling expose the same place and capture
+  information.
+- Added explicit MIR loan operations, public serialized-MIR validation, and
+  direct-native lowering with forced MIR/direct parity across local, returned,
+  reborrowed, and closure-held views. Validation bounds adversarial projection
+  expansion before allocation.
+- Ratified ADR-0045's binding-test and assertion-introspection checkpoint, and
+  formally recorded ADR-0049's positional and named class-pattern deferment.
+- Prepared VS Code extension 0.3.4 with the matching syntax, snippets, and
+  compiler-backed semantic behavior.
+
 ## VS Code extension 0.3.3 — 2026-08-04
 
 - Added builtin-function highlighting for calls such as `print(...)`,

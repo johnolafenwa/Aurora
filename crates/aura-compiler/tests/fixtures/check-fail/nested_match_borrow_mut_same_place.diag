@@ -1,5 +1,6 @@
-error[AU3002]: cannot start `match mut` on `x` while an enclosing match already has mutable access to `x`
+error[AU3002]: cannot mutate `x` while `match mut` holds mutable access to `x`
  --> crates/aura-compiler/tests/fixtures/check-fail/nested_match_borrow_mut_same_place.au:9:13
   |
 9 |             match mut x:
   |             ^
+  = help: mutate through the selected mutable pattern binding, or wait until the match arm ends

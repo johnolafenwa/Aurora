@@ -1,5 +1,6 @@
-error[AU2999]: cannot use pattern binding `v` after reassigning match scrutinee `outer.inner.state`
- --> crates/aura-compiler/tests/fixtures/check-fail/match_borrow_mut_nested_field_binding_use_after_ancestor_reassign.au:16:13
+error[AU3002]: cannot mutate `outer.inner` while `match mut` holds mutable access to `outer.inner.state`
+ --> crates/aura-compiler/tests/fixtures/check-fail/match_borrow_mut_nested_field_binding_use_after_ancestor_reassign.au:15:13
    |
-16 |             v = v + 1
+15 |             outer.inner = Inner(state=Opt.Some(v))
    |             ^
+  = help: mutate through the selected mutable pattern binding, or wait until the match arm ends

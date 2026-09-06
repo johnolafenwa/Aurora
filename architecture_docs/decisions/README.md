@@ -66,7 +66,7 @@ does not change the current Manual or compiler. In particular, the global
 46. [ADR-0046: String literal forms and f-string format specifications](0046-string-literals-and-format-specifications.md) — Accepted for Aura 0.3 in Batch S1
 47. [ADR-0047: Integer literal bases, bitwise operators, and shifts](0047-integer-literals-bitwise-and-shifts.md) — Accepted for Aura 0.3 in Batch S1
 48. [ADR-0048: Power, rounding, divmod, and the math module](0048-power-round-divmod-and-math.md) — Accepted for Aura 0.3 in Batch S1
-49. [ADR-0049: Match guards and or-patterns](0049-match-guards-and-or-patterns.md) — Accepted for Aura 0.3; future class-pattern direction recorded in ADR-0063
+49. [ADR-0049: Match guards and or-patterns](0049-match-guards-and-or-patterns.md) — Accepted for Aura 0.3; class patterns formally deferred to a future dedicated ADR, with approved future direction recorded in ADR-0063
 50. [ADR-0050: Module-level constants and deterministic initialization](0050-module-level-constants.md) — Accepted for Aura 0.3 in Batch S1
 51. [ADR-0051: Import aliases and keyword-only parameter disposition](0051-import-aliases-and-keyword-only-parameters.md) — Accepted for Aura 0.3; future call metadata in ADR-0058 and import polish in ADR-0063
 52. [ADR-0052: Anonymous closed union types](0052-anonymous-closed-union-types.md) — Accepted direction; explicit unions, optional replacement, aliases, and narrowing; detailed design pending
