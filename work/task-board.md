@@ -56,7 +56,8 @@ Last updated: 2026-09-06
   Studio Marketplace and Open VSX.
 - All five downloaded packages passed `SHA256SUMS`; the public Apple-silicon
   archive passed the outside-checkout smoke test and reported the exact release
-  version and commit. The public Marketplace VSIX is byte-identical to GitHub's.
+  version and commit. The public Marketplace and Open VSX VSIX downloads are
+  byte-identical to GitHub's.
 - Current review: `work/2026-09-06-adr0038-release-readiness.md`.
 - Protected user files remain untouched: `personal/file_ops.au`, the untracked
   ADR-0022 draft, and the untracked `.swp` file.
