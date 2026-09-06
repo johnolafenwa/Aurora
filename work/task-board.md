@@ -25,15 +25,14 @@ Last updated: 2026-09-06
   checks pass. Detailed feature design and implementation remain future work.
 - Work note: `work/2026-09-06-approved-roadmap-adrs.md`.
 
-## Aura v0.3.3-preview loans/views release (in progress)
+## Aura v0.3.3-preview loans/views release (complete)
 
-- Current authorized target: fully review ADR-0038 and make the candidate ready
-  before pushing for release tests. Preserve the original compiler coverage
-  gates and add tests, per the user's 2026-09-06 direction. Publication remains
-  pending; no release tag has been created.
+- Completed authorized target: review ADR-0038, preserve the original coverage
+  gates with additional tests, and publish `v0.3.3-preview` following the user's
+  explicit release authorization on 2026-09-06.
 - Release metadata, manifests, locks, installer, Manual stamps, platform guides,
-  generated agent documentation, packaging tests, and changelog are being
-  advanced together.
+  generated agent documentation, packaging tests, and changelog were advanced
+  together.
 - Required publication gate: focused release checks, one complete local CI run,
   one complete green hosted CI run for the exact candidate commit, then an
   annotated tag-triggered prerelease and public artifact/checksum verification.
@@ -48,7 +47,16 @@ Last updated: 2026-09-06
 - Daybreak review traced a timing-only queue-default CLI failure under the full
   parallel gate to scheduler-thread contention. Its test now requests one Aura
   worker while retaining the product watchdog and passes in both ordinary and
-  coverage suites. The exact-candidate hosted Linux/macOS run remains pending.
+  coverage suites. Exact-candidate hosted Linux/macOS CI `34041067574`, Docs
+  `34041067508`, and Tutorial Examples `34041067511` all passed.
+- Annotated tag `v0.3.3-preview` points to implementation commit
+  `d3cc6b96104dd597687a98e9624f800a0cb3cf1e`. Release workflow `34053461619`
+  passed all three CLI builds and package smoke tests, published the GitHub
+  prerelease and all six assets, and published extension `0.3.4` to Visual
+  Studio Marketplace and Open VSX.
+- All five downloaded packages passed `SHA256SUMS`; the public Apple-silicon
+  archive passed the outside-checkout smoke test and reported the exact release
+  version and commit. The public Marketplace VSIX is byte-identical to GitHub's.
 - Current review: `work/2026-09-06-adr0038-release-readiness.md`.
 - Protected user files remain untouched: `personal/file_ops.au`, the untracked
   ADR-0022 draft, and the untracked `.swp` file.

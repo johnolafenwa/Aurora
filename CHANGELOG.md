@@ -5,7 +5,7 @@ versioning for release artifacts while it remains a technical preview; a minor
 preview release may still contain source and API incompatibilities called out
 in this file.
 
-## VS Code extension 0.3.4 — Unreleased
+## VS Code extension 0.3.4 — 2026-09-06
 
 - Added syntax highlighting and snippets for shared and mutable views,
   returned-view contracts, and explicit shared/mutable/owned closure captures.
@@ -13,7 +13,7 @@ in this file.
   view-aware diagnostics, completion, hover, go-to-definition, and capture
   provenance.
 
-## 0.3.3 — Unreleased (technical preview)
+## 0.3.3 — 2026-09-06 (technical preview)
 
 Aura 0.3.3 is a technical preview feature release of the compiler,
 command-line tools, language server, VS Code extension, Manual, Learn track,
@@ -41,7 +41,7 @@ tutorials, examples, and installation tooling.
   expansion before allocation.
 - Ratified ADR-0045's binding-test and assertion-introspection checkpoint, and
   formally recorded ADR-0049's positional and named class-pattern deferment.
-- Prepared VS Code extension 0.3.4 with the matching syntax, snippets, and
+- Published VS Code extension 0.3.4 with the matching syntax, snippets, and
   compiler-backed semantic behavior.
 
 ## VS Code extension 0.3.3 — 2026-08-04

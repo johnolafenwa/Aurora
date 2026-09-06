@@ -5,7 +5,8 @@
 Review the complete loans/views implementation before pushing a candidate for
 release tests. Preserve compiler coverage gates at 96.30% lines, 97.21%
 functions, and 94.71% regions and add tests as explicitly requested by the user.
-No tag or publication is authorized by this readiness checkpoint.
+The initial readiness checkpoint excluded publication. After all local and
+hosted gates passed, the user explicitly authorized the release on 2026-09-06.
 
 ## Work completed
 
@@ -57,9 +58,20 @@ No tag or publication is authorized by this readiness checkpoint.
 - The exact coverage JSON was preserved before coverage-only artifacts were
   cleaned. `target/` returned below the repository's 20 GiB hygiene limit.
 
-## Remaining work
+## Completion
 
-Commit and push the reviewed candidate for one exact-candidate hosted
-Linux/macOS CI run. Do not report publication or create a release tag at this
-checkpoint. Protected user files remain untouched: personal/file_ops.au, .swp,
-and the untracked ADR-0022 draft. Concurrent roadmap commits are preserved.
+Candidate `d3cc6b96104dd597687a98e9624f800a0cb3cf1e` passed hosted Linux/macOS CI
+`34041067574`, Docs `34041067508`, and Tutorial Examples `34041067511`.
+Following explicit release authorization, annotated tag `v0.3.3-preview` was
+published at that exact commit. Release workflow `34053461619` is fully green,
+including all three packaged CLI smoke tests, GitHub prerelease publication,
+and extension `0.3.4` publication to both configured registries.
+
+The five downloaded release packages match `SHA256SUMS`; the public
+Apple-silicon archive passed the outside-checkout smoke test. The public
+Marketplace VSIX is byte-identical to the GitHub asset. Publication details are
+recorded in `work/2026-08-25-v0.3.3-preview-release.md`.
+
+Protected user files remain untouched: personal/file_ops.au, .swp, and the
+untracked ADR-0022 draft. Concurrent roadmap commits are preserved. Subsequent
+release-record updates do not change the immutable release tag or its assets.
