@@ -13,7 +13,7 @@ test locations that must prove completion.
 without treating every retained design detail as ratified. Each such ADR lists
 its remaining questions and implementation status. The 2026-09-06
 [roadmap decisions](../14-priority-roadmap.md#approved-decisions) are recorded
-in ADR-0052 through ADR-0063 where relevant. Historical accepted ADRs retain
+in ADR-0052 through ADR-0064 where relevant. Existing accepted ADRs retain
 their implemented contracts and link to future extensions; future approval
 does not change the current Manual or compiler. In particular, the global
 `Option[T]` replacement belongs to ADR-0052's later implementation family.
@@ -81,3 +81,4 @@ does not change the current Manual or compiler. In particular, the global
 61. [ADR-0061: Collection-element loans and slice views](0061-collection-element-loans-and-slice-views.md) — Accepted direction; contextual access, explicit owned reads, and invalidation checks; detailed design pending
 62. [ADR-0062: Typed serialization, validation, and schemas](0062-typed-serialization-validation-and-schemas.md) — Accepted direction; compile-time opt-in and shared metadata; detailed design pending
 63. [ADR-0063: Everyday syntax and pattern ergonomics](0063-everyday-syntax-and-pattern-ergonomics.md) — Accepted roadmap direction; syntax/pattern/API details pending
+64. [ADR-0064: Native backend strategy and codegen boundary](0064-native-backend-strategy-and-codegen-boundary.md) — Accepted direction; pre-Batch-1 measurements, incremental thin boundary, and Batch 7 backend decision; detailed design pending

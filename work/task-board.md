@@ -2,6 +2,17 @@
 
 Last updated: 2026-09-06
 
+## Priority roadmap scheduling amendment (complete)
+
+- Authorized scope: documentation-only ordering, pre-Batch-1 foundations,
+  reconciliation markers, cross-ADR conflicts, and ADR-0064. Preserve the ten
+  Approved Decisions and independent v0.3.3-preview release work.
+- Verification passed: 16 scoped documents, 83 relative links/anchors, ten
+  byte-identical Approved Decisions, scoped whitespace, and 15 identity tests.
+- Commit only this amendment; scheduled compiler, benchmark, reference-agent,
+  and release-profile implementation belongs to a later task.
+- Work note: `work/2026-09-06-roadmap-amendment.md`.
+
 ## Approved roadmap ADR reconciliation (complete)
 
 - Authorized scope: update design records to reflect the user's approved

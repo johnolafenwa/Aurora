@@ -58,6 +58,22 @@ declared calling restriction.
 
 ## Remaining detailed design
 
+### Open conflicts
+
+**Joint Batch 1–2, ADR-0038 / ADR-0061:** the lifetime-bearing callable type is
+one design shared by callable storage and collection loans. Batch 1 storage
+is scoped to ADR-0037 owned/by-value captures and bound methods on owned or
+Copy receivers. Storage of ADR-0038 shared/mutable loan captures is deferred
+to that joint design. The broad accepted storage behavior above is retained
+as the eventual contract, with this explicit delivery split.
+
+Batch 1 also structurally splits `sema.rs` into type representation,
+capability checking, and place/loan analysis, since unions change `Type` and
+callables change capability checking. It has one checkpoint after unions,
+aliases, and owned-capture closures, before the ADR-0052 optional removal.
+
+### Detailed contract
+
 - Source syntax for call kinds, owned environments, and lifetime-bearing
   callable interfaces; inference and callable aliases.
 - Type equality, conversions/variance, generic callable bounds, and heterogeneous

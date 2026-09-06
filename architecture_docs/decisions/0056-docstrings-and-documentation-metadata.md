@@ -126,6 +126,10 @@ the literal and reports the measured and permitted byte counts. The total
 limit does not count private declarations because their documentation is not
 serialized into the public interface.
 
+**Proposed baseline, not ratified; resolved in Batch 4.** Both byte limits
+above, their counting policy, and the associated rejection thresholds remain
+design proposals.
+
 Empty docstrings are valid metadata but produce no prose section in hover.
 NUL and noncharacter Unicode scalar values remain valid string content, but
 presentation layers escape control characters other than tab and newline so
@@ -345,6 +349,7 @@ MIR; otherwise they are conservatively invalidated.
   wrapper preservation, and separation of prose from typed schema configuration
 - limits: exactly 65,536 bytes, one-byte overflow, multibyte boundaries,
   exactly 4,194,304 exported bytes, total overflow, and private-doc exclusion
+  (**Proposed baseline, not ratified; resolved in Batch 4.** Limit values/policy.)
 - semantics: no expression/MIR node, no allocation or constant, no ownership
   effects, unchanged executable cache identity, and changed metadata identity
 - interfaces: every public declaration/member kind round-trips exact content;

@@ -137,6 +137,10 @@ differ, and different union tags may render the same payload text.
 
 ## Failure and atomic output
 
+**Proposed baseline, not ratified; resolved in Batch 4.** Concurrent `print`
+output atomicity remains open; staging a complete rendered value does not
+alone settle interleaving between concurrent callers.
+
 `str(value)` and f-string construction either return one complete owned string
 or propagate the rendering trap; no partial string becomes observable.
 
@@ -330,6 +334,7 @@ property lookup always use matching versioned contracts.
 - output: complete staging, rendering trap prevents the outer final write,
   no claimed rollback of user-code effects, host partial-write
   retry, output failure, concurrent print call atomicity, and cleanup paths
+  (**Proposed baseline, not ratified; resolved in Batch 4.** Concurrent atomicity.)
 - formatting: fill/alignment/width/precision/`s`, Unicode scalar counting,
   truncation-before-padding, rejected numeric flags, and once-only evaluation
 - property parsing: eligible class getter, malformed placement, decorator

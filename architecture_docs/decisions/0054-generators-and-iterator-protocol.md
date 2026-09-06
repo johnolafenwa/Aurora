@@ -21,6 +21,13 @@ See the [approved roadmap](../14-priority-roadmap.md).
 advancement result. Their source names and exact signatures remain to be
 specified. The separation of an item from termination is binding.
 
+### Open conflicts
+
+**Batch 9, ADR-0052:** `Step[T]` is a nominal enum. The item/end protocol uses
+the existing nominal-enum sum mechanism alongside anonymous unions; it does
+not introduce a third sum mechanism. The source type/variant names, including
+`Item` and `End`, are to be designed in Batch 9.
+
 ## Context
 
 Aura has eager collection comprehensions and compiler-known iteration for its

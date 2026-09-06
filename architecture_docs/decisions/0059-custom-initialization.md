@@ -33,6 +33,18 @@ in the implemented language.
 
 ## Remaining detailed design
 
+### Open conflicts
+
+- **Batch 3, ADR-0038 / ADR-0060 / ADR-0062:** use one shared partial-construction
+  cleanup mechanism extending ADR-0038's ordered exit-action stack. Initializer
+  failure, multi-resource entry failure, and failed decodes must reuse it for
+  exact-once cleanup; do not build separate mechanisms for each feature.
+- **Batch 6, ADR-0062:** computed `__init__` fields have no general inverse.
+  Typed decoding applies to classes with automatic field-based construction
+  or an explicit decode factory. Factory spelling is to be designed in Batch 6.
+
+### Detailed contract
+
 Define the initializer result/signature restrictions, generic and visibility
 rules, interaction with declaration defaults, evaluation order, and delegation
 or alternate-constructor policy. Definite initialization must cover branches,

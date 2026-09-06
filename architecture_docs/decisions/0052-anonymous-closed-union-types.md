@@ -61,6 +61,8 @@ dict[str, int64 | float64 | None]
 `|` binds less tightly than generic application, tuple construction, and every
 non-union type constructor. Parentheses may group it wherever that improves
 readability. A union must contain at least two distinct normalized members.
+**Proposed baseline, not ratified; resolved in Batch 1.** This marker applies
+to the minimum-member-count requirement.
 
 The compiler recursively flattens nested unions, removes duplicate members,
 and sorts the remaining members by a deterministic canonical type key. Source
@@ -84,6 +86,8 @@ A member may be any complete owned value type except another union after
 flattening, a view type, an unspecialized generic, or an FFI-only opaque view.
 `None` is a valid member. A one-member result after normalization is rejected
 as a redundant union type. It never silently becomes that member.
+**Proposed baseline, not ratified; resolved in Batch 1.** The one-member
+rejection is a pending choice, not part of the approved normalization direction.
 
 ## One optional spelling
 
@@ -94,6 +98,8 @@ language does not define `Option[T]` as an alias or second spelling.
 `None | T` normalizes and is displayed as `T | None`, with `None` placed last
 for optional unions. If `T` itself normalizes to a union containing `None`, the
 duplicate is removed. `None | None` is rejected as a redundant union.
+**Proposed baseline, not ratified; resolved in Batch 1.** The rejection follows
+the pending one-member policy.
 
 This choice gives absence the same narrowing, ownership, exhaustiveness, and
 generic-composition rules as every other closed union. One spelling also keeps
@@ -264,6 +270,7 @@ Dedicated diagnostics must identify:
 - a mixed literal with the exact explicit union annotation that would make
   its intended member set clear
 - redundant one-member unions and invalid member categories
+  (**Proposed baseline, not ratified; resolved in Batch 1.** One-member policy.)
 - missing, duplicate, unreachable, or guarded-only match coverage
 - a type pattern that is not a direct normalized member
 - unavailable Copy, clone, Transfer, equality, or hash behavior, including
@@ -315,6 +322,7 @@ the version change.
   `None`, malformed bars, and forbidden union member categories
 - normalization: recursive flattening, duplicate removal, source-order
   independence, deterministic qualified-name order, and one-member rejection
+  (**Proposed baseline, not ratified; resolved in Batch 1.** One-member rejection.)
 - optional typing: sole `T | None` spelling, `None` placement, nested optional
   normalization, unconstrained `None` rejection, narrowing invalidation, and
   distinct present-`None`/absent outcomes where the API needs both
@@ -341,6 +349,23 @@ the version change.
   exhaustiveness diagnostics, generated reference, examples, and tutorials
 - parity: byte-identical MIR/direct results and diagnostics across the entire
   matrix, plus forced-backend fixtures and release archive smoke tests
+
+## Batch 1 must-resolve
+
+- **Type-parameter members:** a member such as `V` in `V | None` must be
+  well-formed for generic library APIs. Reconcile this with the baseline's
+  unspecialized-generic exclusion; distinguish a type parameter from an
+  unspecialized nominal constructor in the detailed type rules.
+- **Conditional narrowing:** specify and implement stable-place conditional
+  narrowing in the same change family as `Option[T]` removal. The intended
+  `if x is not None:` shape has exact syntax to be designed in Batch 1.
+- **FFI nullable results:** state the replacement for nullable results at the
+  FFI boundary before removing `Option[T]`, reconciling the baseline exclusion
+  of unions from C FFI. No new spelling is selected here.
+
+Batch 1 has a reviewable checkpoint after unions, aliases, and owned-capture
+closures, before optional removal. The three criteria above are required for
+the removal; this staging adds no compatibility path or migration diagnostics.
 
 ## Ratification and remaining design
 

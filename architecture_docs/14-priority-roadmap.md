@@ -2,6 +2,13 @@
 
 Status: roadmap direction and decisions below approved by the user on 2026-09-06.
 
+The 2026-09-06 ordering deliberately inverted the earlier foundations-first
+draft: loans, lean binaries, Rust-class performance, multicore, freestanding,
+bare-metal, then surface features. Before adoption, the dominant risk is that
+Aura is not pleasant to write for agent and ML software; systems-level work
+has no consumer until that is true. This usability-first ordering leaves the
+[positioning document's long-term systems goal](../docs/positioning.md) unchanged.
+
 Make Aura easy to program with Python-like syntax, static typing, deterministic
 ownership, no garbage collection, typed failures, and structured concurrency.
 Prioritize practical agent and ML software while building toward Rust-class
@@ -9,9 +16,10 @@ performance and eventual operating-system and device-driver development.
 
 ## Current Foundation
 
-ADR-0038 loans/views is recorded as implemented; ADR-0045 testing is accepted
+ADR-0038 loans/views is implemented; its v0.3.3-preview release is pending the
+coverage gate. ADR-0045 testing is accepted
 and implemented; ADR-0049 is accepted with class patterns formally deferred.
-These are existing foundations. Collection-element loans remain future work.
+These are existing foundations. Collection-element loans are scheduled in Batch 2.
 Classes already have field-based constructors and per-instance defaults;
 `with` already manages builtin resources and eligible non-generic user classes.
 
@@ -25,23 +33,89 @@ Exact syntax, representations, and unresolved
 contracts still need design. Approval records intended behavior, not implementation
 completion. See the [ADR index](decisions/README.md).
 
+## Pre-Batch-1 foundations
+
+These items start before Batch 1 design and run in parallel with it, scheduled
+for the v0.3.3-preview update. Only ADR reconciliation is delivered by this
+documentation task; the other completion criteria belong to later implementation.
+The backend direction is recorded in
+[ADR-0064](decisions/0064-native-backend-strategy-and-codegen-boundary.md).
+
+1. **Cranelift optimization level.** The direct flag setup in
+   `crates/aura-compiler/src/native_codegen.rs` sets `is_pic`, `unwind_info`, and
+   `enable_multi_ret_implicit_sret`, but leaves `opt_level` at Cranelift's
+   default. Completion: measure `opt_level=speed` on the release-performance,
+   integer-loop, and numeric-Array harnesses; run the forced MIR/direct parity
+   matrix; publish results and provenance in the Performance chapter. Adopt
+   the flag if parity holds; otherwise revert it and record failing fixtures
+   as Batch 7 input.
+2. **Backend boundary contract.** Inventory semantic decisions currently in
+   `native_codegen.rs` instead of MIR. Completion: the inventory and design
+   note exist in `architecture_docs/15-backend-boundary.md`, describing semantic
+   lowering into MIR and mechanical native emission through a small builder
+   interface. Incremental refactoring begins in Batch 1 under parity and
+   coverage gates, making a second native backend a bounded addition.
+3. **Rust baselines.** Add Rust counterparts for fib30, 10,000 tasks, TCP
+   fan-out, the retrying worker, integer loops, and numeric-Array add/sum.
+   Use tokio for the three concurrent workloads and plain Rust elsewhere,
+   with the same READY/GO/DONE protocol and provenance rules. Completion:
+   paired Aura/Rust medians in the Performance chapter. This item ratifies no
+   numeric performance target.
+4. **Release profile and executable sizes.** The workspace has no
+   `[profile.release]`; user executables link the `libaura_compiler.a` staticlib.
+   Completion: configure release optimization, LTO, codegen units, stripping,
+   and debug-data separation; retain the unwinding panic strategy required by
+   the runtime; add dead-stripping user-link flags. Measure the `aura` binary,
+   native hello world, and reference agent, preserving standalone execution
+   and source diagnostics. This pulls Batch 5's mechanical work forward;
+   runtime/compiler separation remains in Batch 5.
+5. **ADR reconciliation.** Completion: mark the body/ratification contradictions
+   in ADR-0052–0056, record cross-ADR open conflicts and their resolving batches,
+   and add ADR-0064. Delivered by this documentation amendment.
+6. **Reference agent program.** Create one maintained package under 400 lines
+   in `examples/agents/`, using the current surface for a tool registry, typed
+   tool schemas, retries, a streaming loop, and structured cleanup. Add no new
+   library surface. Completion: run it on both backends and include it in the
+   example smoke tests. Its before/after diff is the usability evidence for
+   each Batch 1–4 and 6 feature.
+
 ## Priority Batches
 
 | Order | Batch | Outcome and scope |
 | --- | --- | --- |
-| 1 | Callable and type foundations | Design storable capturing closures, bound method values, repeatable/mutable/consuming callable capabilities, and preserved names/defaults/keyword-only contracts. Add type aliases and ADR-0052 closed unions for explicitly typed mixed collections such as `list[int \| str]`, optional values, and safe narrowing. |
+| 1 | Callable and type foundations | Add unions, aliases, owned-capture closure storage under ADR-0037, bound methods on owned or Copy receivers, and preserved names/defaults/keyword-only contracts. Defer stored ADR-0038 loan captures to the joint Batch 1–2 lifetime design. Structurally split `sema.rs` into type representation, capability checking, and place/loan analysis. Use the Option-removal criteria and intermediate checkpoint below. |
 | 2 | Natural collection access | Extend ADR-0038 to list elements, dictionary entries, and slice views. Make shared reads, explicit cloning, mutation, and ownership transfer compose naturally; define bounds, structural mutation, and invalidation rules. |
-| 3 | Initialization and resource management | Add `__init__(self, ...)`, definite field initialization, and validation while retaining automatic constructors for classes without an initializer. Use named `Result`-returning factories for fallible construction initially. Extend `with` to generic managers, multiple resources, typed entry/exit, and scoped access with deterministic cleanup. |
-| 4 | Everyday syntax and API usability | Add consistent trailing commas, parenthesized imports, richer unpacking and class patterns, and focused text/byte conveniences. Implement ADR-0056 docstrings and ADR-0055 Display/read-only properties, including local/imported editor support. |
-| 5 | Lean native binaries | Measure representative programs, separate runtime from compiler-only code, partition runtime dependencies, and link only required components. Apply dead stripping and debug-data separation while retaining standalone execution and useful source diagnostics. |
-| 6 | Typed agent APIs and serialization | Add typed class/enum codecs, validation with field-path errors, schema generation, and field/parameter metadata. Implement ADR-0053 decorators on the settled callable model for tool registration, routing, tracing, and ownership-correct retries. |
-| 7 | Rust-class native performance | Establish equivalent Rust/Aura workloads and ratified targets. Improve representations, allocation, retain/release elimination, inlining, bounds checks, loop optimization, and SIMD. Evaluate an optimizing release backend if measurements justify it. |
+| 3 | Initialization and resource management | Add `__init__(self, ...)`, definite initialization, named fallible factories, and generic/multiple typed context managers. Use one partial-construction cleanup mechanism extending ADR-0038's ordered exit-action stack for initializer failure, multi-resource entry failure, and failed decodes. Resolve cancellation/reset and header-temporary entry-view obligations below. |
+| 4 | Everyday syntax and API usability | Add consistent trailing commas, parenthesized imports, richer unpacking/class patterns, and text/byte conveniences. Implement ADR-0056 docstrings, generated API docs, ADR-0055 Display/properties, and a syntax-reflowing `aura fmt` beyond today's whitespace normalization, with editor support. Formatter and API-doc work move here from Batch 11. |
+| 5 | Lean native binaries | Separate runtime from compiler-only code, partition dependencies, and link only required components. Release-profile tuning, dead stripping, and initial size baselines are pre-Batch-1 work. |
+| 6 | Typed agent APIs and serialization | Add typed codecs, validation, schemas, and metadata. Decode classes with automatic field construction or an explicit decode factory; computed `__init__` fields have no general inverse. Reuse Batch 3's partial-cleanup mechanism. Implement ADR-0053 decorators for registration, routing, tracing, and ownership-correct retries. |
+| 7 | Rust-class native performance | Use the Rust baselines and thin backend boundary to decide among LLVM via inkwell, C emission through the already-required host C compiler, and continued Cranelift improvement. C emission is a serious candidate: no LLVM build dependency and cheaper freestanding targets. Improve representations, allocation, retain/release, inlining, bounds checks, loops, and SIMD. No backend switch occurs before this batch. |
 | 8 | Multicore runtime scalability | Improve load balancing/work stealing, preemption latency, cancellation responsiveness, wake paths, and task memory. Define which suspended frames may migrate and preserve structured cleanup across worker boundaries. |
-| 9 | Iterators and streaming | Implement ADR-0054 with distinct item/end cases, associated types, lazy generators, explicit close, and persistent failure state. Settle recoverable stream-error and frame-affinity details; preserve effects, ownership, and early-exit cleanup. |
+| 9 | Iterators and streaming | Implement ADR-0054 with a nominal enum for item/end, associated types, lazy generators, explicit close, and persistent failure. Aura has two sum mechanisms: nominal enums and anonymous unions. Item/end names are to be designed in Batch 9. Settle recoverable stream errors and frame affinity. |
 | 10 | Array v2 and ML interoperability | Build strided views, reshape/transpose, broadcasting, matrix operations, and vectorized kernels on the settled memory model. Add shared-memory and zero-copy foreign-buffer transport, then explicit tensor/device interop where needed. |
-| 11 | Package ecosystem and tooling | Extend current package support with registry/publishing, reproducible dependency resolution, supply-chain metadata, generated API docs, formatter maturity, and responsive compiler-backed editor services. |
-| 12 | Freestanding systems foundation | Ratify and implement hosted/freestanding profiles, core/runtime separation, stable layouts and ABI, raw memory and `unsafe`, volatile access, atomics/fences, custom allocators, cross-compilation, linker/startup/panic controls, and hardware interfaces. |
-| 13 | Operating-system and driver proof | Select a QEMU target and demonstrate boot, memory management, interrupts, device I/O, and a minimal driver. Maintain reproducible build and emulator tests as the basis for wider platform support. |
+| 11 | Package ecosystem and tooling | Extend package support with registry/publishing, reproducible dependency resolution, supply-chain metadata, and responsive compiler-backed editor services. |
+| 12 | Freestanding systems foundation — direction, not scheduled | Develop hosted/freestanding profiles, core/runtime separation, layout/ABI, raw memory, `unsafe`, volatile access, atomics/fences, allocation, cross-compilation, startup/panic controls, and hardware interfaces. |
+| 13 | Operating-system and driver proof — direction, not scheduled | Select a QEMU target and demonstrate boot, memory management, interrupts, device I/O, and a minimal driver with reproducible emulator tests. |
+
+Aura currently has no `unsafe`, raw pointers, atomics, volatile access, layout
+control, or cross-compilation; its runtime depends on rustls, mio, libffi, and
+corosensei. Batches 12–13 retain the long-term direction without a schedule.
+
+**Batch 1 checkpoint and Option-removal criteria:** hold one reviewable
+checkpoint after unions, aliases, and owned-capture closures, before removing
+`Option[T]`. Removal requires conditional narrowing on stable places specified
+and implemented in the same change family (the `if x is not None:` shape;
+exact syntax to be designed in Batch 1), well-formed type-parameter union
+members such as `V | None` for generic library APIs, and a stated FFI-boundary
+replacement for nullable results. These criteria introduce no compatibility
+path or migration diagnostics.
+
+**Batch 3 design obligations:** reconcile ADR-0060's cleanup-under-cancellation
+promise with ADR-0038's forced-frame-reset boundary. Define how a manager
+constructed in a `with` header exposes a scoped entry view when temporaries
+cannot currently be view origins. The shared partial-construction cleanup
+mechanism is an extension of the existing exit-action stack, not three
+independent initializer, manager, and decoder mechanisms.
 
 ## Approved Decisions
 
@@ -110,9 +184,11 @@ Docstrings, basic syntax polish, and binary-size baselines can start early.
 Display and properties need not wait for general decorator execution; their
 parser and metadata dependencies can be delivered independently.
 
-The main dependencies are **callables → decorators**, **collection loans →
-zero-copy APIs**, **union/iterator decisions + scheduler contract → generators**,
-and **runtime separation + memory/ABI controls → freestanding → bare-metal proof**.
+The main dependencies are **callables → decorators**, **callables ↔ collection
+loans** (one lifetime-bearing callable design shared by Batches 1 and 2),
+**collection loans → zero-copy APIs**, **union/iterator decisions + scheduler
+contract → generators**, **backend boundary → any new native backend**, and
+**runtime separation + memory/ABI controls → freestanding → bare-metal proof**.
 Version assignments follow ratification and delivery; the proposed 0.4 ADR
 targets do not commit every batch to one release.
 
@@ -120,6 +196,9 @@ targets do not commit every batch to one release.
 - Define observable acceptance criteria before each batch, add failing behavior
   tests first, and keep compiler, backend parity, reference, examples, tutorials,
   and editor behavior aligned in the same change family.
+- Implement each Batch 1–4 and 6 feature on both maintained backends through
+  the thin boundary, with the forced parity matrix as the gate. Include the
+  reference agent program's before/after diff as checkpoint evidence.
 - Use focused checks during development and one complete verification at the
   implementation checkpoint. One green hosted CI run is sufficient; editorial
   work follows the repository's scoped documentation checks.
@@ -129,5 +208,5 @@ targets do not commit every batch to one release.
 - Keep build artifacts within the repository's cleanup policy. Track batch
   completion in the existing work board when implementation begins.
 
-The next design checkpoint is **Batch 1: callable and type foundations**,
-with early syntax/docstring and binary-footprint work available in parallel.
+The next steps are the **pre-Batch-1 foundations**, followed by the **Batch 1
+design checkpoint**, with foundation work continuing in parallel as scheduled.

@@ -15,6 +15,24 @@
 
 ## Status boundary
 
+### Open conflicts
+
+- **Joint Batch 1–2, ADR-0058 / ADR-0061:** lifetime-bearing callable storage
+  is one shared design across callable types and collection loans. Batch 1
+  first implements owned-capture closure storage under ADR-0037 and bound
+  methods on owned or Copy receivers. Storage of ADR-0038 loan captures waits
+  for this joint design; the records must not defer ownership of it in a circle.
+- **Batch 3, ADR-0060:** reconcile cleanup under cancellation with the forced
+  generated-frame-reset boundary recorded below. Also define how a manager
+  constructed in a `with` header can expose an entry view when temporary
+  expressions cannot be view origins. Origin/lifetime spelling is to be
+  designed in Batch 3.
+- **Batch 3, ADR-0059 / ADR-0060 / ADR-0062:** extend this ADR's ordered
+  exit-action stack with one shared partial-construction cleanup mechanism,
+  reused by failed initialization, multi-resource entry, and typed decoding.
+
+### Implemented scope
+
 This is an implemented Aura 0.3 language feature. It changes the grammar,
 ownership model, closure capture contract, semantic interface, MIR, direct
 backend, diagnostics, editor tooling, examples, tutorials, and Manual as one

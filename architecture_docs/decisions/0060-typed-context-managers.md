@@ -38,6 +38,22 @@ semantics, not a new shared-memory locking API or a transaction commit policy.
 
 ## Remaining detailed design
 
+### Open conflicts
+
+- **Batch 3, ADR-0038:** reconcile cleanup under cancellation with the existing
+  forced-frame-reset boundary: arbitrary source cleanup cannot run against a
+  destroyed generated frame. Preserve the approved cleanup promise while
+  specifying how cleanup completes before that boundary.
+- **Batch 3, ADR-0038:** a manager created in a `with` header must expose any
+  scoped entry view through a valid origin despite the current exclusion of
+  temporary view origins. The origin and lifetime contract is to be designed
+  in Batch 3; do not assume an implicit temporary exemption.
+- **Batch 3, ADR-0059 / ADR-0062:** reuse one partial-construction cleanup
+  mechanism extending ADR-0038's ordered exit-action stack for initialization,
+  multi-resource entry, and failed decoding.
+
+### Detailed contract
+
 Specify protocol names/signatures, result/entry-view types, associated-type
 needs, multi-resource grammar/evaluation, and interoperability with existing
 close-only resources. Do not silently introduce Python exception suppression

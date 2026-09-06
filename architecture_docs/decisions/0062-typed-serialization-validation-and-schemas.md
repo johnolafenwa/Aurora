@@ -35,6 +35,20 @@ requirements and cannot consume or clone a field implicitly to hide an error.
 
 ## Remaining detailed design
 
+### Open conflicts
+
+- **Batch 6, ADR-0059:** a custom `__init__` may compute fields and has no
+  general inverse. Typed decoding applies to automatic field-constructed
+  classes or an explicit decode factory; it cannot infer reconstruction of
+  arbitrary initializer inputs from stored fields. Factory spelling is to be
+  designed in Batch 6.
+- **Batch 3 mechanism, reused in Batch 6, ADR-0038 / ADR-0059 / ADR-0060:**
+  failed decodes reuse the shared partial-construction cleanup extension to
+  ADR-0038's ordered exit-action stack, also used by initializer and
+  multi-resource entry failure.
+
+### Detailed contract
+
 - Opt-in syntax, trait/generic interfaces, metadata attachment, schema format,
   naming/version policy, and generated-symbol visibility.
 - Required/default/unknown-field choices, null versus absent fields, optional

@@ -77,6 +77,9 @@ undecorated intermediate function has no source-visible binding.
 
 ## Desugaring and evaluation order
 
+**Proposed baseline, not ratified; resolved in Batch 6.** The specific
+decorator-expression evaluation and application order below remains open.
+
 For:
 
 ```aura
@@ -114,6 +117,9 @@ module binding. A recursive call therefore invokes the completely decorated
 function. The compiler must use a checked initialization slot for this
 resolution; it may not capture the undecorated intermediate value. Calling the
 slot before initialization completes is a module-initialization cycle error.
+
+**Proposed baseline, not ratified; resolved in Batch 6.** The preceding
+recursive-reference and checked-initialization-slot rules remain open.
 
 ## Exact typing contract
 
@@ -302,6 +308,7 @@ artifacts are invalidated and rebuilt under the new versions.
   expressions, malformed `@` lines, detachment, and eligible declarations
 - evaluation: expression evaluation top to bottom, application bottom to top,
   once-only subexpressions, traps at every layer, and exact cleanup
+  (**Proposed baseline, not ratified; resolved in Batch 6.** Specific order.)
 - module behavior: single initialization across multiple imports, declaration
   ordering, cycle rejection, failed initialization, and cache invalidation
 - typing: exact `F`, every parameter capability, defaults, keyword-only names,
@@ -317,6 +324,7 @@ artifacts are invalidated and rebuilt under the new versions.
   restrictions, environments, capabilities, and lifetime/Transfer checks
 - recursion: direct, mutual, and decorator-wrapper recursion all resolve the
   final initialized bindings; early observation is rejected
+  (**Proposed baseline, not ratified; resolved in Batch 6.** Recursive initialization.)
 - ownership and Transfer: copied named functions, moved intermediates,
   non-Transfer capture paths, task targets, and no hidden capability capture
 - interfaces: imports expose only the final exact signature and preserve

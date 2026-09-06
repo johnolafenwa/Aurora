@@ -39,6 +39,16 @@ Array views and callable/iterator lifetimes under one ownership model.
 
 ## Remaining detailed design
 
+### Open conflicts
+
+**Joint Batch 1–2, ADR-0038 / ADR-0058:** design the lifetime-bearing callable
+type jointly with collection loans. Batch 1 callable storage first covers
+owned/by-value captures and bound methods on owned or Copy receivers;
+ADR-0038 loan-capturing closure storage waits for this shared design. Neither
+ADR may treat the other as independently responsible for the lifetime model.
+
+### Detailed contract
+
 Specify indexed/keyed place identity, index/key evaluation counts, bounds and
 missing-key behavior, negative positions, and which operations invalidate each
 view. Define disjoint element/range reasoning, replacement/removal, dictionary
