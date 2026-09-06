@@ -1,8 +1,8 @@
-# Batch 6 release-performance workloads
+# Release-performance workloads
 
-This directory contains the paired Aura and CPython inputs for Aura 0.2's
-post-reboot release measurement. The runner records exact-workload results with
-their host and repository provenance.
+This directory contains the Aura and CPython inputs established for Batch 6.
+The maintained runner now also builds equivalent pinned Rust inputs from
+`../rust_baselines/` and records all three lanes with host and source provenance.
 
 ## Workloads
 
@@ -88,8 +88,20 @@ binaries before timing, verifies CPython identity, clears known
 runtime-affecting environment overrides, and rechecks the repository and input
 hashes after timing. It records three quiet-host inventories, boot and hardware
 identity, commands, raw observations, hashes, median, MAD, nearest-rank p95,
-best, and paired Aura/CPython ratios. The summary links the exact raw report
+best, and paired Aura/CPython and Aura/Rust ratios for protocol workloads. The summary links the exact raw report
 by SHA-256.
 
 `--allow-competing-processes` exists only for explicitly non-contractual
 diagnostic runs. Do not use it for release evidence.
+
+## Rust comparison lane (0.3.4 foundations)
+
+The runner builds pinned Rust 1.95.0 references from `benchmarks/rust_baselines/`
+with `--release --locked`, fat LTO, and one codegen unit. Report schema is now 2.
+It records source/lockfile and binary SHA-256 identities and paired Aura/Rust
+samples. Rust timing results are pending the post-reboot measurement session;
+protocol smoke checks are not published as performance evidence.
+
+See [the Rust baseline contract](../rust_baselines/README.md) for exact workload,
+allocation, arithmetic, scheduling, and protocol equivalence. The integer-loop
+lane retains its whole-process checksum protocol; other lanes use READY/GO/DONE.

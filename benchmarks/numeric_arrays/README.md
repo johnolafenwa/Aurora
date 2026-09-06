@@ -5,11 +5,11 @@ This benchmark measures two exact one-million-element `float64` workloads:
 - fresh owned elementwise addition of two contiguous arrays
 - reduction of one existing contiguous array with `sum()`
 
-It compares Aura's direct native backend with NumPy under the same explicit
-single-thread environment and records release evidence.
+It compares Aura's direct native backend with NumPy and plain Rust under the
+same explicit single-thread environment and records release evidence.
 
 The add lane allocates and releases a fresh result on every measured
-operation. Both implementations prepare their two inputs before the clock
+operation. All implementations prepare their two inputs before the clock
 starts. The sum lane reuses one prepared input. Every process performs one
 unmeasured kernel warmup, emits `READY`, waits for the host's exact `GO` line,
 then reports a checksum in `DONE`. The host owns and verifies the whole
@@ -38,13 +38,13 @@ timeout, and cleanup behavior.
 The smaller summary repeats the release-relevant provenance and links back to
 the raw report by SHA-256.
 
-The four-lane order reverses every repetition. Each lane uses
+The six-lane order reverses every repetition. Each lane uses
 `AURA_WORKERS=1` plus the common BLAS/OpenMP single-thread environment.
 There are 512 add operations and 1,024 reductions per timed observation.
 Reported values include raw samples, median, median absolute deviation, p95,
-best, the paired Aura/NumPy ratios, their median, and the ratio of medians.
+best, paired Aura/NumPy and Aura/Rust ratios, their medians, and ratios of medians.
 
-No threshold compares Aura with NumPy. A report is contractual only when
+No speed threshold is enforced against either reference implementation. A report is contractual only when
 the checkout is clean and detached, the host is Mac14,9, every
 protocol/checksum validates, the competing-process override is absent, and
 all three host inventories are quiet. An inventory rejects an Aura-checkout
@@ -80,3 +80,15 @@ Release disassembly of the float64 add kernel emitted scalar `fadd d`
 instructions, and the deterministic floating reductions likewise remained
 scalar. Aura's Array API and NumPy cover different surfaces; the workloads
 above are the operations compared by this benchmark.
+
+## Rust comparison lane (0.3.4 foundations)
+
+The runner builds pinned Rust 1.95.0 references from `benchmarks/rust_baselines/`
+with `--release --locked`, fat LTO, and one codegen unit. Report schema is now 2.
+It records source/lockfile and binary SHA-256 identities and paired Aura/Rust
+samples. Rust timing results are pending the post-reboot measurement session;
+protocol smoke checks are not published as performance evidence.
+
+See [the Rust baseline contract](../rust_baselines/README.md) for exact workload,
+allocation, arithmetic, scheduling, and protocol equivalence. The integer-loop
+lane retains its whole-process checksum protocol; other lanes use READY/GO/DONE.

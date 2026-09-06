@@ -3736,3 +3736,9 @@ fn lib_helper_paths_cover_relative_paths_missing_reads_and_import_qualification(
     let qualified_bounds = super::qualify_export_bounds(&program, &bounds);
     assert_eq!(named_ref_name(&qualified_bounds["T"][0]), "dep.Imported");
 }
+
+#[test]
+fn maintained_hello_world_example_runs() {
+    let source = include_str!("../../../examples/basics/hello_world.au");
+    assert_eq!(crate::run_source(source).unwrap().stdout, "Hello, world!\n");
+}

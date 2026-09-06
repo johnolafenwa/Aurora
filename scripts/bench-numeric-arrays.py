@@ -27,20 +27,21 @@ from datetime import datetime, timezone
 from typing import Dict, List, NamedTuple, Optional, Sequence
 
 try:
-    from scripts import benchmark_process
+    from scripts import benchmark_process, rust_baselines
 except ImportError:
     import benchmark_process
+    import rust_baselines
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-REPORT_SCHEMA_VERSION = 1
+REPORT_SCHEMA_VERSION = 2
 ELEMENT_COUNT = 1_000_000
 PAIR_COUNT = 11
 ADD_ITERATIONS = 512
 SUM_ITERATIONS = 1_024
 READY_TIMEOUT_SECONDS = 30.0
 COMPLETION_TIMEOUT_SECONDS = 120.0
-BUILD_TIMEOUT_SECONDS = 300.0
+BUILD_TIMEOUT_SECONDS = 1800.0
 MAX_PROTOCOL_LINE_BYTES = 512
 COMPETING_CPU_PERCENT = 50.0
 QUIET_PROCESS_SAMPLE_INTERVAL_SECONDS = 0.25
@@ -82,6 +83,9 @@ LANES: Dict[str, Dict[str, object]] = {
         "expected_checksum": 4_096_000_000.0,
     },
 }
+
+for _workload in ("add", "sum"):
+    LANES["rust_" + _workload] = {**LANES["aura_" + _workload], "implementation": "rust"}
 
 
 class BenchmarkError(RuntimeError):
@@ -233,6 +237,15 @@ def summarize_pairs(pairs: Sequence[Dict[str, object]]) -> Dict[str, object]:
             "ratio_of_medians": (
                 float(aura_summary["median_s"]) / float(numpy_summary["median_s"])
             ),
+        }
+        rust = [float(pair["runs"][f"rust_{workload}"]["elapsed_s"]) for pair in pairs]
+        rust_summary = duration_summary(rust)
+        rust_summary["median_per_operation_s"] = float(rust_summary["median_s"]) / iterations
+        result[workload]["rust"] = rust_summary
+        ratios = [a / r for a, r in zip(aura, rust)]
+        result[workload]["aura_vs_rust"] = {
+            "paired_ratios": ratios, "paired_median_ratio": statistics.median(ratios),
+            "ratio_of_medians": float(aura_summary["median_s"]) / float(rust_summary["median_s"]),
         }
     return result
 
@@ -672,6 +685,8 @@ def lane_commands(
         "numpy_add": [str(python), str(reference), "--workload", "add"],
         "aura_sum": [str(binaries["sum"])],
         "numpy_sum": [str(python), str(reference), "--workload", "sum"],
+        "rust_add": [str(binaries["rust_add"])],
+        "rust_sum": [str(binaries["rust_sum"])],
     }
 
 
@@ -731,6 +746,8 @@ def execute(options: Options) -> Dict[str, object]:
         binaries, builds = build_aura_workloads(
             options.aura.resolve(), pathlib.Path(directory)
         )
+        rust_binaries, rust_build = rust_baselines.build(pathlib.Path(directory) / "rust-target")
+        binaries.update({"rust_" + name: rust_binaries["float64_" + name] for name in ("add", "sum")})
         commands = lane_commands(binaries, options.python.resolve())
         before_timing = quiet_process_inventory()
         if before_timing and not options.allow_competing_processes:
@@ -745,6 +762,8 @@ def execute(options: Options) -> Dict[str, object]:
         if after_timing and not options.allow_competing_processes:
             raise BenchmarkError("competing host processes detected after timing")
 
+    if rust_baselines.source_identity() != rust_build["sources"]:
+        raise BenchmarkError("Rust input identity changed during measurement")
     noncontractual_reasons = evidence_noncontractual_reasons(
         allow_competing_processes=options.allow_competing_processes,
         process_checks=(before_build, before_timing, after_timing),
@@ -785,6 +804,7 @@ def execute(options: Options) -> Dict[str, object]:
             "before_timing": before_timing,
             "after_timing": after_timing,
         },
+        "rust_build": rust_build,
         "builds": builds,
         "warmups": warmups,
         "pairs": pairs,

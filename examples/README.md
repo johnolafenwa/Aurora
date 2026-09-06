@@ -1127,3 +1127,5 @@ When the implemented language subset changes:
 1. update the relevant example
 2. update the matching tutorial chapter
 3. keep the example set runnable under `cargo test`
+
+The single-print `basics/hello_world.au` is also the executable-size baseline.

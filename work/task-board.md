@@ -2,6 +2,19 @@
 
 Last updated: 2026-09-06
 
+## Pre-Batch-1 foundations items 1–4 (in progress)
+
+- Scope: optimization flag, backend boundary note, Rust baseline programs and
+  runners, release profile/linking, executable-size evidence; next release 0.3.4.
+- Implementation delivered with test-first flag, link, cache, and runner regressions.
+- Local verification: 385 forced parity fixtures; full serial workspace tests;
+  coverage 96.306815% lines / 97.210239% functions / 94.808289% regions;
+  release-profile direct/MIR diagnostics; 44 runner tests; nine Rust smoke programs.
+- Remaining: final-head size report, final documentation checks, branch/main
+  hosted CI and merge, measurement-session handoff.
+- No timing publication, release preparation, version bump, tag, or reboot.
+- Work note: `work/2026-09-07-pre-batch-1-items-1-4.md`.
+
 ## Priority roadmap scheduling amendment (complete)
 
 - Authorized scope: documentation-only ordering, pre-Batch-1 foundations,

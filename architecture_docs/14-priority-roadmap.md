@@ -16,8 +16,7 @@ performance and eventual operating-system and device-driver development.
 
 ## Current Foundation
 
-ADR-0038 loans/views is implemented; its v0.3.3-preview release is pending the
-coverage gate. ADR-0045 testing is accepted
+ADR-0038 loans/views is implemented and shipped in v0.3.3-preview. ADR-0045 testing is accepted
 and implemented; ADR-0049 is accepted with class patterns formally deferred.
 These are existing foundations. Collection-element loans are scheduled in Batch 2.
 Classes already have field-based constructors and per-instance defaults;
@@ -36,15 +35,15 @@ completion. See the [ADR index](decisions/README.md).
 ## Pre-Batch-1 foundations
 
 These items start before Batch 1 design and run in parallel with it, scheduled
-for the v0.3.3-preview update. Only ADR reconciliation is delivered by this
-documentation task; the other completion criteria belong to later implementation.
+for the 0.3.4 update. Items 1–4 implementation status is recorded below;
+optimization-level and Rust-baseline timing is reserved for a post-reboot session.
 The backend direction is recorded in
 [ADR-0064](decisions/0064-native-backend-strategy-and-codegen-boundary.md).
 
 1. **Cranelift optimization level.** The direct flag setup in
    `crates/aura-compiler/src/native_codegen.rs` sets `is_pic`, `unwind_info`, and
-   `enable_multi_ret_implicit_sret`, but leaves `opt_level` at Cranelift's
-   default. Completion: measure `opt_level=speed` on the release-performance,
+   `enable_multi_ret_implicit_sret`, and now `opt_level=speed`. Completion:
+   verify parity and measure the effect on the release-performance,
    integer-loop, and numeric-Array harnesses; run the forced MIR/direct parity
    matrix; publish results and provenance in the Performance chapter. Adopt
    the flag if parity holds; otherwise revert it and record failing fixtures
@@ -61,10 +60,10 @@ The backend direction is recorded in
    with the same READY/GO/DONE protocol and provenance rules. Completion:
    paired Aura/Rust medians in the Performance chapter. This item ratifies no
    numeric performance target.
-4. **Release profile and executable sizes.** The workspace has no
+4. **Release profile and executable sizes.** The workspace now has a tuned
    `[profile.release]`; user executables link the `libaura_compiler.a` staticlib.
    Completion: configure release optimization, LTO, codegen units, stripping,
-   and debug-data separation; retain the unwinding panic strategy required by
+   and debug-data omission; retain the unwinding panic strategy required by
    the runtime; add dead-stripping user-link flags. Measure the `aura` binary,
    native hello world, and reference agent, preserving standalone execution
    and source diagnostics. This pulls Batch 5's mechanical work forward;
@@ -78,6 +77,22 @@ The backend direction is recorded in
    library surface. Completion: run it on both backends and include it in the
    example smoke tests. Its before/after diff is the usability evidence for
    each Batch 1–4 and 6 feature.
+
+### Items 1–4 delivery status (0.3.4)
+
+- Item 1: `opt_level=speed` delivered and adopted after all 385 forced parity fixtures
+  and the compiler/CLI acceptance suites passed.
+  Publication-grade timing is deferred to the post-reboot measurement session.
+- Item 2: [backend boundary inventory and builder sketch](15-backend-boundary.md)
+  delivered; no refactor performed.
+- Item 3: pinned standalone Rust programs, three runner lanes, provenance, unit
+  tests, and hosted protocol smoke verification delivered. Timing remains pending.
+- Item 4: release profile, section collection and post-link local/debug stripping,
+  plus clean-ref size tooling delivered. Link/strip steps pass local packaging,
+  standalone diagnostics, cache, and release-profile checks. The
+  [executable-size table](../docs/manual/performance.md#executable-size) is published
+  with clean-ref provenance and a default-profile control.
+- Items 5 and 6 retain their recorded scope and status above.
 
 ## Priority Batches
 

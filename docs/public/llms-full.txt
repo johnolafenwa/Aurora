@@ -3181,6 +3181,26 @@ Windows support, configurable formatter, or annotation-based test discovery.
 Its maintained execution engines are the MIR runtime and direct native
 backend.
 
+## Native executable profile
+
+For the 0.3.4 foundations update, workspace release builds use `opt-level=3`,
+fat LTO, one codegen unit, `debug=false`, and `strip="symbols"`. Panic unwinding
+remains enabled for the runtime's `extern "C-unwind"` boundaries. This profile
+reduces shipped compiler metadata; it does not strip the runtime archive's
+linkable symbols or change the default MIR execution mode.
+
+Both direct and embedded-MIR launcher builds request unused-section removal:
+`-Wl,-dead_strip` on macOS and `-Wl,--gc-sections` on Linux. A successful link is
+followed by `strip -S -x` on the user executable, removing debug/local symbols
+while retaining globals for process-global FFI. The host C toolchain must supply
+`strip`. Missing/failing stripping is a build error. Aura's embedded source
+metadata preserves typed call frames, task ancestry, and source-located traps;
+native debugger symbol information is reduced. No separate debug companion
+artifact is emitted. The runtime archive remains intact.
+
+Executable-size provenance and the current limits of these optimizations are
+recorded in [Performance](performance.md#executable-size).
+
 ## Source: docs/manual/closures.md
 
 # Closures
@@ -5341,10 +5361,26 @@ This page documents known current limits of the Aura compiler and runtime.
 - `aura fmt` currently normalizes line endings, trailing whitespace, and final newlines; it is not yet a syntax-reflowing formatter.
 - `aura test` discovers each parameterless `def test_*()` function as a
   separate result and retains file-level execution for files with no such
-  function. Discovery is name-prefix based; annotations, parameterized tests,
-  and fixture/teardown protocols are not implemented.
+  function. Optional `setup()` and `teardown()` run per selected case, including
+  teardown after setup/body failure. Parameterized registration returns labeled
+  capture-free `def() -> None` values in `list[(str, def() -> None)]`; registration
+  runs before `-k` filtering. Discovery remains name-prefix based; annotations
+  are not implemented.
 - A timed-out `aura test` stops waiting but cannot terminate its worker thread; the timed-out program may continue host side effects until the process exits.
 - Recursive `aura fmt` and `aura test` traversal follows directory symlinks without cycle detection in 0.3.
+
+### Native artifact profile (0.3.4 foundations)
+
+The workspace release profile uses optimization level 3, fat LTO, one codegen
+unit, no debug data, and symbol stripping for the shipped compiler executable.
+Panic unwinding remains enabled. The runtime archive retains linkable symbols.
+Both direct and embedded-MIR user executables link with `-Wl,-dead_strip` on
+macOS or `-Wl,--gc-sections` on Linux, then use `strip -S -x` to remove debug and
+local symbols while preserving globals needed by process-global FFI. Source
+locations, typed Aura call frames, and task ancestry are embedded runtime
+metadata and remain available; native symbol/debugger information is reduced.
+The host toolchain must provide `strip` as well as `cc`. The compiler
+and runtime still share one static archive.
 
 ## Source: docs/manual/diagnostics.md
 
@@ -13651,14 +13687,71 @@ Its SHA-linked summary has SHA-256
 
 The repository benchmark runner records commands, source and binary hashes,
 raw observations, medians, dispersion, host inventory, boot identity, and the
-environment policy. Run the maintained harness with:
+environment policy. From a clean detached checkout on the pinned measurement
+host, run the maintained harness with its Rust lanes:
 
 ```bash
-npm run bench:release-performance
+npm run bench:release-performance -- \
+  --label foundations-after-rust \
+  --aura target/release/aura \
+  --python /Applications/Xcode.app/Contents/Developer/usr/bin/python3 \
+  --pairs 11 \
+  --raw-json /tmp/aura-foundations-after-release-raw.json \
+  --summary-json /tmp/aura-foundations-after-release-summary.json
 ```
 
 The scalable-runtime and numeric-Array harnesses provide the deeper scheduler,
 memory, and kernel evidence referenced by their Manual chapters.
+
+## Executable Size
+
+The pre-Batch-1 implementation reduces executable sizes while retaining panic
+unwinding and Aura's embedded diagnostic metadata. Counts below are exact bytes
+from separate clean detached builds; the table counts each executable, while
+installed toolchains also ship the separate runtime archive.
+
+| Executable | Before: v0.3.3-preview, Cargo default | After: Cargo default | After: tuned release | Reduction from before |
+| --- | ---: | ---: | ---: | ---: |
+| `aura` compiler | 15,424,032 | 15,866,008 | 10,897,392 | 29.35% |
+| Native hello world | 23,646,792 | 1,702,088 | 1,586,968 | 93.29% |
+| Retrying-worker stand-in | 23,715,816 | 4,049,240 | 3,666,600 | 84.54% |
+
+The tuned profile uses level 3, fat LTO, one codegen unit, no debug data, and
+stripped compiler symbols. The after-default control restores Cargo's default
+release values through `CARGO_PROFILE_RELEASE_*` overrides in a separate target
+directory; it retains the new Cranelift flag and user-executable link/strip steps.
+Both after columns use macOS unused-section removal and debug/local-symbol
+stripping of user binaries. The runtime archive retains its linkable symbols.
+
+Provenance: Mac14,9 / Apple M2 Pro, arm64, macOS 26.5.2; Rust 1.95.0
+(`59807616e`, LLVM 22.1.2); Apple clang 21.0.0 (`clang-2100.1.1.101`). The before
+ref is `v0.3.3-preview` (`d3cc6b96104dd597687a98e9624f800a0cb3cf1e`). The after
+comparison uses the delivered pre-Batch-1 implementation. Exact measured commits,
+commands, profile overrides, source and executable SHA-256 hashes, and standalone
+output are retained in the [versioned raw evidence](https://github.com/johnolafenwa/Aura/blob/main/work/2026-09-07-pre-batch-1-executable-sizes.json).
+
+The hello input is `examples/basics/hello_world.au`, a single print. Because the
+before ref predates that file, the tool stages identical source bytes in its
+build area. `examples/agents/retrying_network_worker.au` is the reference-agent
+stand-in until pre-Batch-1 item 6 lands. Both subjects produce identical output
+across all three builds with Cargo unavailable during standalone execution.
+Each detached checkout and target directory is removed after hashing.
+
+Reproduce from the desired after checkout:
+
+```bash
+python3 scripts/bench-binary-size.py \
+  --before-ref v0.3.3-preview \
+  --after-ref "$(git rev-parse HEAD)" \
+  --output /tmp/aura-executable-sizes.json
+```
+
+## Pending measurements
+
+The Cranelift optimization-level and Rust-baseline timings will be collected in
+a post-reboot session and are not yet published. Protocol-only Rust smoke checks
+are correctness evidence, not timing results. Existing CPython and NumPy tables
+above retain their original measurements and provenance.
 
 ## Source: docs/manual/process.md
 

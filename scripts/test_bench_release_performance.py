@@ -56,6 +56,19 @@ class ReleasePerformanceBenchmarkTests(unittest.TestCase):
         )
         self.assertIn("20 ephemeral loopback listeners", bench.METHODOLOGY_NOTES["tcp_fanout"])
 
+    def test_rust_protocol_lane_and_paired_summary(self):
+        binaries = {name: Path('/tmp') / name for name in bench.PROTOCOL_WORKLOADS}
+        binaries.update({'rust_' + name: Path('/tmp/rust') / name for name in bench.PROTOCOL_WORKLOADS})
+        commands = bench.protocol_commands(binaries, Path('/python'))
+        self.assertEqual(commands['fib30']['rust'], ['/tmp/rust/fib30'])
+        pairs = [{'workloads': {'fib30': {'runs': {
+            lane: {'protocol_elapsed_s': duration, 'whole_process_elapsed_s': duration}
+            for lane, duration in [('aura', 6), ('cpython', 12), ('rust', 2)]
+        }}}}]
+        result = bench.summarize_protocol_workload(pairs, 'fib30')
+        self.assertEqual(result['protocol_vs_rust']['paired_median_ratio'], 3)
+        self.assertIn('rust', result['protocol_vs_rust'])
+
     def test_measurement_plan_rotates_workloads_and_lane_order(self) -> None:
         first = bench.measurement_plan(0)
         second = bench.measurement_plan(1)
@@ -64,8 +77,8 @@ class ReleasePerformanceBenchmarkTests(unittest.TestCase):
             "fib30",
         )
         self.assertEqual(second[0][0], "tasks_10000")
-        self.assertEqual(first[0][1], ["aura", "cpython"])
-        self.assertEqual(second[0][1], ["cpython", "aura"])
+        self.assertEqual(first[0][1], ["aura", "cpython", "rust"])
+        self.assertEqual(second[0][1], ["rust", "cpython", "aura"])
         self.assertEqual(first[-1][0], "v6")
         self.assertNotEqual(
             dict(first)["v6"],
@@ -218,6 +231,8 @@ class ReleasePerformanceBenchmarkTests(unittest.TestCase):
             }
             for aura, cpython in ((2.0, 1.0), (4.0, 2.0), (3.0, 1.5))
         ]
+        for pair in pairs:
+            pair["workloads"]["fib30"]["runs"]["rust"] = {"protocol_elapsed_s": 0.5, "whole_process_elapsed_s": 0.75}
         summary = bench.summarize_protocol_workload(pairs, "fib30")
         primary = summary["protocol"]
         self.assertEqual(primary["aura"]["samples_s"], [2.0, 4.0, 3.0])
@@ -539,6 +554,8 @@ class ReleasePerformanceBenchmarkTests(unittest.TestCase):
             return {"whole_process_elapsed_s": duration, "returncode": 0}
 
         with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(bench.rust_baselines, "build", return_value=(
+                {name: Path("/tmp/rust") / name for name in bench.rust_baselines.CONTRACTS}, {"sources": {}})))
             stack.enter_context(mock.patch.object(bench, "validate_options"))
             stack.enter_context(
                 mock.patch.object(

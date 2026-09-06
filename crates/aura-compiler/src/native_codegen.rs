@@ -61,6 +61,7 @@ fn set_native_codegen_flag(
 
 fn native_codegen_flags() -> std::result::Result<settings::Flags, String> {
     let mut flag_builder = settings::builder();
+    set_native_codegen_flag(&mut flag_builder, "opt_level", "speed")?;
     set_native_codegen_flag(&mut flag_builder, "is_pic", "true")?;
     set_native_codegen_flag(&mut flag_builder, "unwind_info", "true")?;
     // Aura's direct-call ABI is private to one generated object and flattens

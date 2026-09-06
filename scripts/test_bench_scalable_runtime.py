@@ -686,9 +686,9 @@ class ProcessUnitTests(unittest.TestCase):
                     )
         reap.assert_called_once_with(process, "interrupt probe")
 
-    def test_legacy_integer_loop_helper_uses_the_shared_group_guard(self) -> None:
+    def test_integer_loop_helper_uses_the_shared_group_guard(self) -> None:
         completed = bench.subprocess.CompletedProcess(
-            ["/tmp/int64-loop"], 0, b"", b""
+            ["/tmp/int64-loop"], 0, b"10000000\n", b""
         )
         with mock.patch.object(
             direct_bench.benchmark_process,
@@ -703,7 +703,7 @@ class ProcessUnitTests(unittest.TestCase):
                 call.args[:2]
                 == (
                     ["/tmp/int64-loop"],
-                    "direct integer-loop workload",
+                    "checked integer loop",
                 )
                 for call in run.call_args_list
             )

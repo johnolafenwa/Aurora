@@ -417,3 +417,23 @@ Aura 0.3 has no package registry, publishing and installation workflow,
 Windows support, configurable formatter, or annotation-based test discovery.
 Its maintained execution engines are the MIR runtime and direct native
 backend.
+
+## Native executable profile
+
+For the 0.3.4 foundations update, workspace release builds use `opt-level=3`,
+fat LTO, one codegen unit, `debug=false`, and `strip="symbols"`. Panic unwinding
+remains enabled for the runtime's `extern "C-unwind"` boundaries. This profile
+reduces shipped compiler metadata; it does not strip the runtime archive's
+linkable symbols or change the default MIR execution mode.
+
+Both direct and embedded-MIR launcher builds request unused-section removal:
+`-Wl,-dead_strip` on macOS and `-Wl,--gc-sections` on Linux. A successful link is
+followed by `strip -S -x` on the user executable, removing debug/local symbols
+while retaining globals for process-global FFI. The host C toolchain must supply
+`strip`. Missing/failing stripping is a build error. Aura's embedded source
+metadata preserves typed call frames, task ancestry, and source-located traps;
+native debugger symbol information is reduced. No separate debug companion
+artifact is emitted. The runtime archive remains intact.
+
+Executable-size provenance and the current limits of these optimizations are
+recorded in [Performance](performance.md#executable-size).

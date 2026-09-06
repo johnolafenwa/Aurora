@@ -325,7 +325,23 @@ This page documents known current limits of the Aura compiler and runtime.
 - `aura fmt` currently normalizes line endings, trailing whitespace, and final newlines; it is not yet a syntax-reflowing formatter.
 - `aura test` discovers each parameterless `def test_*()` function as a
   separate result and retains file-level execution for files with no such
-  function. Discovery is name-prefix based; annotations, parameterized tests,
-  and fixture/teardown protocols are not implemented.
+  function. Optional `setup()` and `teardown()` run per selected case, including
+  teardown after setup/body failure. Parameterized registration returns labeled
+  capture-free `def() -> None` values in `list[(str, def() -> None)]`; registration
+  runs before `-k` filtering. Discovery remains name-prefix based; annotations
+  are not implemented.
 - A timed-out `aura test` stops waiting but cannot terminate its worker thread; the timed-out program may continue host side effects until the process exits.
 - Recursive `aura fmt` and `aura test` traversal follows directory symlinks without cycle detection in 0.3.
+
+### Native artifact profile (0.3.4 foundations)
+
+The workspace release profile uses optimization level 3, fat LTO, one codegen
+unit, no debug data, and symbol stripping for the shipped compiler executable.
+Panic unwinding remains enabled. The runtime archive retains linkable symbols.
+Both direct and embedded-MIR user executables link with `-Wl,-dead_strip` on
+macOS or `-Wl,--gc-sections` on Linux, then use `strip -S -x` to remove debug and
+local symbols while preserving globals needed by process-global FFI. Source
+locations, typed Aura call frames, and task ancestry are embedded runtime
+metadata and remain available; native symbol/debugger information is reduced.
+The host toolchain must provide `strip` as well as `cc`. The compiler
+and runtime still share one static archive.
